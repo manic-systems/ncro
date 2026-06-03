@@ -1,4 +1,4 @@
-name: Nix Package
+name: Nix
 
 on:
   push:
@@ -38,7 +38,5 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - run: nix build .# -L --no-link
+      - name: Build ncro package
+        run: nix build .# -L --no-link
