@@ -10,20 +10,20 @@ license      = "EUPL-1.2"
 readme       = "./README.md"
 repository   = "https://github.com/feel-co/ncro"
 rust-version = "1.90.0"
-version      = "2.2.0"
+version      = "2.2.1"
 
 [workspace.dependencies]
 # Workspace components
-ncro-config    = { path = "./crates/config", version = "2.2.0" }
-ncro-db        = { path = "./crates/db", version = "2.2.0" }
-ncro-discovery = { path = "./crates/discovery", version = "2.2.0" }
-ncro-health    = { path = "./crates/health", version = "2.2.0" }
-ncro-mesh      = { path = "./crates/mesh", version = "2.2.0" }
-ncro-metrics   = { path = "./crates/metrics", version = "2.2.0" }
-ncro-narinfo   = { path = "./crates/narinfo", version = "2.2.0" }
-ncro-router    = { path = "./crates/router", version = "2.2.0" }
-ncro-s3        = { path = "./crates/s3", version = "2.2.0" }
-ncro-server    = { path = "./crates/server", version = "2.2.0" }
+ncro-config    = { path = "./crates/config", version = "2.2.1" }
+ncro-db        = { path = "./crates/db", version = "2.2.1" }
+ncro-discovery = { path = "./crates/discovery", version = "2.2.1" }
+ncro-health    = { path = "./crates/health", version = "2.2.1" }
+ncro-mesh      = { path = "./crates/mesh", version = "2.2.1" }
+ncro-metrics   = { path = "./crates/metrics", version = "2.2.1" }
+ncro-narinfo   = { path = "./crates/narinfo", version = "2.2.1" }
+ncro-router    = { path = "./crates/router", version = "2.2.1" }
+ncro-s3        = { path = "./crates/s3", version = "2.2.1" }
+ncro-server    = { path = "./crates/server", version = "2.2.1" }
 
 # Other deps
 anyhow             = "1.0.102"
