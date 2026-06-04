@@ -38,7 +38,7 @@ hex                = "0.4.3"
 humantime-serde    = "1.1.1"
 mdns-sd            = "0.20.0"
 moka               = { version = "0.12.15", features = [ "future" ] }
-pound              = "0.1.4"
+pound              = "0.1.6"
 prometheus         = "0.14.0"
 rand               = "0.10.1"
 reqwest            = { version = "0.13.4", default-features = false }
@@ -56,8 +56,8 @@ tracing            = "0.1.44"
 tracing-subscriber = "0.3.23"
 url                = "2.5.8"
 
-aws-config = { version = "1.8.17", features = [ "behavior-version-latest" ] }
-aws-sdk-s3 = { version = "1.134.0", features = [ "rt-tokio" ] }
+aws-config = { version = "1.8.18", features = [ "behavior-version-latest" ] }
+aws-sdk-s3 = { version = "1.135.0", features = [ "rt-tokio" ] }
 
 # See:
 #  <https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html>
