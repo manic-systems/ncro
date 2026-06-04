@@ -89,6 +89,11 @@ enum CommitOutcome {
   Rejected,
 }
 
+enum CachedFilterCheck {
+  Accepted(Option<Vec<u8>>),
+  Rejected,
+}
+
 /// Outcome of racing a single priority group.
 #[derive(Debug)]
 enum RaceGroupError {
@@ -288,20 +293,30 @@ impl Router {
     store_hash: &str,
   ) -> Result<Option<ResolveResult>, RouterError> {
     if let Some(cached) = self.inner.lru.get(store_hash).await {
-      if !self
-        .cached_route_allows_filters(
+      let CachedFilterCheck::Accepted(narinfo_bytes) = self
+        .cached_route_filter_check(
           &cached.url,
+          store_hash,
           cached.narinfo_bytes.as_deref(),
         )
         .await
-      {
+      else {
         self.inner.lru.invalidate(store_hash).await;
         return Ok(None);
-      }
+      };
       ncro_metrics::get().narinfo_cache_hits.inc();
-      return Ok(Some((*cached).clone()));
+      let mut result = (*cached).clone();
+      if result.narinfo_bytes.is_none() {
+        result.narinfo_bytes = narinfo_bytes;
+        self
+          .inner
+          .lru
+          .insert(store_hash.to_string(), Arc::new(result.clone()))
+          .await;
+      }
+      return Ok(Some(result));
     }
-    let Some(entry) = self.inner.db.get_route(store_hash).await? else {
+    let Some(mut entry) = self.inner.db.get_route(store_hash).await? else {
       return Ok(None);
     };
     if !entry.is_valid() {
@@ -311,21 +326,26 @@ impl Router {
     if health.as_ref().is_some_and(|h| h.status == Status::Down) {
       return Ok(None);
     }
-    if !self
-      .cached_route_allows_filters(
+    let CachedFilterCheck::Accepted(narinfo_bytes) = self
+      .cached_route_filter_check(
         &entry.upstream_url,
+        store_hash,
         entry.narinfo_bytes.as_deref(),
       )
       .await
-    {
+    else {
       return Ok(None);
+    };
+    if entry.narinfo_bytes.is_none() && narinfo_bytes.is_some() {
+      entry.narinfo_bytes = narinfo_bytes;
+      self.inner.db.set_route(&entry).await?;
     }
     ncro_metrics::get().narinfo_cache_hits.inc();
     let result = ResolveResult {
-      url:           entry.upstream_url,
+      url:           entry.upstream_url.clone(),
       latency_ms:    entry.latency_ema,
       cache_hit:     true,
-      narinfo_bytes: entry.narinfo_bytes,
+      narinfo_bytes: entry.narinfo_bytes.clone(),
     };
     let arc = Arc::new(result.clone());
     self.inner.lru.insert(store_hash.to_string(), arc).await;
@@ -703,11 +723,12 @@ impl Router {
     !has_allow || allow_matched
   }
 
-  async fn cached_route_allows_filters(
+  async fn cached_route_filter_check(
     &self,
     upstream: &str,
+    store_hash: &str,
     narinfo_bytes: Option<&[u8]>,
-  ) -> bool {
+  ) -> CachedFilterCheck {
     if !self
       .inner
       .upstream_filters
@@ -715,15 +736,21 @@ impl Router {
       .await
       .contains_key(upstream)
     {
-      return true;
+      return CachedFilterCheck::Accepted(narinfo_bytes.map(<[u8]>::to_vec));
     }
-    let Some(bytes) = narinfo_bytes else {
-      return false;
-    };
-    let Ok(narinfo) = NarInfo::parse(bytes) else {
-      return false;
-    };
-    self.upstream_allows_narinfo(upstream, &narinfo).await
+    if let Some(bytes) = narinfo_bytes
+      && let Ok(narinfo) = NarInfo::parse(bytes)
+      && self.upstream_allows_narinfo(upstream, &narinfo).await
+    {
+      return CachedFilterCheck::Accepted(Some(bytes.to_vec()));
+    }
+
+    if let Ok((body, parsed)) = self.fetch_narinfo(upstream, store_hash).await
+      && self.upstream_allows_narinfo(upstream, &parsed).await
+    {
+      return CachedFilterCheck::Accepted(body);
+    }
+    CachedFilterCheck::Rejected
   }
 
   async fn fetch_narinfo(
@@ -839,8 +866,9 @@ mod tests {
   #![expect(clippy::unwrap_used, reason = "Fine in tests")]
   use std::{sync::Arc, time::Duration};
 
+  use chrono::Utc;
   use ncro_config::UpstreamConfig;
-  use ncro_db::Db;
+  use ncro_db::{Db, RouteEntry};
   use ncro_health::Prober;
   use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -1126,6 +1154,116 @@ mod tests {
       .unwrap();
 
     assert_eq!(result.url, accepted);
+    assert!(!result.cache_hit);
+  }
+
+  #[tokio::test]
+  async fn cached_route_without_narinfo_bytes_uses_cache_after_filter_check() {
+    let upstream = spawn_narinfo_server(200, "zedless-0.1.0").await;
+    let router =
+      make_router_with_upstreams(Duration::from_mins(1), &[UpstreamConfig {
+        url: upstream.clone(),
+        priority: 1,
+        ..Default::default()
+      }])
+      .await;
+    let now = Utc::now();
+    router
+      .inner
+      .db
+      .set_route(&RouteEntry {
+        store_path:    "abc123".to_string(),
+        upstream_url:  upstream.clone(),
+        latency_ms:    5.0,
+        latency_ema:   5.0,
+        last_verified: now,
+        query_count:   1,
+        failure_count: 0,
+        ttl:           now + chrono::Duration::hours(1),
+        nar_hash:      "sha256:abc".to_string(),
+        nar_size:      1,
+        nar_url:       "nar/test.nar.xz".to_string(),
+        narinfo_bytes: None,
+      })
+      .await
+      .unwrap();
+    router
+      .set_upstream_filters(upstream.clone(), vec![FilterRule {
+        action:  FilterAction::Allow,
+        field:   FilterField::Name,
+        pattern: "zedless*".to_string(),
+      }])
+      .await;
+
+    let result = router.resolve("abc123", &[]).await.unwrap();
+
+    assert_eq!(result.url, upstream);
+    assert!(result.cache_hit);
+    assert!(result.narinfo_bytes.is_some());
+    assert!(
+      router
+        .inner
+        .db
+        .get_route("abc123")
+        .await
+        .unwrap()
+        .unwrap()
+        .narinfo_bytes
+        .is_some()
+    );
+  }
+
+  #[tokio::test]
+  async fn cached_route_filter_check_failure_falls_back_to_race() {
+    let stale = spawn_narinfo_server(500, "stale-1.0").await;
+    let working = spawn_narinfo_server(200, "zedless-0.1.0").await;
+    let router = make_router_with_upstreams(Duration::from_mins(1), &[
+      UpstreamConfig {
+        url: stale.clone(),
+        priority: 1,
+        ..Default::default()
+      },
+      UpstreamConfig {
+        url: working.clone(),
+        priority: 2,
+        ..Default::default()
+      },
+    ])
+    .await;
+    let now = Utc::now();
+    router
+      .inner
+      .db
+      .set_route(&RouteEntry {
+        store_path:    "abc123".to_string(),
+        upstream_url:  stale.clone(),
+        latency_ms:    5.0,
+        latency_ema:   5.0,
+        last_verified: now,
+        query_count:   1,
+        failure_count: 0,
+        ttl:           now + chrono::Duration::hours(1),
+        nar_hash:      "sha256:abc".to_string(),
+        nar_size:      1,
+        nar_url:       "nar/test.nar.xz".to_string(),
+        narinfo_bytes: None,
+      })
+      .await
+      .unwrap();
+    router
+      .set_upstream_filters(stale, vec![FilterRule {
+        action:  FilterAction::Allow,
+        field:   FilterField::Name,
+        pattern: "zedless*".to_string(),
+      }])
+      .await;
+
+    let result = router
+      .resolve("abc123", std::slice::from_ref(&working))
+      .await
+      .unwrap();
+
+    assert_eq!(result.url, working);
     assert!(!result.cache_hit);
   }
 
