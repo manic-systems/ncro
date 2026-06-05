@@ -58,13 +58,18 @@ flowchart TD
     C --> E[Parallel HEAD race]
     E --> F[Fastest upstream wins]
     F --> G[Result cached in SQLite TTL]
+    E --> L{All caches unavailable?}
+    L -- yes --> M[Optional fallback cache]
 
     D --> H[Try upstreams in latency order]
     H --> I{404?}
     I -- yes --> J[Fallback to next upstream]
+    J --> N{All caches failed?}
+    N -- yes --> M
     I -- no --> K[Zero copy stream to client]
 
     J --> H
+    M --> A
     K --> A
 ```
 
@@ -82,6 +87,9 @@ The request flow follows two distinct paths depending on the request type:
    otherwise the narinfo is returned to the client
 6. The winning route is persisted with a configurable TTL; subsequent requests
    for the same hash use the cached route directly
+7. If all normal candidates are unavailable, ncro may try the optional fallback
+   cache. Fallback narinfos are returned directly and are not persisted as route
+   winners.
 
 ### NAR Streaming
 
@@ -93,7 +101,8 @@ The request flow follows two distinct paths depending on the request type:
    client with zero buffering on disk
 4. If the upstream returns 404, ncro falls through to the next upstream in
    latency order
-5. After all upstreams are exhausted with no success, a 404 is returned
+5. After all normal upstreams are exhausted with no success, ncro may
+   _optionally_ try the optional fallback cache before returning 404
 
 Background probes (`HEAD /nix-cache-info`) run every 30 seconds to keep latency
 measurements current and detect unhealthy upstreams. System design is covered
@@ -125,6 +134,10 @@ further in the [architechture document].
 - Per-upstream filters are applied after ncro fetches the full narinfo from a
   candidate winner. Rejected upstreams are not cached as winners and ncro keeps
   looking for another acceptable upstream.
+- `fallback_cache` is a last-resort safety valve. It is disabled by default,
+  defaults to `https://cache.nixos.org` when enabled, and is intentionally not
+  part of health probing, discovery, priority routing, filters, cooldown, or
+  route persistence.
 
 ## Quick Start
 
@@ -180,6 +193,13 @@ url      = "https://cache.internal.example.com"
 priority = 5
 username = "ncro"
 password = "hunter2" # it says ******* on my screen it's secure!
+
+# Last-resort fallback used only when all normal caches are unavailable.
+# Disabled by default and kept outside normal router features.
+[fallback_cache]
+enabled = false
+url = "https://cache.nixos.org"
+public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 
 [cache]
 db_path = "/var/lib/ncro/routes.db"
@@ -270,6 +290,33 @@ For a project-specific cache that should only serve `zedless`, prefer a high
 caches for routing, while the filter prevents unrelated paths from being
 accepted if the cache happens to respond first.
 
+### Fallback Cache
+
+`fallback_cache` is an optional last-resort cache for availability failures. It
+is disabled by default. When enabled, it defaults to the nixpkgs binary cache:
+
+```toml
+[fallback_cache]
+enabled = true
+url = "https://cache.nixos.org"
+public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+```
+
+The fallback cache accepts the same connection-related fields as an upstream:
+`url`, `public_key`, `username`, `password`, and Nix-style `s3://` URLs. It is
+not a member of `[[upstreams]]`, and ncro deliberately keeps it out of normal
+router behavior:
+
+- It is not health probed and does not appear in `/health`.
+- It is not affected by upstream priority, discovery, cooldown, or filters.
+- Successful fallback narinfo lookups are not stored in SQLite and do not become
+  route-cache winners.
+- It is used only after normal upstreams are unavailable for narinfo lookups, or
+  after normal NAR streaming attempts fail.
+
+Iif the router, filters, discovery, or health logic regresses, an enabled
+fallback cache can still provide a direct path to a known-good binary cache.
+
 ### S3 Upstreams
 
 ncro accepts Nix-style `s3://` URLs in the `url` field and fetches narinfo/NAR
@@ -349,7 +396,8 @@ the username field.
   };
 
   # Point Nix at the proxy. By default the module appends every configured
-  # upstream public_key to nix.settings.trusted-public-keys; set
+  # upstream public_key, plus the fallback_cache public_key when fallback is
+  # enabled, to nix.settings.trusted-public-keys; set
   # services.ncro.addUpstreamPublicKeys = false to manage those keys yourself.
   # NOTE: ncro needs to be the *only* substituter if you wish to benefit
   # from its capabilities fully. If there are other substituters in your
@@ -478,8 +526,10 @@ Prometheus metrics are available at `/metrics`.
   restarts.
 - Use a small `ttl` while testing and a larger one in production to reduce
   upstream probing.
-- Keep `cache.nix.org` and any private caches in the upstream list, with the
+- Keep `cache.nixos.org` and any private caches in the upstream list, with the
   most trusted cache first.
+- Enable `fallback_cache` only when you want a last-resort cache that bypasses
+  normal router features during upstream outages.
 - If you run behind a firewall or container network, make sure the listen port
   is reachable from your Nix clients.
 
