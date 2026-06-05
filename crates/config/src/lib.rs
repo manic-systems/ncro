@@ -123,6 +123,8 @@ mod tests {
     assert_eq!(cfg.server.listen, ":8080");
     assert_eq!(cfg.cache.max_entries, 100_000);
     assert_eq!(cfg.upstreams.len(), 1);
+    assert!(!cfg.fallback_cache.enabled);
+    assert_eq!(cfg.fallback_cache.upstream.url, "https://cache.nixos.org");
     cfg.validate()?;
     Ok(())
   }
@@ -243,6 +245,27 @@ priority = 10
   }
 
   #[test]
+  fn load_parses_s3_fallback_cache() -> Result<(), ConfigError> {
+    let toml = r#"
+[[upstreams]]
+url = "https://cache.example"
+
+[fallback_cache]
+enabled = true
+url = "s3://fallback-cache?endpoint=s3.example.com"
+"#;
+    let cfg: Config = toml::from_str(toml)?;
+    let mut cfg = cfg;
+    if cfg.fallback_cache.upstream.url.starts_with("s3://") {
+      cfg.fallback_cache.upstream.s3 =
+        Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
+    }
+    assert!(cfg.fallback_cache.enabled);
+    assert!(cfg.fallback_cache.upstream.s3.is_some());
+    Ok(())
+  }
+
+  #[test]
   #[expect(clippy::expect_used)]
   fn empty_listen_passes_validation() {
     // Socket activation supplies the fd at runtime; an empty listen address
@@ -328,6 +351,29 @@ pub struct UpstreamConfig {
   pub filters:    Vec<FilterRule>,
   #[serde(skip)]
   pub s3:         Option<S3Config>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FallbackCacheConfig {
+  pub enabled:  bool,
+  #[serde(flatten)]
+  pub upstream: UpstreamConfig,
+}
+
+impl Default for FallbackCacheConfig {
+  fn default() -> Self {
+    Self {
+      enabled:  false,
+      upstream: UpstreamConfig {
+        url: "https://cache.nixos.org".to_string(),
+        public_key: "cache.nixos.org-1:\
+                     6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+          .to_string(),
+        ..Default::default()
+      },
+    }
+  }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -483,28 +529,30 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-  pub server:    ServerConfig,
-  pub upstreams: Vec<UpstreamConfig>,
-  pub cache:     CacheConfig,
-  pub mesh:      MeshConfig,
-  pub discovery: DiscoveryConfig,
-  pub logging:   LoggingConfig,
+  pub server:         ServerConfig,
+  pub upstreams:      Vec<UpstreamConfig>,
+  pub fallback_cache: FallbackCacheConfig,
+  pub cache:          CacheConfig,
+  pub mesh:           MeshConfig,
+  pub discovery:      DiscoveryConfig,
+  pub logging:        LoggingConfig,
 }
 
 impl Default for Config {
   fn default() -> Self {
     Self {
-      server:    ServerConfig::default(),
-      upstreams: vec![UpstreamConfig {
+      server:         ServerConfig::default(),
+      upstreams:      vec![UpstreamConfig {
         url: "https://cache.nixos.org".to_string(),
         priority: 10,
         public_key: String::new(),
         ..Default::default()
       }],
-      cache:     CacheConfig::default(),
-      mesh:      MeshConfig::default(),
-      discovery: DiscoveryConfig::default(),
-      logging:   LoggingConfig::default(),
+      fallback_cache: FallbackCacheConfig::default(),
+      cache:          CacheConfig::default(),
+      mesh:           MeshConfig::default(),
+      discovery:      DiscoveryConfig::default(),
+      logging:        LoggingConfig::default(),
     }
   }
 }
@@ -543,6 +591,10 @@ impl Config {
         upstream.s3 = Some(parse_s3_url(&upstream.url)?);
       }
     }
+    if cfg.fallback_cache.upstream.url.starts_with("s3://") {
+      cfg.fallback_cache.upstream.s3 =
+        Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
+    }
 
     Ok(cfg)
   }
@@ -558,29 +610,10 @@ impl Config {
       ));
     }
     for (i, upstream) in self.upstreams.iter().enumerate() {
-      if upstream.url.is_empty() {
-        return Err(ConfigError::Validation(format!(
-          "upstream[{i}]: URL is empty"
-        )));
-      }
-      Url::parse(&upstream.url).map_err(|err| {
-        ConfigError::Validation(format!(
-          "upstream[{i}]: invalid URL {:?}: {err}",
-          upstream.url
-        ))
-      })?;
-      if !upstream.public_key.is_empty() && !upstream.public_key.contains(':') {
-        return Err(ConfigError::Validation(format!(
-          "upstream[{i}]: public_key must be in 'name:base64(key)' Nix format"
-        )));
-      }
-      for (j, filter) in upstream.filters.iter().enumerate() {
-        if filter.pattern.is_empty() {
-          return Err(ConfigError::Validation(format!(
-            "upstream[{i}].filters[{j}]: pattern is empty"
-          )));
-        }
-      }
+      validate_upstream(upstream, &format!("upstream[{i}]"))?;
+    }
+    if self.fallback_cache.enabled {
+      validate_upstream(&self.fallback_cache.upstream, "fallback_cache")?;
     }
     if self.server.cache_priority < 1 {
       return Err(ConfigError::Validation(format!(
@@ -685,4 +718,32 @@ impl Config {
     }
     Ok(())
   }
+}
+
+fn validate_upstream(
+  upstream: &UpstreamConfig,
+  label: &str,
+) -> Result<(), ConfigError> {
+  if upstream.url.is_empty() {
+    return Err(ConfigError::Validation(format!("{label}: URL is empty")));
+  }
+  Url::parse(&upstream.url).map_err(|err| {
+    ConfigError::Validation(format!(
+      "{label}: invalid URL {:?}: {err}",
+      upstream.url
+    ))
+  })?;
+  if !upstream.public_key.is_empty() && !upstream.public_key.contains(':') {
+    return Err(ConfigError::Validation(format!(
+      "{label}: public_key must be in 'name:base64(key)' Nix format"
+    )));
+  }
+  for (j, filter) in upstream.filters.iter().enumerate() {
+    if filter.pattern.is_empty() {
+      return Err(ConfigError::Validation(format!(
+        "{label}.filters[{j}]: pattern is empty"
+      )));
+    }
+  }
+  Ok(())
 }

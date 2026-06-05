@@ -8,11 +8,18 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-chrono              = { workspace = true, features = [ "serde" ] }
-serde               = { workspace = true, features = [ "derive" ] }
-sqlx                = { workspace = true, features = [ "runtime-tokio", "tls-rustls", "sqlite", "macros", "migrate", "chrono" ] }
+chrono = { workspace = true, features = [ "serde" ] }
+serde = { workspace = true, features = [ "derive" ] }
+sqlx = { workspace = true, features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "sqlite",
+  "macros",
+  "migrate",
+  "chrono",
+] }
 thiserror.workspace = true
-tokio               = { workspace = true, features = [ "fs" ] }
+tokio = { workspace = true, features = [ "fs" ] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [ "macros", "rt-multi-thread" ] }

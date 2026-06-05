@@ -24,9 +24,18 @@ pub struct AppState {
   prober:         Prober,
   db:             Db,
   upstreams:      Vec<UpstreamConfig>,
+  fallback_cache: Option<UpstreamConfig>,
   s3:             S3ClientPool,
   client:         reqwest::Client,
   cache_priority: i32,
+}
+
+pub struct AppConfig {
+  pub upstreams:      Vec<UpstreamConfig>,
+  pub fallback_cache: Option<UpstreamConfig>,
+  pub cache_priority: i32,
+  pub read_timeout:   std::time::Duration,
+  pub write_timeout:  std::time::Duration,
 }
 
 /// Build the HTTP application router.
@@ -38,22 +47,32 @@ pub fn app(
   router: Router,
   prober: Prober,
   db: Db,
-  upstreams: Vec<UpstreamConfig>,
-  cache_priority: i32,
-  read_timeout: std::time::Duration,
-  write_timeout: std::time::Duration,
+  config: AppConfig,
 ) -> Result<AxumRouter, reqwest::Error> {
+  let AppConfig {
+    upstreams,
+    fallback_cache,
+    cache_priority,
+    read_timeout,
+    write_timeout,
+  } = config;
   let s3 = S3ClientPool::default();
   for upstream in &upstreams {
     if let Some(config) = &upstream.s3 {
       s3.register(upstream.url.clone(), config.clone());
     }
   }
+  if let Some(upstream) = &fallback_cache
+    && let Some(config) = &upstream.s3
+  {
+    s3.register(upstream.url.clone(), config.clone());
+  }
   let state = AppState {
     router,
     prober,
     db,
     upstreams,
+    fallback_cache,
     s3,
     client: reqwest::Client::builder()
       .read_timeout(read_timeout)
@@ -169,7 +188,7 @@ async fn narinfo(
         req.method().clone(),
         req.headers(),
         format!("{}{}", result.url, req.uri().path()),
-        upstream_auth(&state.upstreams, &result.url),
+        upstream_auth(&state, &result.url),
       )
       .await
     },
@@ -179,6 +198,16 @@ async fn narinfo(
         .with_label_values(&["error"])
         .inc();
       StatusCode::NOT_FOUND.into_response()
+    },
+    Err(RouterError::UpstreamUnavailable | RouterError::NoCandidates(_)) => {
+      if let Some(resp) = try_fallback_narinfo(&state, hash, req).await {
+        return resp;
+      }
+      ncro_metrics::get()
+        .narinfo_requests
+        .with_label_values(&["error"])
+        .inc();
+      (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
     },
     Err(err) => {
       tracing::warn!(hash, error = %err, "narinfo resolve failed");
@@ -216,7 +245,7 @@ async fn nar(
       req.headers(),
       &entry.upstream_url,
       &path_and_query,
-      upstream_auth(&state.upstreams, &entry.upstream_url),
+      upstream_auth(&state, &entry.upstream_url),
     )
     .await
   {
@@ -241,7 +270,7 @@ async fn nar(
         req.headers(),
         &h.url,
         &path_and_query,
-        upstream_auth(&state.upstreams, &h.url),
+        upstream_auth(&state, &h.url),
       )
       .await
       {
@@ -249,15 +278,84 @@ async fn nar(
       }
     }
   }
+  if let Some(fallback) = &state.fallback_cache
+    && let Some(resp) = try_nar_upstream(
+      &state.client,
+      &state.s3,
+      req.method().clone(),
+      req.headers(),
+      &fallback.url,
+      &path_and_query,
+      upstream_auth(&state, &fallback.url),
+    )
+    .await
+  {
+    return resp;
+  }
   StatusCode::NOT_FOUND.into_response()
 }
 
+async fn try_fallback_narinfo(
+  state: &AppState,
+  hash: &str,
+  req: Request<Body>,
+) -> Option<Response> {
+  let fallback = state.fallback_cache.as_ref()?;
+  match state.router.resolve_fallback(hash, &fallback.url).await {
+    Ok(result) => {
+      tracing::warn!(
+        hash,
+        upstream = result.url,
+        latency_ms = result.latency_ms,
+        "narinfo routed to fallback cache"
+      );
+      ncro_metrics::get()
+        .narinfo_requests
+        .with_label_values(&["200"])
+        .inc();
+      if let Some(bytes) = result.narinfo_bytes {
+        return Some(
+          (
+            StatusCode::OK,
+            [("content-type", "text/x-nix-narinfo")],
+            Bytes::from(bytes),
+          )
+            .into_response(),
+        );
+      }
+      Some(
+        proxy(
+          &state.client,
+          req.method().clone(),
+          req.headers(),
+          format!("{}{}", result.url, req.uri().path()),
+          upstream_auth(state, &result.url),
+        )
+        .await,
+      )
+    },
+    Err(RouterError::NotFound) => {
+      ncro_metrics::get()
+        .narinfo_requests
+        .with_label_values(&["error"])
+        .inc();
+      Some(StatusCode::NOT_FOUND.into_response())
+    },
+    Err(err) => {
+      tracing::warn!(hash, upstream = fallback.url, error = %err, "fallback cache failed");
+      None
+    },
+  }
+}
+
 fn upstream_auth(
-  upstreams: &[UpstreamConfig],
+  state: &AppState,
   url: &str,
 ) -> Option<(String, Option<String>)> {
-  upstreams
+  state
+    .upstreams
     .iter()
+    .chain(state.fallback_cache.iter())
     .find(|u| u.url == url && !u.username.is_empty())
     .map(|u| (u.username.clone(), u.password.clone()))
 }

@@ -231,6 +231,28 @@ impl Router {
     self.inner.s3.register(upstream, config);
   }
 
+  /// Resolve through a last-resort fallback cache without using route cache,
+  /// health, priority, cooldown, filters, or route persistence.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RouterError::NotFound`] if the fallback cache does not have the
+  /// narinfo, or propagates fetch/parse/signature errors from the fallback.
+  pub async fn resolve_fallback(
+    &self,
+    store_hash: &str,
+    upstream: &str,
+  ) -> Result<ResolveResult, RouterError> {
+    let start = Instant::now();
+    let (body, _) = self.fetch_narinfo(upstream, store_hash).await?;
+    Ok(ResolveResult {
+      url:           upstream.to_string(),
+      latency_ms:    start.elapsed().as_secs_f64() * 1000.0,
+      cache_hit:     false,
+      narinfo_bytes: body,
+    })
+  }
+
   /// Resolve a narinfo hash to an upstream URL by checking the route cache
   /// then racing all candidates.
   ///
@@ -1114,6 +1136,26 @@ mod tests {
       .unwrap();
 
     assert_eq!(result.url, accepted);
+  }
+
+  #[tokio::test]
+  async fn fallback_resolve_ignores_filters_and_does_not_persist_route() {
+    let fallback = spawn_narinfo_server(200, "unrelated-1.0").await;
+    let router = make_router(Duration::from_mins(1)).await;
+    router
+      .set_upstream_filters(fallback.clone(), vec![FilterRule {
+        action:  FilterAction::Allow,
+        field:   FilterField::Name,
+        pattern: "zedless*".to_string(),
+      }])
+      .await;
+
+    let result = router.resolve_fallback("abc123", &fallback).await.unwrap();
+
+    assert_eq!(result.url, fallback);
+    assert!(!result.cache_hit);
+    assert!(result.narinfo_bytes.is_some());
+    assert!(router.inner.db.get_route("abc123").await.unwrap().is_none());
   }
 
   #[tokio::test]

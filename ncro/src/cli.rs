@@ -160,6 +160,26 @@ pub async fn run() -> anyhow::Result<()> {
       .set_upstream_filters(upstream.url.clone(), upstream.filters.clone())
       .await;
   }
+  if cfg.fallback_cache.enabled {
+    let upstream = &cfg.fallback_cache.upstream;
+    if let Some(s3) = &upstream.s3 {
+      router.register_s3_upstream(upstream.url.clone(), s3.clone());
+    }
+    if !upstream.public_key.is_empty() {
+      router
+        .set_upstream_key(upstream.url.clone(), upstream.public_key.clone())
+        .await?;
+    }
+    if !upstream.username.is_empty() {
+      router
+        .set_upstream_auth(
+          upstream.url.clone(),
+          upstream.username.clone(),
+          upstream.password.clone(),
+        )
+        .await;
+    }
+  }
 
   let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
   let probe_prober = prober.clone();
@@ -229,15 +249,16 @@ pub async fn run() -> anyhow::Result<()> {
     ));
   }
 
-  let app = ncro_server::app(
-    router,
-    prober,
-    db,
-    cfg.upstreams.clone(),
-    cfg.server.cache_priority,
-    cfg.server.read_timeout.0,
-    cfg.server.write_timeout.0,
-  )?;
+  let app = ncro_server::app(router, prober, db, ncro_server::AppConfig {
+    upstreams:      cfg.upstreams.clone(),
+    fallback_cache: cfg
+      .fallback_cache
+      .enabled
+      .then_some(cfg.fallback_cache.upstream.clone()),
+    cache_priority: cfg.server.cache_priority,
+    read_timeout:   cfg.server.read_timeout.0,
+    write_timeout:  cfg.server.write_timeout.0,
+  })?;
   let listener = match inherited_listener() {
     Some(std_listener) => {
       tracing::info!("socket activation: using inherited listener (fd 3)");
