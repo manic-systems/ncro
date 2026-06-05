@@ -7,7 +7,8 @@
   inherit (lib.modules) mkIf;
   inherit (lib.options) mkOption mkEnableOption literalExpression;
   inherit (lib.types) bool package;
-  inherit (lib) optionals optionalAttrs;
+  inherit (lib.lists) optional optionals;
+  inherit (lib.attrsets) optionalAttrs;
 
   tomlFormat = pkgs.formats.toml {};
   tomlType = tomlFormat.type;
@@ -27,8 +28,16 @@
     then "0.0.0.0${raw}"
     else raw;
 
-  upstreamPublicKeys = lib.pipe (cfg.settings.upstreams or []) [
-    (builtins.map (upstream: upstream.public_key or ""))
+  fallbackPublicKeys =
+    optional
+    (cfg.settings.fallback_cache.enabled or false)
+    (cfg.settings.fallback_cache.public_key or "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=");
+
+  upstreamPublicKeys = lib.pipe ((cfg.settings.upstreams or []) ++ fallbackPublicKeys) [
+    (builtins.map (upstream:
+      if builtins.isAttrs upstream
+      then upstream.public_key or ""
+      else upstream))
     (builtins.filter (key: key != ""))
     lib.unique
   ];

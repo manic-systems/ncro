@@ -13,12 +13,16 @@ flowchart LR
   info --> race[Parallel upstream race]
   race --> chosen[Chosen upstream]
   chosen --> cache
+  race --> fallback[Optional fallback cache]
   nar --> chosen
+  nar --> fallback
 ```
 
 The routing path is simple: a narinfo lookup first checks SQLite, then falls
 back to a parallel race across upstreams when there is no usable entry. The
-winning upstream is stored with a TTL, so later requests can skip the race.
+winning upstream is stored with a TTL, so later requests can skip the race. If
+all normal upstreams are unavailable, ncro can use a separately configured
+fallback cache as a last resort.
 
 ```mermaid
 sequenceDiagram
@@ -26,6 +30,7 @@ sequenceDiagram
   participant N as ncro
   participant S as SQLite
   participant U as Upstreams
+  participant F as Fallback cache
 
   C->>N: GET /<hash>.narinfo
   N->>S: lookup route
@@ -42,15 +47,26 @@ sequenceDiagram
       N->>U: continue with remaining candidates
     end
   end
+  opt all normal upstreams unavailable and fallback enabled
+    N->>F: fetch narinfo directly
+    F-->>N: narinfo body
+  end
   N-->>C: response
 ```
 
 Path filters sit after the narinfo fetch, not before the upstream race. A Nix
-client requests `/<hash>.narinfo`, so ncro only knows the store hash at the start
-of routing. The full `StorePath`, references, and deriver are inside the narinfo
-body. This means filtering is a validation step for candidate winners: if a
-winning upstream's narinfo is rejected, the route is not cached and ncro retries
-the remaining candidates.
+client requests `/<hash>.narinfo`, so ncro only knows the store hash at the
+start of routing. The full `StorePath`, references, and deriver are inside the
+narinfo body. This means filtering is a validation step for candidate winners:
+if a winning upstream's narinfo is rejected, the route is not cached and ncro
+retries the remaining candidates.
+
+> [!NOTE]
+> The fallback cache is deliberately outside this path. It is not an upstream in
+> the router's candidate set and is not affected by filters, priority,
+> discovery, cooldown, health state, or route-cache persistence. This gives
+> operators a direct recovery path to a known-good cache if the normal router
+> behavior or all configured upstreams are unavailable.
 
 NAR streaming, on another hand, follows a different path. There is actually no
 race and when a client requests `/nar/<hash>.nar`, ncro looks up the route for
@@ -64,6 +80,7 @@ sequenceDiagram
   participant C as Client
   participant N as ncro
   participant U as Upstreams
+  participant F as Fallback cache
 
   C->>N: GET /nar/<hash>.nar
   N->>U: try upstreams in latency order
@@ -72,6 +89,11 @@ sequenceDiagram
     N-->>C: stream (zero copy)
   else upstream returns 404
     N->>U: try next upstream
+  end
+  opt all normal upstreams fail and fallback enabled
+    N->>F: proxy NAR request directly
+    F-->>N: 200 + stream
+    N-->>C: stream (zero copy)
   end
 ```
 
@@ -102,8 +124,10 @@ Selection is driven by latency first. When two upstreams are effectively tied,
 it can distinguish a briefly slow cache from one that is trending unhealthy.
 Per-upstream filters can reject a candidate winner after its narinfo is fetched;
 this prevents project-specific caches from becoming winners for unrelated paths.
+Fallback cache traffic bypasses these router features and does not update health
+or routing state.
 
-> [!TIP]
+> [!NOTE]
 > Persistence is intentionally narrow. SQLite stores two kinds of data so a
 > restart does not force ncro to relearn everything from scratch.
 
@@ -111,7 +135,9 @@ First type of stored data is **route entries**, a mapping from narinfo hash to
 the winning upstream URL, stored with a creation timestamp and TTL. When the
 cache exceeds `max_entries`, the least recently used entry is evicted first.
 **Health snapshots** on another hand are per-upstream EMA latency estimates and
-failure counts, refreshed by the background probe loop.
+failure counts, refreshed by the background probe loop. Fallback-cache responses
+are (intentionally) not stored as route entries, so normal upstreams become
+active again as soon as they recover.
 
 Discovery and mesh are optional extensions. Discovery can add peers from the
 local network, while mesh gossip shares recent route decisions across trusted
@@ -132,37 +158,3 @@ and all background tasks run on tokio's async runtime, allowing concurrent
 upstream connections without thread-per-connection overhead. Shutdown is driven
 by the normal process termination path and background work is told to stop
 gracefully.
-
-## Configuration Reference
-
-The most important settings are `upstreams`, `server.listen`, `cache.db_path`,
-`cache.ttl`, `cache.negative_ttl`, `cache.latency_alpha`,
-`server.cache_priority`, `discovery.enabled`, `discovery.address_family`, and `mesh.enabled`.
-
-`upstreams` defines the cache backends ncro can use. Each upstream can carry a
-`priority` value, optional Basic Auth credentials, an optional `public_key` for
-narinfo signature verification, and optional `filters`.
-
-Upstream filters support `allow` and `deny` rules over narinfo fields. The
-available fields are `name`, `store_path`, `reference`, and `deriver`; patterns
-use `*` wildcards. Deny rules always win. If any allow rules are configured for
-an upstream, at least one must match for that upstream to be accepted.
-
-`cache.ttl` is how long a successful routing decision remains trusted. The
-negative TTL applies to failed lookups so ncro does not immediately retry the
-same miss.
-
-`cache.latency_alpha` controls how quickly EMA latency reacts to new probes. A
-smaller value smooths jitter; a larger value reacts faster to recent changes.
-
-`server.cache_priority` is used when the server layer needs to compare cache
-responses. It should stay positive.
-
-`discovery.enabled` and `mesh.enabled` turn on the optional network-coordination
-paths described above. Discovery is opportunistic; mesh is signed and intended
-for trusted peers.
-
-`discovery.address_family` controls which addresses from an mDNS-discovered
-peer are registered as upstreams. The default `any` registers all routable
-addresses (IPv4 and IPv6) so the race engine can try them in parallel. Set
-`ipv4` or `ipv6` when the upstream server only listens on one address family.
