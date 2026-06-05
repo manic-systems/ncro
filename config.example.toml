@@ -21,6 +21,16 @@ url      = "https://nix-community.cachix.org"
 # field   = "name"       # name | store_path | reference | deriver
 # pattern = "zedless*"   # supports '*' wildcards
 
+# Optional last-resort cache. Disabled by default. When enabled, this cache is
+# used only when the normal upstream set is unavailable, and is not part of
+# health probing, priority routing, discovery, filters, cooldown, or route DB
+# persistence. URL, public_key, username/password, and s3:// URLs are accepted
+# like regular upstreams.
+[fallback_cache]
+enabled    = false
+public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+url        = "https://cache.nixos.org"
+
 [cache]
 db_path       = "/var/lib/ncro/routes.db"
 latency_alpha = 0.3
