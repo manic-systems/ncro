@@ -8,7 +8,14 @@ use chrono::Utc;
 use dashmap::{DashMap, mapref::entry::Entry};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use moka::future::Cache as MokaCache;
-use ncro_config::{FilterAction, FilterField, FilterRule};
+use ncro_config::{
+  FilterAction,
+  FilterField,
+  FilterRule,
+  NarUrlMode,
+  S3Config,
+  UpstreamConfig,
+};
 use ncro_db::{Db, DbError, RouteEntry};
 use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
@@ -34,6 +41,59 @@ pub enum RouterError {
   ParseNarinfo(#[from] NarInfoError),
   #[error(transparent)]
   Db(#[from] DbError),
+}
+
+#[derive(Debug, Error)]
+pub enum UpstreamRegistrationError {
+  #[error("invalid upstream public key: {0}")]
+  PublicKey(#[from] NarInfoError),
+  #[error("build upstream HTTP client: {0}")]
+  HttpClient(#[from] reqwest::Error),
+}
+
+pub trait RouterUpstream {
+  fn url(&self) -> &str;
+  fn public_key(&self) -> &str;
+  fn username(&self) -> &str;
+  fn password(&self) -> Option<&str>;
+  fn filters(&self) -> &[FilterRule];
+  fn nar_url_mode(&self) -> NarUrlMode;
+  fn narinfo_timeout(&self) -> Option<Duration>;
+  fn s3(&self) -> Option<&S3Config>;
+}
+
+impl RouterUpstream for UpstreamConfig {
+  fn url(&self) -> &str {
+    &self.url
+  }
+
+  fn public_key(&self) -> &str {
+    &self.public_key
+  }
+
+  fn username(&self) -> &str {
+    &self.username
+  }
+
+  fn password(&self) -> Option<&str> {
+    self.password.as_deref()
+  }
+
+  fn filters(&self) -> &[FilterRule] {
+    &self.filters
+  }
+
+  fn nar_url_mode(&self) -> NarUrlMode {
+    self.nar_url_mode
+  }
+
+  fn narinfo_timeout(&self) -> Option<Duration> {
+    self.narinfo_timeout.as_ref().map(|timeout| timeout.0)
+  }
+
+  fn s3(&self) -> Option<&S3Config> {
+    self.s3.as_ref()
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +129,7 @@ struct RouterInner {
   upstream_keys:            RwLock<HashMap<String, String>>,
   upstream_auth:            RwLock<HashMap<String, (String, Option<String>)>>,
   upstream_filters:         RwLock<HashMap<String, Vec<FilterRule>>>,
+  upstream_nar_url_modes:   RwLock<HashMap<String, NarUrlMode>>,
   inflight:                 DashMap<String, Arc<Mutex<()>>>,
   lru:                      MokaCache<String, Arc<ResolveResult>>,
   miss_lru:                 MokaCache<String, ()>,
@@ -155,6 +216,7 @@ impl Router {
         upstream_keys: RwLock::new(HashMap::new()),
         upstream_auth: RwLock::new(HashMap::new()),
         upstream_filters: RwLock::new(HashMap::new()),
+        upstream_nar_url_modes: RwLock::new(HashMap::new()),
         inflight: DashMap::new(),
         lru: MokaCache::builder()
           .max_capacity(1024)
@@ -177,9 +239,60 @@ impl Router {
 
   /// # Errors
   ///
+  /// Returns [`UpstreamRegistrationError`] if the upstream public key is
+  /// invalid or a per-upstream HTTP client cannot be built.
+  pub async fn register_upstream(
+    &self,
+    upstream: &(impl RouterUpstream + Sync + ?Sized),
+  ) -> Result<(), UpstreamRegistrationError> {
+    if let Some(s3) = upstream.s3() {
+      self
+        .inner
+        .s3
+        .register(upstream.url().to_string(), s3.clone());
+    }
+    if !upstream.public_key().is_empty() {
+      self
+        .register_upstream_key(
+          upstream.url().to_string(),
+          upstream.public_key().to_string(),
+        )
+        .await?;
+    }
+    if !upstream.username().is_empty() {
+      self
+        .register_upstream_auth(
+          upstream.url().to_string(),
+          upstream.username().to_string(),
+          upstream.password().map(str::to_string),
+        )
+        .await;
+    }
+    self
+      .register_upstream_filters(
+        upstream.url().to_string(),
+        upstream.filters().to_vec(),
+      )
+      .await;
+    self
+      .register_upstream_nar_url_mode(
+        upstream.url().to_string(),
+        upstream.nar_url_mode(),
+      )
+      .await;
+    if let Some(timeout) = upstream.narinfo_timeout() {
+      self
+        .register_upstream_narinfo_timeout(upstream.url().to_string(), timeout)
+        .await?;
+    }
+    Ok(())
+  }
+
+  /// # Errors
+  ///
   /// Returns [`NarInfoError`] if `public_key` is not in valid `name:base64`
   /// Nix format.
-  pub async fn set_upstream_key(
+  async fn register_upstream_key(
     &self,
     url: String,
     public_key: String,
@@ -195,7 +308,7 @@ impl Router {
   }
 
   /// Register HTTP Basic Auth credentials for an upstream URL.
-  pub async fn set_upstream_auth(
+  async fn register_upstream_auth(
     &self,
     url: String,
     username: String,
@@ -214,6 +327,14 @@ impl Router {
     url: String,
     filters: Vec<FilterRule>,
   ) {
+    self.register_upstream_filters(url, filters).await;
+  }
+
+  async fn register_upstream_filters(
+    &self,
+    url: String,
+    filters: Vec<FilterRule>,
+  ) {
     if filters.is_empty() {
       return;
     }
@@ -225,12 +346,20 @@ impl Router {
       .insert(url, filters);
   }
 
-  pub fn register_s3_upstream(
+  async fn register_upstream_nar_url_mode(
     &self,
-    upstream: String,
-    config: ncro_config::S3Config,
+    url: String,
+    mode: NarUrlMode,
   ) {
-    self.inner.s3.register(upstream, config);
+    if mode == NarUrlMode::Keep {
+      return;
+    }
+    self
+      .inner
+      .upstream_nar_url_modes
+      .write()
+      .await
+      .insert(url, mode);
   }
 
   /// Build and register a per-upstream HTTP client with a custom narinfo
@@ -240,7 +369,7 @@ impl Router {
   /// # Errors
   ///
   /// Returns an error if the per-upstream client cannot be built.
-  pub async fn set_upstream_narinfo_timeout(
+  async fn register_upstream_narinfo_timeout(
     &self,
     url: String,
     timeout: Duration,
@@ -269,11 +398,13 @@ impl Router {
   ) -> Result<ResolveResult, RouterError> {
     let start = Instant::now();
     let (body, _) = self.fetch_narinfo(upstream, store_hash).await?;
+    let narinfo_bytes =
+      self.response_narinfo_bytes(upstream, body.as_deref()).await;
     Ok(ResolveResult {
-      url:           upstream.to_string(),
-      latency_ms:    start.elapsed().as_secs_f64() * 1000.0,
-      cache_hit:     false,
-      narinfo_bytes: body,
+      url: upstream.to_string(),
+      latency_ms: start.elapsed().as_secs_f64() * 1000.0,
+      cache_hit: false,
+      narinfo_bytes,
     })
   }
 
@@ -353,7 +484,9 @@ impl Router {
       ncro_metrics::get().narinfo_cache_hits.inc();
       let mut result = (*cached).clone();
       if result.narinfo_bytes.is_none() {
-        result.narinfo_bytes = narinfo_bytes;
+        result.narinfo_bytes = self
+          .response_narinfo_bytes(&cached.url, narinfo_bytes.as_deref())
+          .await;
         self
           .inner
           .lru
@@ -387,11 +520,17 @@ impl Router {
       self.inner.db.set_route(&entry).await?;
     }
     ncro_metrics::get().narinfo_cache_hits.inc();
+    let narinfo_bytes = self
+      .response_narinfo_bytes(
+        &entry.upstream_url,
+        entry.narinfo_bytes.as_deref(),
+      )
+      .await;
     let result = ResolveResult {
-      url:           entry.upstream_url.clone(),
-      latency_ms:    entry.latency_ema,
-      cache_hit:     true,
-      narinfo_bytes: entry.narinfo_bytes.clone(),
+      url: entry.upstream_url.clone(),
+      latency_ms: entry.latency_ema,
+      cache_hit: true,
+      narinfo_bytes,
     };
     let arc = Arc::new(result.clone());
     self.inner.lru.insert(store_hash.to_string(), arc).await;
@@ -730,7 +869,9 @@ impl Router {
       url:           winner.url.clone(),
       latency_ms:    winner.latency_ms,
       cache_hit:     false,
-      narinfo_bytes: body.clone(),
+      narinfo_bytes: self
+        .response_narinfo_bytes(&winner.url, body.as_deref())
+        .await,
     };
     self
       .inner
@@ -848,6 +989,79 @@ impl Router {
     }
     Ok((Some(body), parsed))
   }
+
+  async fn response_narinfo_bytes(
+    &self,
+    upstream: &str,
+    body: Option<&[u8]>,
+  ) -> Option<Vec<u8>> {
+    let body = body?;
+    let mode = self
+      .inner
+      .upstream_nar_url_modes
+      .read()
+      .await
+      .get(upstream)
+      .copied()
+      .unwrap_or_default();
+    Some(rewrite_narinfo_url(body, upstream, mode))
+  }
+}
+
+fn rewrite_narinfo_url(
+  body: &[u8],
+  upstream: &str,
+  mode: NarUrlMode,
+) -> Vec<u8> {
+  if mode == NarUrlMode::Keep {
+    return body.to_vec();
+  }
+  let Ok(text) = std::str::from_utf8(body) else {
+    return body.to_vec();
+  };
+  let mut out = String::with_capacity(text.len() + upstream.len());
+  for line in text.split_inclusive('\n') {
+    let (line, newline) = line.strip_suffix('\n').map_or((line, ""), |line| {
+      line
+        .strip_suffix('\r')
+        .map_or((line, "\n"), |line| (line, "\r\n"))
+    });
+    if let Some(url) = line.strip_prefix("URL: ") {
+      out.push_str("URL: ");
+      out.push_str(&rewrite_nar_url_value(url, upstream, mode));
+    } else {
+      out.push_str(line);
+    }
+    out.push_str(newline);
+  }
+  out.into_bytes()
+}
+
+fn rewrite_nar_url_value(
+  url: &str,
+  upstream: &str,
+  mode: NarUrlMode,
+) -> String {
+  match mode {
+    NarUrlMode::Keep => url.to_string(),
+    NarUrlMode::ToSelf => relative_nar_url(url).to_string(),
+    NarUrlMode::ToUpstream => {
+      format!(
+        "{}/{}",
+        upstream.trim_end_matches('/'),
+        relative_nar_url(url).trim_start_matches('/')
+      )
+    },
+  }
+}
+
+fn relative_nar_url(url: &str) -> &str {
+  if let Some((_, rest)) = url.split_once("://")
+    && let Some((_, path)) = rest.split_once('/')
+  {
+    return path;
+  }
+  url.trim_start_matches('/')
 }
 
 fn filter_rule_matches(rule: &FilterRule, narinfo: &NarInfo) -> bool {
@@ -922,7 +1136,7 @@ mod tests {
   use std::{sync::Arc, time::Duration};
 
   use chrono::Utc;
-  use ncro_config::UpstreamConfig;
+  use ncro_config::{NarUrlMode, UpstreamConfig};
   use ncro_db::{Db, RouteEntry};
   use ncro_health::Prober;
   use tokio::{
@@ -940,6 +1154,7 @@ mod tests {
     Router,
     RouterTuning,
     filter_rule_matches,
+    rewrite_narinfo_url,
     store_path_name,
     wildcard_match,
   };
@@ -1082,6 +1297,33 @@ mod tests {
       },
       &narinfo,
     ));
+  }
+
+  #[test]
+  fn narinfo_url_to_self_preserves_path_and_query() {
+    let body = b"StorePath: /nix/store/abc-hello\nURL: https://cache.example/nar/abc.nar.xz?token=1\nNarHash: sha256:abc\nNarSize: 1\n";
+
+    let rewritten =
+      rewrite_narinfo_url(body, "https://cache.example", NarUrlMode::ToSelf);
+
+    let rewritten = String::from_utf8(rewritten).unwrap();
+    assert!(rewritten.contains("URL: nar/abc.nar.xz?token=1\n"));
+  }
+
+  #[test]
+  fn narinfo_url_to_upstream_uses_selected_upstream() {
+    let body = b"StorePath: /nix/store/abc-hello\nURL: /nar/abc.nar.xz\nNarHash: sha256:abc\nNarSize: 1\n";
+
+    let rewritten = rewrite_narinfo_url(
+      body,
+      "https://cache.example/root/",
+      NarUrlMode::ToUpstream,
+    );
+
+    let rewritten = String::from_utf8(rewritten).unwrap();
+    assert!(
+      rewritten.contains("URL: https://cache.example/root/nar/abc.nar.xz\n")
+    );
   }
 
   #[tokio::test]

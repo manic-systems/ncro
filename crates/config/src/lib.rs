@@ -314,7 +314,7 @@ impl<'de> Deserialize<'de> for HumanDuration {
   }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FilterAction {
   #[default]
@@ -330,6 +330,18 @@ pub enum FilterField {
   StorePath,
   Reference,
   Deriver,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NarUrlMode {
+  /// Return the upstream narinfo `URL:` line unchanged.
+  #[default]
+  Keep,
+  /// Rewrite `URL:` to a relative path so Nix fetches NARs through NCRO.
+  ToSelf,
+  /// Rewrite `URL:` to an absolute URL rooted at the selected upstream.
+  ToUpstream,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -361,6 +373,8 @@ pub struct UpstreamConfig {
   /// fetched. Deny rules reject immediately; if any allow rules exist,
   /// at least one must match.
   pub filters:         Vec<FilterRule>,
+  /// Controls how the narinfo `URL:` field is returned to clients.
+  pub nar_url_mode:    NarUrlMode,
   /// Optional per-upstream timeout for narinfo HEAD races and GET fetches.
   /// When unset, the router's global race timeout is used.
   pub narinfo_timeout: Option<HumanDuration>,
