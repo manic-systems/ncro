@@ -24,6 +24,7 @@
 
   cacheKey1Name = "ncro-e2e-cache1";
   cacheKey2Name = "ncro-e2e-cache2";
+  cacheKeyBadUrlName = "ncro-e2e-badurl-cache";
 
   # Shared NixOS module applied to every node.
   commonBase = {
@@ -91,6 +92,63 @@ in
           environment.NIX_SECRET_KEY_FILE = "/etc/nix/cache-key.sec";
           serviceConfig = {
             ExecStart = "${pkgs.nix-serve-ng}/bin/nix-serve --port 5000";
+            Restart = "on-failure";
+          };
+        };
+      };
+
+      # Static binary cache whose narinfo advertises an unreachable absolute
+      # NAR URL. The NAR itself is present under /nar/*, so a client only
+      # succeeds when NCRO rewrites the narinfo URL back through itself.
+      badurlcache = {
+        config,
+        pkgs,
+        ...
+      }: {
+        imports = [commonBase];
+
+        system.extraDependencies = [payload1];
+
+        systemd.services.setup-badurl-cache = {
+          description = "Generate static cache with deliberately bad narinfo URLs";
+          wantedBy = ["multi-user.target"];
+          before = ["badurl-cache.service"];
+          after = ["nix-daemon.service"];
+          requires = ["nix-daemon.service"];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            ExecStart = pkgs.writeShellScript "setup-badurl-cache" ''
+              set -euo pipefail
+              mkdir -p /etc/nix /srv/badurl-cache
+              if [ ! -f /etc/nix/cache-key.sec ]; then
+                ${config.nix.package}/bin/nix-store \
+                  --generate-binary-cache-key "${cacheKeyBadUrlName}" \
+                  /etc/nix/cache-key.sec \
+                  /etc/nix/cache-key.pub
+              fi
+              chmod 644 /etc/nix/cache-key.pub /etc/nix/cache-key.sec
+
+              ${config.nix.package}/bin/nix copy \
+                --to 'file:///srv/badurl-cache?compression=xz&secret-key=/etc/nix/cache-key.sec' \
+                '${payload1}'
+
+              for narinfo in /srv/badurl-cache/*.narinfo; do
+                ${pkgs.gnused}/bin/sed -i \
+                  's#^URL: /*#URL: http://127.0.0.1:9/#' \
+                  "$narinfo"
+              done
+            '';
+          };
+        };
+
+        systemd.services.badurl-cache = {
+          description = "Serve static cache with bad narinfo URLs";
+          wantedBy = ["multi-user.target"];
+          after = ["setup-badurl-cache.service" "network.target"];
+          requires = ["setup-badurl-cache.service"];
+          serviceConfig = {
+            ExecStart = "${pkgs.python3}/bin/python3 -m http.server 5000 --directory /srv/badurl-cache"; # insane I know
             Restart = "on-failure";
           };
         };
@@ -250,6 +308,37 @@ in
           };
         };
       };
+
+      # Fourth ncro instance. Its upstream intentionally advertises broken NAR
+      # URLs, so nix copy only succeeds when nar_url_mode = "to_self" rewrites
+      # the client-visible narinfo URL back through NCRO.
+      rewriter = {
+        imports = [
+          self.nixosModules.ncro
+          commonBase
+        ];
+
+        nix.settings.trusted-substituters = ["http://localhost:8080"];
+
+        services.ncro = {
+          enable = true;
+          settings = {
+            server.listen = ":8080";
+            upstreams = [
+              {
+                url = "http://badurlcache:5000";
+                priority = 1;
+                nar_url_mode = "to_self";
+              }
+            ];
+
+            cache = {
+              ttl = "5m";
+              negative_ttl = "30s";
+            };
+          };
+        };
+      };
     };
 
     testScript = ''
@@ -286,6 +375,10 @@ in
       bincache1.wait_for_unit("nix-serve-ng.service")
       bincache1.wait_for_open_port(5000)
 
+      badurlcache.wait_for_unit("setup-badurl-cache.service")
+      badurlcache.wait_for_unit("badurl-cache.service")
+      badurlcache.wait_for_open_port(5000)
+
       bincache2.wait_for_unit("setup-cache.service")
       bincache2.wait_for_unit("harmonia.service")
       bincache2.wait_for_open_port(5000)
@@ -299,6 +392,9 @@ in
       filtered.wait_for_unit("ncro.service")
       filtered.wait_for_open_port(8080)
 
+      rewriter.wait_for_unit("ncro.service")
+      rewriter.wait_for_open_port(8080)
+
       with subtest("binary caches serve nix-cache-info"):
           for node, port in ((bincache1, 5000), (bincache2, 5000)):
               out = node.succeed(f"curl -sf http://localhost:{port}/nix-cache-info")
@@ -308,7 +404,8 @@ in
       with subtest("each cache backend serves its own payload narinfo directly"):
           cache1_public_key = bincache1.succeed("cat /etc/nix/cache-key.pub").strip()
           cache2_public_key = bincache2.succeed("cat /etc/nix/cache-key.pub").strip()
-          trusted_keys = f"{cache1_public_key} {cache2_public_key}"
+          badurl_public_key = badurlcache.succeed("cat /etc/nix/cache-key.pub").strip()
+          trusted_keys = f"{cache1_public_key} {cache2_public_key} {badurl_public_key}"
 
           out1 = bincache1.succeed(f"curl -sf http://localhost:5000/{hash1}.narinfo")
           assert "StorePath" in out1, \
@@ -363,6 +460,24 @@ in
           )
           host.succeed(f"test -f {payload1_path}/data")
           host.succeed(f"grep -q 'nix-serve-ng' {payload1_path}/data")
+
+      with subtest("nar_url_mode to_self rewrites bad upstream nar URL"):
+          upstream_narinfo = badurlcache.succeed(f"curl -sf http://localhost:5000/{hash1}.narinfo")
+          assert "URL: http://127.0.0.1:9/nar/" in upstream_narinfo, \
+              f"badurlcache did not advertise unreachable absolute NAR URL: {upstream_narinfo!r}"
+
+          rewritten_narinfo = rewriter.succeed(f"curl -sf http://localhost:8080/{hash1}.narinfo")
+          assert "URL: nar/" in rewritten_narinfo, \
+              f"rewriter ncro did not rewrite NAR URL to relative path: {rewritten_narinfo!r}"
+          assert "127.0.0.1:9" not in rewritten_narinfo, \
+              f"rewriter ncro leaked unreachable upstream NAR URL: {rewritten_narinfo!r}"
+
+          rewriter.fail(f"nix store ls {payload1_path} 2>/dev/null")
+          rewriter.succeed(
+              f"nix copy --from http://localhost:8080 --extra-trusted-public-keys '{trusted_keys}' {payload1_path}"
+          )
+          rewriter.succeed(f"test -f {payload1_path}/data")
+          rewriter.succeed(f"grep -q 'nix-serve-ng' {payload1_path}/data")
 
       with subtest("nix copy payload2 (harmonia) through host ncro"):
           host.fail(f"nix store ls {payload2_path} 2>/dev/null")
