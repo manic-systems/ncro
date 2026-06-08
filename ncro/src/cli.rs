@@ -139,56 +139,12 @@ pub async fn run() -> anyhow::Result<()> {
   )?;
 
   for upstream in &cfg.upstreams {
-    if let Some(s3) = &upstream.s3 {
-      router.register_s3_upstream(upstream.url.clone(), s3.clone());
-    }
-    if !upstream.public_key.is_empty() {
-      router
-        .set_upstream_key(upstream.url.clone(), upstream.public_key.clone())
-        .await?;
-    }
-    if !upstream.username.is_empty() {
-      router
-        .set_upstream_auth(
-          upstream.url.clone(),
-          upstream.username.clone(),
-          upstream.password.clone(),
-        )
-        .await;
-    }
-    router
-      .set_upstream_filters(upstream.url.clone(), upstream.filters.clone())
-      .await;
-    if let Some(timeout) = &upstream.narinfo_timeout {
-      router
-        .set_upstream_narinfo_timeout(upstream.url.clone(), timeout.0)
-        .await?;
-    }
+    router.register_upstream(upstream).await?;
   }
   if cfg.fallback_cache.enabled {
-    let upstream = &cfg.fallback_cache.upstream;
-    if let Some(s3) = &upstream.s3 {
-      router.register_s3_upstream(upstream.url.clone(), s3.clone());
-    }
-    if !upstream.public_key.is_empty() {
-      router
-        .set_upstream_key(upstream.url.clone(), upstream.public_key.clone())
-        .await?;
-    }
-    if !upstream.username.is_empty() {
-      router
-        .set_upstream_auth(
-          upstream.url.clone(),
-          upstream.username.clone(),
-          upstream.password.clone(),
-        )
-        .await;
-    }
-    if let Some(timeout) = &upstream.narinfo_timeout {
-      router
-        .set_upstream_narinfo_timeout(upstream.url.clone(), timeout.0)
-        .await?;
-    }
+    router
+      .register_upstream(&cfg.fallback_cache.upstream)
+      .await?;
   }
 
   let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
