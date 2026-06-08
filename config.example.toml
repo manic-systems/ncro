@@ -16,6 +16,7 @@ url      = "https://nix-community.cachix.org"
 # Optional per-upstream timeout overrides. When set, these override the global
 # timeouts for this upstream only.
 #
+# nar_url_mode    = "keep" # keep | to_self | to_upstream
 # narinfo_timeout = "10s"  # overrides the router's race timeout for narinfo
 # nar_timeout     = "60s"  # overrides the server's read_timeout for NAR streams
 
