@@ -13,6 +13,12 @@ url        = "https://cache.nixos.org"
 priority = 20
 url      = "https://nix-community.cachix.org"
 
+# Optional per-upstream timeout overrides. When set, these override the global
+# timeouts for this upstream only.
+#
+# narinfo_timeout = "10s"  # overrides the router's race timeout for narinfo
+# nar_timeout     = "60s"  # overrides the server's read_timeout for NAR streams
+
 # Optional per-upstream filters. Deny rules always reject matching paths. If an
 # upstream has any allow rules, at least one allow rule must match.
 #
