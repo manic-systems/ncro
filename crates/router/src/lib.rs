@@ -64,6 +64,7 @@ struct RouterInner {
   race_timeout:             Duration,
   negative_ttl:             Duration,
   client:                   reqwest::Client,
+  upstream_clients:         RwLock<HashMap<String, reqwest::Client>>,
   s3:                       S3ClientPool,
   upstream_keys:            RwLock<HashMap<String, String>>,
   upstream_auth:            RwLock<HashMap<String, (String, Option<String>)>>,
@@ -149,6 +150,7 @@ impl Router {
         race_timeout,
         negative_ttl,
         client: reqwest::Client::builder().timeout(race_timeout).build()?,
+        upstream_clients: RwLock::new(HashMap::new()),
         s3: S3ClientPool::default(),
         upstream_keys: RwLock::new(HashMap::new()),
         upstream_auth: RwLock::new(HashMap::new()),
@@ -229,6 +231,28 @@ impl Router {
     config: ncro_config::S3Config,
   ) {
     self.inner.s3.register(upstream, config);
+  }
+
+  /// Build and register a per-upstream HTTP client with a custom narinfo
+  /// timeout. When set, this client is used in place of the default
+  /// race-timeout client for HEAD races and GET fetches against `url`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the per-upstream client cannot be built.
+  pub async fn set_upstream_narinfo_timeout(
+    &self,
+    url: String,
+    timeout: Duration,
+  ) -> Result<(), reqwest::Error> {
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
+    self
+      .inner
+      .upstream_clients
+      .write()
+      .await
+      .insert(url, client);
+    Ok(())
   }
 
   /// Resolve through a last-resort fallback cache without using route cache,
@@ -487,11 +511,15 @@ impl Router {
     group: &[String],
   ) -> (Result<RaceResult, RaceGroupError>, u32) {
     let auth_snapshot = self.inner.upstream_auth.read().await.clone();
+    let clients_snapshot = self.inner.upstream_clients.read().await.clone();
     let mut handles = FuturesUnordered::new();
     for upstream in group {
       let upstream = upstream.clone();
       let store_hash = store_hash.to_string();
-      let client = self.inner.client.clone();
+      let client = clients_snapshot
+        .get(&upstream)
+        .cloned()
+        .unwrap_or_else(|| self.inner.client.clone());
       let s3 = self.inner.s3.clone();
       let gate = self.upstream_gate(&upstream);
       let auth = auth_snapshot.get(&upstream).cloned();
@@ -789,10 +817,15 @@ impl Router {
         .ok_or(RouterError::NotFound)?
     } else {
       let auth = self.inner.upstream_auth.read().await.get(upstream).cloned();
-      let mut req = self
+      let client = self
         .inner
-        .client
-        .get(format!("{upstream}/{store_hash}.narinfo"));
+        .upstream_clients
+        .read()
+        .await
+        .get(upstream)
+        .cloned()
+        .unwrap_or_else(|| self.inner.client.clone());
+      let mut req = client.get(format!("{upstream}/{store_hash}.narinfo"));
       if let Some((user, pass)) = auth {
         req = req.basic_auth(user, pass);
       }

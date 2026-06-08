@@ -343,14 +343,34 @@ pub struct FilterRule {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
-  pub url:        String,
-  pub priority:   i32,
-  pub public_key: String,
-  pub username:   String,
-  pub password:   Option<String>,
-  pub filters:    Vec<FilterRule>,
+  /// Base URL of the substituter (http, https, or `s3://`).
+  pub url:             String,
+  /// Priority for latency tiebreaking and race ordering. Lower values are
+  /// preferred. Two upstreams within 10 % EMA latency are resolved by
+  /// this priority.
+  pub priority:        i32,
+  /// Nix-style `name:base64(key)` public key for narinfo signature
+  /// verification. Leave empty to skip verification.
+  pub public_key:      String,
+  /// HTTP Basic Auth username. Requests are made without authentication
+  /// when empty.
+  pub username:        String,
+  /// HTTP Basic Auth password.
+  pub password:        Option<String>,
+  /// Per-upstream allow/deny path filters evaluated after the narinfo is
+  /// fetched. Deny rules reject immediately; if any allow rules exist,
+  /// at least one must match.
+  pub filters:         Vec<FilterRule>,
+  /// Optional per-upstream timeout for narinfo HEAD races and GET fetches.
+  /// When unset, the router's global race timeout is used.
+  pub narinfo_timeout: Option<HumanDuration>,
+  /// Optional per-upstream timeout for NAR file streaming requests.
+  /// When unset, the server's global `read_timeout` is used.
+  pub nar_timeout:     Option<HumanDuration>,
+  /// Parsed S3 configuration derived from `url` when the scheme is `s3://`.
+  /// Not set directly in config, but populated automatically at load time.
   #[serde(skip)]
-  pub s3:         Option<S3Config>,
+  pub s3:              Option<S3Config>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

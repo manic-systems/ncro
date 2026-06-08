@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+  collections::{BTreeMap, HashMap},
+  sync::Arc,
+};
 
 use axum::{
   Router as AxumRouter,
@@ -26,8 +29,15 @@ pub struct AppState {
   upstreams:      Vec<UpstreamConfig>,
   fallback_cache: Option<UpstreamConfig>,
   s3:             S3ClientPool,
-  client:         reqwest::Client,
+  nar_clients:    HashMap<String, reqwest::Client>,
+  default_client: reqwest::Client,
   cache_priority: i32,
+}
+
+impl AppState {
+  fn nar_client(&self, url: &str) -> &reqwest::Client {
+    self.nar_clients.get(url).unwrap_or(&self.default_client)
+  }
 }
 
 pub struct AppConfig {
@@ -67,6 +77,29 @@ pub fn app(
   {
     s3.register(upstream.url.clone(), config.clone());
   }
+
+  let mut nar_clients = HashMap::new();
+  for upstream in &upstreams {
+    let timeout = upstream.nar_timeout.as_ref().map_or(read_timeout, |t| t.0);
+    nar_clients.insert(
+      upstream.url.clone(),
+      reqwest::Client::builder().read_timeout(timeout).build()?,
+    );
+  }
+  if let Some(upstream) = &fallback_cache
+    && !nar_clients.contains_key(&upstream.url)
+  {
+    let timeout = upstream.nar_timeout.as_ref().map_or(read_timeout, |t| t.0);
+    nar_clients.insert(
+      upstream.url.clone(),
+      reqwest::Client::builder().read_timeout(timeout).build()?,
+    );
+  }
+
+  let default_client = reqwest::Client::builder()
+    .read_timeout(read_timeout)
+    .build()?;
+
   let state = AppState {
     router,
     prober,
@@ -74,9 +107,8 @@ pub fn app(
     upstreams,
     fallback_cache,
     s3,
-    client: reqwest::Client::builder()
-      .read_timeout(read_timeout)
-      .build()?,
+    nar_clients,
+    default_client,
     cache_priority,
   };
   Ok(
@@ -184,7 +216,7 @@ async fn narinfo(
           .into_response();
       }
       proxy(
-        &state.client,
+        state.nar_client(&result.url),
         req.method().clone(),
         req.headers(),
         format!("{}{}", result.url, req.uri().path()),
@@ -239,7 +271,7 @@ async fn nar(
   if let Ok(Some(entry)) = state.db.get_route_by_nar_url(&nar_url).await
     && entry.is_valid()
     && let Some(resp) = try_nar_upstream(
-      &state.client,
+      state.nar_client(&entry.upstream_url),
       &state.s3,
       req.method().clone(),
       req.headers(),
@@ -264,7 +296,7 @@ async fn nar(
   for (_priority, group) in by_priority {
     for h in group {
       if let Some(resp) = try_nar_upstream(
-        &state.client,
+        state.nar_client(&h.url),
         &state.s3,
         req.method().clone(),
         req.headers(),
@@ -280,7 +312,7 @@ async fn nar(
   }
   if let Some(fallback) = &state.fallback_cache
     && let Some(resp) = try_nar_upstream(
-      &state.client,
+      state.nar_client(&fallback.url),
       &state.s3,
       req.method().clone(),
       req.headers(),
@@ -325,7 +357,7 @@ async fn try_fallback_narinfo(
       }
       Some(
         proxy(
-          &state.client,
+          state.nar_client(&result.url),
           req.method().clone(),
           req.headers(),
           format!("{}{}", result.url, req.uri().path()),

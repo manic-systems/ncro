@@ -159,6 +159,11 @@ pub async fn run() -> anyhow::Result<()> {
     router
       .set_upstream_filters(upstream.url.clone(), upstream.filters.clone())
       .await;
+    if let Some(timeout) = &upstream.narinfo_timeout {
+      router
+        .set_upstream_narinfo_timeout(upstream.url.clone(), timeout.0)
+        .await?;
+    }
   }
   if cfg.fallback_cache.enabled {
     let upstream = &cfg.fallback_cache.upstream;
@@ -178,6 +183,11 @@ pub async fn run() -> anyhow::Result<()> {
           upstream.password.clone(),
         )
         .await;
+    }
+    if let Some(timeout) = &upstream.narinfo_timeout {
+      router
+        .set_upstream_narinfo_timeout(upstream.url.clone(), timeout.0)
+        .await?;
     }
   }
 
