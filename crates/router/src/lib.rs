@@ -245,46 +245,32 @@ impl Router {
     &self,
     upstream: &(impl RouterUpstream + Sync + ?Sized),
   ) -> Result<(), UpstreamRegistrationError> {
+    let url = upstream.url().to_string();
     if let Some(s3) = upstream.s3() {
-      self
-        .inner
-        .s3
-        .register(upstream.url().to_string(), s3.clone());
-    }
-    if !upstream.public_key().is_empty() {
-      self
-        .register_upstream_key(
-          upstream.url().to_string(),
-          upstream.public_key().to_string(),
-        )
-        .await?;
-    }
-    if !upstream.username().is_empty() {
-      self
-        .register_upstream_auth(
-          upstream.url().to_string(),
-          upstream.username().to_string(),
-          upstream.password().map(str::to_string),
-        )
-        .await;
+      self.inner.s3.register(url.clone(), s3.clone());
     }
     self
-      .register_upstream_filters(
-        upstream.url().to_string(),
-        upstream.filters().to_vec(),
+      .register_upstream_key(
+        url.clone(),
+        upstream.public_key().to_string(),
+      )
+      .await?;
+    self
+      .register_upstream_auth(
+        url.clone(),
+        upstream.username().to_string(),
+        upstream.password().map(str::to_string),
       )
       .await;
     self
-      .register_upstream_nar_url_mode(
-        upstream.url().to_string(),
-        upstream.nar_url_mode(),
-      )
+      .register_upstream_filters(url.clone(), upstream.filters().to_vec())
       .await;
-    if let Some(timeout) = upstream.narinfo_timeout() {
-      self
-        .register_upstream_narinfo_timeout(upstream.url().to_string(), timeout)
-        .await?;
-    }
+    self
+      .register_upstream_nar_url_mode(url.clone(), upstream.nar_url_mode())
+      .await;
+    self
+      .register_upstream_narinfo_timeout(url, upstream.narinfo_timeout())
+      .await?;
     Ok(())
   }
 
@@ -297,53 +283,41 @@ impl Router {
     url: String,
     public_key: String,
   ) -> Result<(), NarInfoError> {
-    parse_public_key(&public_key)?;
-    self
-      .inner
-      .upstream_keys
-      .write()
-      .await
-      .insert(url, public_key);
+    let mut map = self.inner.upstream_keys.write().await;
+    if public_key.is_empty() {
+      map.remove(&url);
+    } else {
+      parse_public_key(&public_key)?;
+      map.insert(url, public_key);
+    }
     Ok(())
   }
 
-  /// Register HTTP Basic Auth credentials for an upstream URL.
   async fn register_upstream_auth(
     &self,
     url: String,
     username: String,
     password: Option<String>,
   ) {
-    self
-      .inner
-      .upstream_auth
-      .write()
-      .await
-      .insert(url, (username, password));
-  }
-
-  pub async fn set_upstream_filters(
-    &self,
-    url: String,
-    filters: Vec<FilterRule>,
-  ) {
-    self.register_upstream_filters(url, filters).await;
-  }
-
-  async fn register_upstream_filters(
-    &self,
-    url: String,
-    filters: Vec<FilterRule>,
-  ) {
-    if filters.is_empty() {
-      return;
+    let mut map = self.inner.upstream_auth.write().await;
+    if username.is_empty() {
+      map.remove(&url);
+    } else {
+      map.insert(url, (username, password));
     }
-    self
-      .inner
-      .upstream_filters
-      .write()
-      .await
-      .insert(url, filters);
+  }
+
+  pub(crate) async fn register_upstream_filters(
+    &self,
+    url: String,
+    filters: Vec<FilterRule>,
+  ) {
+    let mut map = self.inner.upstream_filters.write().await;
+    if filters.is_empty() {
+      map.remove(&url);
+    } else {
+      map.insert(url, filters);
+    }
   }
 
   async fn register_upstream_nar_url_mode(
@@ -351,15 +325,12 @@ impl Router {
     url: String,
     mode: NarUrlMode,
   ) {
+    let mut map = self.inner.upstream_nar_url_modes.write().await;
     if mode == NarUrlMode::Keep {
-      return;
+      map.remove(&url);
+    } else {
+      map.insert(url, mode);
     }
-    self
-      .inner
-      .upstream_nar_url_modes
-      .write()
-      .await
-      .insert(url, mode);
   }
 
   /// Build and register a per-upstream HTTP client with a custom narinfo
@@ -372,15 +343,14 @@ impl Router {
   async fn register_upstream_narinfo_timeout(
     &self,
     url: String,
-    timeout: Duration,
+    timeout: Option<Duration>,
   ) -> Result<(), reqwest::Error> {
-    let client = reqwest::Client::builder().timeout(timeout).build()?;
-    self
-      .inner
-      .upstream_clients
-      .write()
-      .await
-      .insert(url, client);
+    let mut map = self.inner.upstream_clients.write().await;
+    if let Some(timeout) = timeout {
+      map.insert(url, reqwest::Client::builder().timeout(timeout).build()?);
+    } else {
+      map.remove(&url);
+    }
     Ok(())
   }
 
@@ -996,14 +966,13 @@ impl Router {
     body: Option<&[u8]>,
   ) -> Option<Vec<u8>> {
     let body = body?;
-    let mode = self
-      .inner
-      .upstream_nar_url_modes
-      .read()
-      .await
-      .get(upstream)
-      .copied()
-      .unwrap_or_default();
+    let mode = {
+      let map = self.inner.upstream_nar_url_modes.read().await;
+      map.get(upstream).copied().unwrap_or_default()
+    };
+    if mode == NarUrlMode::Keep {
+      return Some(body.to_vec());
+    }
     Some(rewrite_narinfo_url(body, upstream, mode))
   }
 }
@@ -1398,7 +1367,7 @@ mod tests {
     ])
     .await;
     router
-      .set_upstream_filters(rejected.clone(), vec![FilterRule {
+      .register_upstream_filters(rejected.clone(), vec![FilterRule {
         action:  FilterAction::Allow,
         field:   FilterField::Name,
         pattern: "zedless*".to_string(),
@@ -1418,7 +1387,7 @@ mod tests {
     let fallback = spawn_narinfo_server(200, "unrelated-1.0").await;
     let router = make_router(Duration::from_mins(1)).await;
     router
-      .set_upstream_filters(fallback.clone(), vec![FilterRule {
+      .register_upstream_filters(fallback.clone(), vec![FilterRule {
         action:  FilterAction::Allow,
         field:   FilterField::Name,
         pattern: "zedless*".to_string(),
@@ -1458,7 +1427,7 @@ mod tests {
     assert_eq!(cached.url, previously_accepted);
 
     router
-      .set_upstream_filters(previously_accepted.clone(), vec![FilterRule {
+      .register_upstream_filters(previously_accepted.clone(), vec![FilterRule {
         action:  FilterAction::Allow,
         field:   FilterField::Name,
         pattern: "zedless*".to_string(),
@@ -1505,7 +1474,7 @@ mod tests {
       .await
       .unwrap();
     router
-      .set_upstream_filters(upstream.clone(), vec![FilterRule {
+      .register_upstream_filters(upstream.clone(), vec![FilterRule {
         action:  FilterAction::Allow,
         field:   FilterField::Name,
         pattern: "zedless*".to_string(),
@@ -1568,7 +1537,7 @@ mod tests {
       .await
       .unwrap();
     router
-      .set_upstream_filters(stale, vec![FilterRule {
+      .register_upstream_filters(stale, vec![FilterRule {
         action:  FilterAction::Allow,
         field:   FilterField::Name,
         pattern: "zedless*".to_string(),
