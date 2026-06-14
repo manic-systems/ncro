@@ -34,6 +34,7 @@
       p2p-discovery = pkgs.callPackage ./nix/tests/p2p.nix {inherit self;};
       e2e = pkgs.callPackage ./nix/tests/e2e.nix {inherit self;};
       s3 = pkgs.callPackage ./nix/tests/s3.nix {inherit self;};
+      netrc = pkgs.callPackage ./nix/tests/netrc.nix {inherit self;};
       socket-activation = pkgs.callPackage ./nix/tests/socket-activation.nix {inherit self;};
     });
 
