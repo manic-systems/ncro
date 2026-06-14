@@ -1,5 +1,6 @@
 use std::{env, fs, time::Duration};
 
+use netrc::Netrc;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use url::Url;
@@ -111,6 +112,55 @@ fn parse_s3_url(raw: &str) -> Result<S3Config, ConfigError> {
     profile,
     addressing_style,
   })
+}
+
+/// Fill empty `username`/`password` fields from matching netrc entries.
+///
+/// Credentials configured explicitly always win: only upstreams with an empty
+/// `username` are considered. S3 upstreams and non-HTTP(S) URLs are skipped
+/// because they do not use HTTP Basic auth. An entry matches by host, and is
+/// only applied when its `login` is non-empty. An empty netrc password maps to
+/// `None`.
+fn apply_netrc<'a>(
+  upstreams: impl Iterator<Item = &'a mut UpstreamConfig>,
+  nrc: &Netrc,
+) {
+  for upstream in upstreams {
+    // Skip s3 and explicitly configured credentials
+    if !upstream.username.is_empty() || upstream.s3.is_some() {
+      continue;
+    }
+
+    // Skip non-HTTP(S) URLs
+    let Ok(parsed) = Url::parse(&upstream.url) else {
+      continue;
+    };
+    
+    if !matches!(parsed.scheme(), "http" | "https") {
+      continue;
+    }
+    
+    let Some(host) = parsed.host_str() else {
+      continue;
+    };
+    
+    // Skip if no netrc entry for this host
+    let Some(auth) = nrc.hosts.get(host).or_else(|| nrc.hosts.get("default")) else {
+      continue;
+    };
+    
+    // Skip if netrc entry has no login
+    if auth.login.is_empty() {
+      continue;
+    }
+    
+    upstream.username.clone_from(&auth.login);
+    upstream.password = if auth.password.is_empty() {
+      None
+    } else {
+      Some(auth.password.clone())
+    };
+  }
 }
 
 #[cfg(test)]
@@ -293,6 +343,89 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       );
     }
     Ok(())
+  }
+
+  #[expect(clippy::expect_used)]
+  fn netrc(content: &str) -> Netrc {
+    use std::str::FromStr as _;
+    Netrc::from_str(content).expect("valid netrc")
+  }
+
+  fn upstream(url: &str) -> UpstreamConfig {
+    UpstreamConfig {
+      url: url.to_string(),
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn netrc_fills_empty_credentials() {
+    let nrc = netrc("machine cache.example.com login alice password secret\n");
+    let mut up = upstream("https://cache.example.com");
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert_eq!(up.username, "alice");
+    assert_eq!(up.password.as_deref(), Some("secret"));
+  }
+
+  #[test]
+  fn netrc_does_not_override_config_credentials() {
+    let nrc = netrc("machine cache.example.com login alice password secret\n");
+    let mut up = upstream("https://cache.example.com");
+    up.username = "bob".to_string();
+    up.password = Some("configpw".to_string());
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert_eq!(up.username, "bob");
+    assert_eq!(up.password.as_deref(), Some("configpw"));
+  }
+
+  #[test]
+  fn netrc_ignores_non_matching_host() {
+    let nrc = netrc("machine other.example.com login alice password secret\n");
+    let mut up = upstream("https://cache.example.com");
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert!(up.username.is_empty());
+    assert!(up.password.is_none());
+  }
+
+  #[test]
+  #[expect(clippy::expect_used)]
+  fn netrc_skips_s3_upstreams() {
+    let nrc = netrc("machine my-cache login alice password secret\n");
+    let mut up = upstream("s3://my-cache?endpoint=s3.example.com");
+    up.s3 = Some(parse_s3_url(&up.url).expect("valid s3 url"));
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert!(up.username.is_empty());
+    assert!(up.password.is_none());
+  }
+
+  #[test]
+  fn netrc_empty_password_maps_to_none() {
+    let nrc = netrc("machine cache.example.com login alice\n");
+    let mut up = upstream("https://cache.example.com");
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert_eq!(up.username, "alice");
+    assert!(up.password.is_none());
+  }
+
+  #[test]
+  fn netrc_default_entry_matches_any_host() {
+    let nrc = netrc("default login alice password secret\n");
+    let mut up = upstream("https://cache.example.com");
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert_eq!(up.username, "alice");
+    assert_eq!(up.password.as_deref(), Some("secret"));
+  }
+
+  #[test]
+  fn netrc_explicit_machine_takes_precedence_over_default() {
+    let nrc = netrc(
+      "machine cache.example.com login alice password secret\n\
+       default login bob password fallback\n",
+    );
+    let mut up = upstream("https://cache.example.com");
+    apply_netrc(std::iter::once(&mut up), &nrc);
+    assert_eq!(up.username, "alice");
+    assert_eq!(up.password.as_deref(), Some("secret"));
   }
 }
 
@@ -628,6 +761,16 @@ impl Config {
     if cfg.fallback_cache.upstream.url.starts_with("s3://") {
       cfg.fallback_cache.upstream.s3 =
         Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
+    }
+
+    if let Ok(nrc) = Netrc::new() {
+      apply_netrc(
+        cfg
+          .upstreams
+          .iter_mut()
+          .chain(std::iter::once(&mut cfg.fallback_cache.upstream)),
+        &nrc,
+      );
     }
 
     Ok(cfg)
