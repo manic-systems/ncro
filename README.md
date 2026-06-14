@@ -372,6 +372,14 @@ password = "hunter2"
 `password` is optional. Omit it for token-only schemes where the token goes in
 the username field.
 
+#### .netrc support
+For HTTP(S) upstreams, you can leave `username`/`password` empty and supply
+credentials from a netrc file instead (`NETRC` environemnt variable, or `~/.netrc`). 
+The `machine` name must match the upstream hostname; a `default` entry 
+is used as a fallback. Config credentials always win over netrc. 
+
+On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
+
 ## NixOS Integration
 
 ```nix
