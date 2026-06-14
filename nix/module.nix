@@ -84,6 +84,16 @@ in {
       example = literalExpression "inputs.ncro.packages.$${system}.ncro";
     };
 
+    netrcFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/etc/nix/netrc";
+      description = ''
+        The path to netrc file for upstream authentication.
+        If null, ncro will not use netrc for upstream authentication.
+      '';
+    };
+
     settings = mkOption {
       type = tomlType;
       default = {};
@@ -137,6 +147,9 @@ in {
         then ["ncro.socket"]
         else ["network.target"];
       requires = optionals cfg.socketActivation ["ncro.socket"];
+      environment = optionalAttrs (cfg.netrcFile != null) {
+        NETRC = "%d/netrc";
+      };
       serviceConfig =
         {
           ExecStart = "${lib.getExe' cfg.package "ncro"} --config ${configFile}";
@@ -173,7 +186,8 @@ in {
           SystemCallFilter = ["@system-service"];
           SystemCallArchitectures = "native";
         }
-        // optionalAttrs cfg.socketActivation {Type = "notify";};
+        // optionalAttrs cfg.socketActivation {Type = "notify";}
+        // optionalAttrs (cfg.netrcFile != null) {LoadCredential = ["netrc:${cfg.netrcFile}"];};
     };
   };
 }
