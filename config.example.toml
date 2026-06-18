@@ -58,6 +58,27 @@ max_concurrent_races      = 64
 per_upstream_max_inflight = 8
 upstream_cooldown         = "15s"
 
+[trust]
+# off | signed | quorum. In signed mode, accepted narinfos must verify against
+# the selected upstream's public_key. In quorum mode, at least threshold
+# distinct configured signer keys must agree on StorePath, NarHash, NarSize,
+# and References before ncro stores a route. See docs/trust.md for the full
+# model.
+fail_closed              = true
+mode                     = "off"
+require_distinct_signers = true
+threshold                = 2
+
+# Optional maximum age for a claim to count toward a quorum. Unset = never
+# expires. Prevents a long-dead signer from propping up a quorum forever.
+# claim_ttl              = "30d"
+# Signer keys trusted to vouch for content in quorum mode, in addition to the
+# public_key of every configured upstream. A quorum counts only claims signed
+# by a key in this set; without it an attacker could self-sign forged content
+# under throwaway keys and forge agreement. In a mesh, list the other nodes'
+# upstream signer keys here so their relayed claims count.
+# trusted_keys           = ["cache-b-1:base64key=", "cache-c-1:base64key="]
+
 [discovery]
 discovery_time = "5s"
 domain         = "local"
@@ -71,6 +92,12 @@ enabled         = false
 gossip_interval = "30s"
 peers           = [  ]
 private_key     = "/etc/ncro/node.key"
+
+# When true, this node also gossips locally-verified trust claims to peers and
+# accepts claims relayed by peers (each re-verified against its original Nix
+# signer key before being trusted). Lets a quorum form across a mesh where each
+# node sees only one upstream. Only meaningful with trust.mode = "quorum".
+gossip_trust_claims = false
 
 [logging]
 format     = "json"
