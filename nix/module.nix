@@ -6,7 +6,7 @@
 }: let
   inherit (lib.modules) mkIf;
   inherit (lib.options) mkOption mkEnableOption literalExpression;
-  inherit (lib.types) bool package;
+  inherit (lib.types) bool package nullOr path;
   inherit (lib.lists) optional optionals;
   inherit (lib.attrsets) optionalAttrs;
 
@@ -84,8 +84,8 @@ in {
       example = literalExpression "inputs.ncro.packages.$${system}.ncro";
     };
 
-    netrcFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
+    netrcFile = mkOption {
+      type = nullOr path;
       default = null;
       example = "/etc/nix/netrc";
       description = ''
