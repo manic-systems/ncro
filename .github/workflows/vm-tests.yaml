@@ -41,6 +41,8 @@ jobs:
         include:
           - name: P2P Discovery Test
             check: p2p-discovery
+          - name: Mesh Trust Test
+            check: mesh-trust
           - name: E2E Test
             check: e2e
     steps:
