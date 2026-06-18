@@ -141,7 +141,7 @@ pub async fn run() -> anyhow::Result<()> {
     });
   }
 
-  let router = Router::new(
+  let router = Router::new_with_trust(
     db.clone(),
     prober.clone(),
     cfg.cache.ttl.0,
@@ -153,6 +153,7 @@ pub async fn run() -> anyhow::Result<()> {
       in_memory_negative_ttl:    cfg.cache.mass_query.in_memory_negative_ttl.0,
       upstream_cooldown:         cfg.cache.mass_query.upstream_cooldown.0,
     },
+    cfg.trust.clone(),
   )?;
 
   for upstream in &cfg.upstreams {
@@ -210,10 +211,27 @@ pub async fn run() -> anyhow::Result<()> {
       .iter()
       .filter_map(|p| hex::decode(&p.public_key).ok()?.try_into().ok())
       .collect::<Vec<[u8; 32]>>();
+    // Relayed trust claims are only honored if signed by a key in this set:
+    // the explicit trust.trusted_keys plus every configured upstream's
+    // public_key. This keeps a quorum a count of *trusted* signers.
+    let trusted_keys = cfg
+      .trust
+      .trusted_keys
+      .iter()
+      .cloned()
+      .chain(
+        cfg
+          .upstreams
+          .iter()
+          .map(|u| u.public_key.clone())
+          .filter(|k| !k.is_empty()),
+      )
+      .collect::<Vec<String>>();
     ncro_mesh::listen_and_serve(
       &cfg.mesh.bind_addr,
       db.clone(),
       allowed,
+      trusted_keys,
       stop_rx.clone(),
     )
     .await?;
@@ -228,6 +246,7 @@ pub async fn run() -> anyhow::Result<()> {
       db.clone(),
       peers,
       cfg.mesh.gossip_interval.0,
+      cfg.mesh.gossip_trust_claims,
       stop_rx.clone(),
     ));
   }
@@ -241,6 +260,7 @@ pub async fn run() -> anyhow::Result<()> {
     cache_priority: cfg.server.cache_priority,
     read_timeout:   cfg.server.read_timeout.0,
     write_timeout:  cfg.server.write_timeout.0,
+    trust:          cfg.trust,
   })?;
   let listener = match inherited_listener() {
     Some(std_listener) => {

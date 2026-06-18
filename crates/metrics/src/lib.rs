@@ -26,6 +26,11 @@ pub struct Metrics {
   pub upstream_race_wins:                    IntCounterVec,
   pub route_entries:                         IntGauge,
   pub upstream_latency:                      HistogramVec,
+  /// Times content was served despite a failed or absent trust check because
+  /// `trust.fail_closed = false`.  Labelled by `reason` (`unsigned`,
+  /// `below_quorum`).  A non-zero value means the proxy is running in an open
+  /// mode and the trust policy is advisory rather than enforced.
+  pub trust_bypass:                          IntCounterVec,
 }
 
 static METRICS: OnceLock<Metrics> = OnceLock::new();
@@ -115,6 +120,15 @@ pub fn get() -> &'static Metrics {
       &["upstream"],
     )
     .expect("valid metric");
+    let trust_bypass = IntCounterVec::new(
+      Opts::new(
+        "ncro_trust_bypass_total",
+        "Content served despite a failed or absent trust check \
+         (fail_closed=false).",
+      ),
+      &["reason"],
+    )
+    .expect("valid metric");
 
     for collector in [
       Box::new(narinfo_cache_hits.clone())
@@ -130,6 +144,7 @@ pub fn get() -> &'static Metrics {
       Box::new(upstream_race_wins.clone()),
       Box::new(route_entries.clone()),
       Box::new(upstream_latency.clone()),
+      Box::new(trust_bypass.clone()),
     ] {
       registry.register(collector).expect("register metric");
     }
@@ -148,6 +163,7 @@ pub fn get() -> &'static Metrics {
       upstream_race_wins,
       route_entries,
       upstream_latency,
+      trust_bypass,
     }
   })
 }

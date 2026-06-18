@@ -477,7 +477,6 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     }
     Ok(())
   }
-
   #[expect(clippy::expect_used)]
   fn netrc(content: &str) -> Netrc {
     use std::str::FromStr as _;
@@ -637,6 +636,81 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     assert!(debug.contains("<redacted>"));
     assert!(!debug.contains("secret"));
   }
+
+  #[test]
+  fn parses_trust_config() -> Result<(), ConfigError> {
+    let cfg: Config = toml::from_str(
+      "[trust]\nmode = \"quorum\"\nthreshold = 2\nrequire_distinct_signers = \
+       true\nfail_closed = true\n",
+    )?;
+    assert_eq!(cfg.trust.mode, TrustMode::Quorum);
+    assert_eq!(cfg.trust.threshold, 2);
+    cfg.validate()?;
+    Ok(())
+  }
+
+  #[test]
+  fn rejects_zero_trust_threshold_when_enabled() -> Result<(), toml::de::Error>
+  {
+    let cfg: Config =
+      toml::from_str("[trust]\nmode = \"signed\"\nthreshold = 0\n")?;
+    let result = cfg.validate();
+    assert!(result.is_err(), "expected validation failure");
+    Ok(())
+  }
+
+  #[test]
+  fn parses_trust_hardening_fields() -> Result<(), ConfigError> {
+    let cfg: Config = toml::from_str(
+      "[trust]\nmode = \"quorum\"\nthreshold = 2\nclaim_ttl = \"90s\"\n",
+    )?;
+    assert_eq!(
+      cfg.trust.claim_ttl.as_ref().map(|d| d.0),
+      Some(std::time::Duration::from_secs(90))
+    );
+    cfg.validate()?;
+    Ok(())
+  }
+
+  #[test]
+  fn trust_hardening_fields_default_off() {
+    let cfg = Config::default();
+    assert!(cfg.trust.claim_ttl.is_none());
+    assert!(!cfg.mesh.gossip_trust_claims);
+  }
+
+  #[test]
+  fn parses_mesh_gossip_trust_claims() -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str(
+      "[mesh]\nenabled = true\ngossip_trust_claims = \
+       true\n\n[[mesh.peers]]\naddr = \"10.0.0.2:7946\"\n",
+    )?;
+    assert!(cfg.mesh.gossip_trust_claims);
+    Ok(())
+  }
+
+  #[test]
+  fn parses_trusted_keys() -> Result<(), ConfigError> {
+    let cfg: Config = toml::from_str(
+      "[trust]\nmode = \"quorum\"\ntrusted_keys = [\"cache-b-1:YWJj\", \
+       \"cache-c-1:ZGVm\"]\n",
+    )?;
+    assert_eq!(cfg.trust.trusted_keys.len(), 2);
+    cfg.validate()?;
+    Ok(())
+  }
+
+  #[test]
+  fn rejects_malformed_trusted_key() -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str(
+      "[trust]\nmode = \"quorum\"\ntrusted_keys = [\"missing-colon\"]\n",
+    )?;
+    assert!(
+      cfg.validate().is_err(),
+      "a trusted key without a ':' separator must be rejected"
+    );
+    Ok(())
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,6 +728,15 @@ impl<'de> Deserialize<'de> for HumanDuration {
     D: Deserializer<'de>,
   {
     humantime_serde::deserialize(deserializer).map(Self)
+  }
+}
+
+impl serde::Serialize for HumanDuration {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    humantime_serde::serialize(&self.0, serializer)
   }
 }
 
@@ -853,22 +936,29 @@ pub struct PeerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MeshConfig {
-  pub enabled:          bool,
-  pub bind_addr:        String,
-  pub peers:            Vec<PeerConfig>,
+  pub enabled:             bool,
+  pub bind_addr:           String,
+  pub peers:               Vec<PeerConfig>,
   #[serde(rename = "private_key")]
-  pub private_key_path: String,
-  pub gossip_interval:  HumanDuration,
+  pub private_key_path:    String,
+  pub gossip_interval:     HumanDuration,
+  /// When enabled, this node also gossips the trust claims it has verified
+  /// locally to its peers, and accepts claims relayed by peers (after
+  /// re-verifying each claim's embedded narinfo signature).  This lets a
+  /// quorum be satisfied across a mesh of nodes that each see only one
+  /// upstream.  Off by default; only meaningful when `trust.mode = "quorum"`.
+  pub gossip_trust_claims: bool,
 }
 
 impl Default for MeshConfig {
   fn default() -> Self {
     Self {
-      enabled:          false,
-      bind_addr:        "0.0.0.0:7946".to_string(),
-      peers:            Vec::new(),
-      private_key_path: String::new(),
-      gossip_interval:  HumanDuration(Duration::from_secs(30)),
+      enabled:             false,
+      bind_addr:           "0.0.0.0:7946".to_string(),
+      peers:               Vec::new(),
+      private_key_path:    String::new(),
+      gossip_interval:     HumanDuration(Duration::from_secs(30)),
+      gossip_trust_claims: false,
     }
   }
 }
@@ -939,6 +1029,63 @@ pub enum LogFormat {
   Text,
 }
 
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  Default,
+  PartialEq,
+  Eq,
+  serde::Serialize,
+  serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustMode {
+  #[default]
+  Off,
+  Signed,
+  Quorum,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TrustConfig {
+  pub mode:                     TrustMode,
+  pub threshold:                u32,
+  pub require_distinct_signers: bool,
+  pub fail_closed:              bool,
+  /// Optional maximum age for a trust claim to count toward a quorum.  Claims
+  /// whose `last_seen` is older than this are ignored when evaluating the
+  /// policy, preventing a long-dead signer from propping up a quorum forever.
+  /// Unset (the default) means claims never expire.
+  pub claim_ttl:                Option<HumanDuration>,
+  /// Nix public keys (`name:base64(key)`) that are trusted to vouch for
+  /// content in `quorum` mode, *in addition to* the `public_key` of every
+  /// configured upstream.  A quorum counts only claims signed by a key in
+  /// this trusted set, and mesh-relayed claims signed by any other key are
+  /// dropped.
+  ///
+  /// This is the difference between a real quorum and security theatre:
+  /// without it, anyone could generate throwaway keypairs, self-sign forged
+  /// content under each, relay the claims over the mesh, and manufacture a
+  /// quorum.  In a multi-node mesh, list here the signer keys of the *other*
+  /// nodes' trusted upstreams so their relayed claims count.
+  pub trusted_keys:             Vec<String>,
+}
+
+impl Default for TrustConfig {
+  fn default() -> Self {
+    Self {
+      mode:                     TrustMode::Off,
+      threshold:                2,
+      require_distinct_signers: true,
+      fail_closed:              true,
+      claim_ttl:                None,
+      trusted_keys:             Vec::new(),
+    }
+  }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -949,6 +1096,7 @@ pub struct Config {
   pub mesh:           MeshConfig,
   pub discovery:      DiscoveryConfig,
   pub logging:        LoggingConfig,
+  pub trust:          TrustConfig,
 }
 
 impl Default for Config {
@@ -966,6 +1114,7 @@ impl Default for Config {
       mesh:           MeshConfig::default(),
       discovery:      DiscoveryConfig::default(),
       logging:        LoggingConfig::default(),
+      trust:          TrustConfig::default(),
     }
   }
 }
@@ -1117,6 +1266,18 @@ impl Config {
         self.logging.level
       ))
     })?;
+    if self.trust.mode != TrustMode::Off && self.trust.threshold == 0 {
+      return Err(ConfigError::Validation(
+        "trust.threshold must be >= 1 when trust is enabled".to_string(),
+      ));
+    }
+    for (i, key) in self.trust.trusted_keys.iter().enumerate() {
+      if !key.contains(':') {
+        return Err(ConfigError::Validation(format!(
+          "trust.trusted_keys[{i}] must be in 'name:base64(key)' Nix format"
+        )));
+      }
+    }
     if self.mesh.enabled && self.mesh.peers.is_empty() {
       return Err(ConfigError::Validation(
         "mesh.enabled is true but no peers configured".to_string(),
