@@ -2193,10 +2193,12 @@ dependencies = [
 name = "ncro-mesh"
 version = "2.2.2"
 dependencies = [
+ "base64",
  "chrono",
  "ed25519-dalek",
  "hex",
  "ncro-db",
+ "ncro-narinfo",
  "rand 0.10.1",
  "rmp-serde",
  "serde",
