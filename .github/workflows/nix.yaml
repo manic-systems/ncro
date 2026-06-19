@@ -13,7 +13,7 @@ jobs:
     outputs:
       files_changed: ${{ steps.changed-files.outputs.files }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: changed-files
         uses: dorny/paths-filter@v4
         with:
@@ -36,7 +36,7 @@ jobs:
     if: ${{ needs.changes.outputs.files_changed == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - name: Build ncro package
         run: nix build .# -L --no-link

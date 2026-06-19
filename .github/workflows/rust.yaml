@@ -23,7 +23,7 @@ jobs:
       files_changed: ${{ steps.changed-files.outputs.files }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Get changed files
         id: changed-files
         uses: dorny/paths-filter@v4
@@ -47,7 +47,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - uses: cachix/install-nix-action@v31
 
@@ -64,7 +64,7 @@ jobs:
       pct: ${{ steps.nextest.outputs.pct }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 2
 

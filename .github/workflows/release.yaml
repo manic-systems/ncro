@@ -35,7 +35,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: cachix/install-nix-action@v31
 
@@ -55,7 +55,7 @@ jobs:
     needs: [create-release, build-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download Assets
         uses: robinraju/release-downloader@v1
