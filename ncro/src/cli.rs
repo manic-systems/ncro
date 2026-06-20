@@ -5,7 +5,9 @@ use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
 use pound::Parse;
 use tokio::net::TcpListener;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+use crate::warn_buffer::BufferLayer;
 
 /// Returns the number of socket-activation fds passed by systemd, or `None`
 /// if socket activation is not in use.
@@ -81,10 +83,21 @@ pub struct Args {
 
 pub async fn run() -> anyhow::Result<()> {
   let args = Args::parse();
-  let cfg = Config::load(args.config.as_deref())?;
-  cfg.validate()?;
+
+  // Config loading happens before we know the configured log level/format, so
+  // buffer any diagnostics it emits and replay them once logging is set up.
+  let buffer = BufferLayer::default();
+  let cfg = {
+    let subscriber = tracing_subscriber::registry().with(buffer.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let cfg = Config::load(args.config.as_deref())?;
+    cfg.validate()?;
+    cfg
+  };
 
   init_logging(&cfg.logging.level, &cfg.logging.format);
+  buffer.replay();
+
   let _ = ncro_metrics::get();
 
   let db = Db::open(&cfg.cache.db_path, cfg.cache.max_entries).await?;

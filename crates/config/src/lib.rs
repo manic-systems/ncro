@@ -155,6 +155,16 @@ fn apply_netrc<'a>(
     }
     
     upstream.username.clone_from(&auth.login);
+
+    if upstream.password.is_some() {
+      tracing::warn!(
+        "upstream {} has a password configured without a username; the \
+         configured password is ignored and netrc credentials will be used \
+         instead",
+        upstream.url
+      );
+    }
+
     upstream.password = if auth.password.is_empty() {
       None
     } else {
