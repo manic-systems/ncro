@@ -250,10 +250,7 @@ impl Router {
       self.inner.s3.register(url.clone(), s3.clone());
     }
     self
-      .register_upstream_key(
-        url.clone(),
-        upstream.public_key().to_string(),
-      )
+      .register_upstream_key(url.clone(), upstream.public_key().to_string())
       .await?;
     self
       .register_upstream_auth(
@@ -1427,11 +1424,13 @@ mod tests {
     assert_eq!(cached.url, previously_accepted);
 
     router
-      .register_upstream_filters(previously_accepted.clone(), vec![FilterRule {
-        action:  FilterAction::Allow,
-        field:   FilterField::Name,
-        pattern: "zedless*".to_string(),
-      }])
+      .register_upstream_filters(previously_accepted.clone(), vec![
+        FilterRule {
+          action:  FilterAction::Allow,
+          field:   FilterField::Name,
+          pattern: "zedless*".to_string(),
+        },
+      ])
       .await;
 
     let result = router

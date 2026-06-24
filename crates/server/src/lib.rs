@@ -113,13 +113,16 @@ pub fn app(
   };
   Ok(
     AxumRouter::new()
-      .route("/nix-cache-info", get(cache_info).head(cache_info))
-      .route("/health", get(health))
-      .route("/metrics", get(metrics_endpoint))
-      .route("/{hash_narinfo}", get(narinfo).head(narinfo))
-      .route("/nar/{*path}", get(nar).head(nar))
+      .merge(
+        AxumRouter::new()
+          .route("/nix-cache-info", get(cache_info).head(cache_info))
+          .route("/health", get(health))
+          .route("/metrics", get(metrics_endpoint))
+          .route("/{hash_narinfo}", get(narinfo).head(narinfo))
+          .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
+      )
+      .merge(AxumRouter::new().route("/nar/{*path}", get(nar).head(nar)))
       .layer(RequestBodyTimeoutLayer::new(read_timeout))
-      .layer(ResponseBodyTimeoutLayer::new(write_timeout))
       .with_state(Arc::new(state)),
   )
 }
