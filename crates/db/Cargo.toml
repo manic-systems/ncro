@@ -19,7 +19,7 @@ sqlx = { workspace = true, features = [
   "chrono",
 ] }
 thiserror.workspace = true
-tokio = { workspace = true, features = [ "fs" ] }
+tokio = { workspace = true, features = [ "fs", "sync" ] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [ "macros", "rt-multi-thread" ] }

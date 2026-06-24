@@ -14,6 +14,7 @@ use sqlx::{
   sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -61,6 +62,7 @@ pub struct Db {
   pool:        SqlitePool,
   max_entries: i64,
   write_count: Arc<AtomicU64>,
+  write_lock:  Arc<Mutex<()>>,
 }
 
 impl Db {
@@ -98,6 +100,7 @@ impl Db {
       pool,
       max_entries,
       write_count: Arc::new(AtomicU64::new(0)),
+      write_lock: Arc::new(Mutex::new(())),
     })
   }
 
@@ -142,6 +145,7 @@ impl Db {
   ///
   /// Returns [`DbError`] on `SQLite` write failure.
   pub async fn set_route(&self, entry: &RouteEntry) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
     sqlx::query(
             r"INSERT INTO routes
                (store_path, upstream_url, latency_ms, latency_ema, query_count, failure_count,
@@ -185,6 +189,7 @@ impl Db {
   ///
   /// Returns [`DbError`] on `SQLite` write failure.
   pub async fn expire_old_routes(&self) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
     sqlx::query("DELETE FROM routes WHERE ttl < ?")
       .bind(Utc::now().timestamp())
       .execute(&self.pool)
@@ -231,6 +236,7 @@ impl Db {
     store_path: &str,
     ttl: Duration,
   ) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
     sqlx::query(
             r"INSERT INTO negative_cache (store_path, expires_at) VALUES (?, ?)
                ON CONFLICT(store_path) DO UPDATE SET expires_at = excluded.expires_at",
@@ -264,6 +270,7 @@ impl Db {
   ///
   /// Returns [`DbError`] on `SQLite` write failure.
   pub async fn expire_negatives(&self) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
     sqlx::query("DELETE FROM negative_cache WHERE expires_at < ?")
       .bind(Utc::now().timestamp())
       .execute(&self.pool)
@@ -281,6 +288,7 @@ impl Db {
     consecutive_fails: i64,
     total_queries: i64,
   ) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
     sqlx::query(
             r"INSERT INTO upstream_health (url, ema_latency, consecutive_fails, total_queries)
                VALUES (?, ?, ?, ?)
@@ -461,6 +469,18 @@ fn timestamp(
 
 #[cfg(test)]
 mod tests {
+  use std::{
+    env,
+    error::Error,
+    fs,
+    iter,
+    process,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+  };
+
+  use tokio::sync::Barrier;
+
   use super::*;
 
   #[tokio::test]
@@ -522,8 +542,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn concurrent_reads_do_not_deadlock()
-  -> Result<(), Box<dyn std::error::Error>> {
+  async fn concurrent_reads_do_not_deadlock() -> Result<(), Box<dyn Error>> {
     let db = Db::open(":memory:", 100).await?;
     let now = Utc::now();
     let entry = RouteEntry {
@@ -541,9 +560,9 @@ mod tests {
       narinfo_bytes: None,
     };
     db.set_route(&entry).await?;
-    let db = std::sync::Arc::new(db);
-    let handles: Vec<_> = std::iter::repeat_with(|| {
-      let db = std::sync::Arc::clone(&db);
+    let db = Arc::new(db);
+    let handles: Vec<_> = iter::repeat_with(|| {
+      let db = Arc::clone(&db);
       tokio::spawn(async move { db.get_route("aaa").await })
     })
     .take(4)
@@ -551,6 +570,64 @@ mod tests {
     for h in handles {
       assert!(h.await??.is_some());
     }
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn concurrent_file_writes_are_serialized() -> Result<(), Box<dyn Error>>
+  {
+    let path = env::temp_dir()
+      .join(format!(
+        "ncro-db-concurrent-writes-{}-{}.db",
+        process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+      ))
+      .to_string_lossy()
+      .into_owned();
+    let _ = fs::remove_file(&path);
+    let db = Arc::new(Db::open(&path, 100).await?);
+    let barrier = Arc::new(Barrier::new(65));
+
+    let handles: Vec<_> = (0..64_u64)
+      .map(|i| {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+          let now = Utc::now();
+          let entry = RouteEntry {
+            store_path:    format!("hash{i}"),
+            upstream_url:  "https://cache.nixos.org".into(),
+            latency_ms:    1.0,
+            latency_ema:   1.0,
+            last_verified: now,
+            query_count:   1,
+            failure_count: 0,
+            ttl:           now + chrono::Duration::hours(1),
+            nar_hash:      format!("sha256:{i}"),
+            nar_size:      1,
+            nar_url:       format!("nar/{i}.nar"),
+            narinfo_bytes: None,
+          };
+          barrier.wait().await;
+          db.set_route(&entry).await?;
+          db.set_negative(&format!("missing{i}"), Duration::from_mins(1))
+            .await?;
+          db.save_health(&format!("https://cache{i}.example"), 1.0, 0, 1)
+            .await?;
+          Ok::<_, DbError>(())
+        })
+      })
+      .collect();
+
+    barrier.wait().await;
+    for handle in handles {
+      handle.await??;
+    }
+    assert_eq!(db.route_count().await?, 64);
+    drop(db);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{path}-shm"));
+    let _ = fs::remove_file(format!("{path}-wal"));
     Ok(())
   }
 
