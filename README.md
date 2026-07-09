@@ -366,17 +366,43 @@ NAR streaming.
 url      = "https://cache.internal.example.com"
 priority = 5
 username = "ncro"
-password = "hunter2"
+password_file = "/run/secrets/ncro-cache-password"
 ```
 
-`password` is optional. Omit it for token-only schemes where the token goes in
-the username field.
+> [!TIP]
+> `password` is optional. Omit it for token-only schemes where the token goes in
+> the username field. Use `password_file` to read the password from a secret
+> file instead of storing it inline; one trailing newline is ignored. `password`
+> and `password_file` are mutually exclusive.
 
-#### .netrc support
+With agenix on NixOS, pass the decrypted file through systemd credentials so the
+`DynamicUser=true` service can read it without making the secret broadly
+readable:
+
+```nix
+{
+  age.secrets.ncro-cache-password.file = ./ncro-cache-password.age;
+
+  systemd.services.ncro.serviceConfig.LoadCredential = [
+    "ncro-cache-password:${config.age.secrets.ncro-cache-password.path}"
+  ];
+
+    services.ncro.settings.upstreams = [
+    {
+      url = "https://cache.internal.example.com";
+      username = "ncro";
+      password_file = "/run/credentials/ncro.service/ncro-cache-password";
+    }
+  ];
+}
+```
+
+#### `.netrc` support
+
 For HTTP(S) upstreams, you can leave `username`/`password` empty and supply
-credentials from a netrc file instead (`NETRC` environemnt variable, or `~/.netrc`). 
-The `machine` name must match the upstream hostname; a `default` entry 
-is used as a fallback. Config credentials always win over netrc. 
+credentials from a netrc file instead (`NETRC` environment variable, or
+`~/.netrc`). The `machine` name must match the upstream hostname; a `default`
+entry is used as a fallback. Config credentials always win over netrc.
 
 On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
 
