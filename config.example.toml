@@ -19,6 +19,8 @@ url      = "https://nix-community.cachix.org"
 # nar_url_mode    = "keep" # keep | to_self | to_upstream
 # narinfo_timeout = "10s"  # overrides the router's race timeout for narinfo
 # nar_timeout     = "60s"  # overrides the server's read_timeout for NAR streams
+# username        = "ncro"
+# password_file   = "/run/secrets/ncro-upstream-password"
 
 # Optional per-upstream filters. Deny rules always reject matching paths. If an
 # upstream has any allow rules, at least one allow rule must match.
@@ -31,8 +33,8 @@ url      = "https://nix-community.cachix.org"
 # Optional last-resort cache. Disabled by default. When enabled, this cache is
 # used only when the normal upstream set is unavailable, and is not part of
 # health probing, priority routing, discovery, filters, cooldown, or route DB
-# persistence. URL, public_key, username/password, and s3:// URLs are accepted
-# like regular upstreams.
+# persistence. URL, public_key, username/password/password_file, and s3:// URLs
+# are accepted like regular upstreams.
 [fallback_cache]
 enabled    = false
 public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
