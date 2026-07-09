@@ -1,4 +1,4 @@
-use std::{env, fs, time::Duration};
+use std::{env, fmt, fs, time::Duration};
 
 use netrc::Netrc;
 use serde::{Deserialize, Deserializer};
@@ -9,6 +9,11 @@ use url::Url;
 pub enum ConfigError {
   #[error("read config: {0}")]
   Read(#[from] std::io::Error),
+  #[error("read password_file {path:?}: {source}")]
+  PasswordFile {
+    path:   String,
+    source: std::io::Error,
+  },
   #[error("parse config: {0}")]
   Parse(#[from] toml::de::Error),
   #[error("{0}")]
@@ -135,25 +140,26 @@ fn apply_netrc<'a>(
     let Ok(parsed) = Url::parse(&upstream.url) else {
       continue;
     };
-    
+
     if !matches!(parsed.scheme(), "http" | "https") {
       continue;
     }
-    
+
     let Some(host) = parsed.host_str() else {
       continue;
     };
-    
+
     // Skip if no netrc entry for this host
-    let Some(auth) = nrc.hosts.get(host).or_else(|| nrc.hosts.get("default")) else {
+    let Some(auth) = nrc.hosts.get(host).or_else(|| nrc.hosts.get("default"))
+    else {
       continue;
     };
-    
+
     // Skip if netrc entry has no login
     if auth.login.is_empty() {
       continue;
     }
-    
+
     upstream.username.clone_from(&auth.login);
 
     if upstream.password.is_some() {
@@ -173,9 +179,56 @@ fn apply_netrc<'a>(
   }
 }
 
+fn read_password_file(path: &str) -> Result<String, ConfigError> {
+  let mut password = fs::read_to_string(path).map_err(|source| {
+    ConfigError::PasswordFile {
+      path: path.to_string(),
+      source,
+    }
+  })?;
+  if password.ends_with('\n') {
+    password.pop();
+    if password.ends_with('\r') {
+      password.pop();
+    }
+  }
+  Ok(password)
+}
+
+fn resolve_password_file(
+  upstream: &mut UpstreamConfig,
+  label: &str,
+) -> Result<(), ConfigError> {
+  let Some(path) = upstream.password_file.as_deref() else {
+    return Ok(());
+  };
+  if upstream.password.is_some() {
+    return Err(ConfigError::Validation(format!(
+      "{label}: password and password_file are mutually exclusive"
+    )));
+  }
+  upstream.password = Some(read_password_file(path)?);
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+  use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+  };
+
   use super::*;
+
+  static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+  fn test_dir(name: &str) -> Result<PathBuf, ConfigError> {
+    let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir()
+      .join(format!("ncro-config-{name}-{}-{id}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+  }
 
   #[test]
   fn loads_defaults() -> Result<(), ConfigError> {
@@ -429,13 +482,90 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   #[test]
   fn netrc_explicit_machine_takes_precedence_over_default() {
     let nrc = netrc(
-      "machine cache.example.com login alice password secret\n\
-       default login bob password fallback\n",
+      "machine cache.example.com login alice password secret\ndefault login \
+       bob password fallback\n",
     );
     let mut up = upstream("https://cache.example.com");
     apply_netrc(std::iter::once(&mut up), &nrc);
     assert_eq!(up.username, "alice");
     assert_eq!(up.password.as_deref(), Some("secret"));
+  }
+
+  #[test]
+  fn password_file_fills_upstream_password() -> Result<(), ConfigError> {
+    let dir = test_dir("password-file-fills")?;
+    let password_path = dir.join("password");
+    let config_path = dir.join("ncro.toml");
+    fs::write(&password_path, "secret\n")?;
+    fs::write(
+      &config_path,
+      format!(
+        "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
+         \"alice\"\npassword_file = {:?}\n",
+        password_path
+      ),
+    )?;
+
+    let config_path = config_path.to_string_lossy();
+    let cfg = Config::load(Some(&config_path))?;
+
+    assert_eq!(cfg.upstreams[0].password.as_deref(), Some("secret"));
+    Ok(())
+  }
+
+  #[test]
+  fn password_file_preserves_non_newline_whitespace() -> Result<(), ConfigError>
+  {
+    let dir = test_dir("password-file-whitespace")?;
+    let password_path = dir.join("password");
+    let config_path = dir.join("ncro.toml");
+    fs::write(&password_path, " secret \n")?;
+    fs::write(
+      &config_path,
+      format!(
+        "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
+         \"alice\"\npassword_file = {:?}\n",
+        password_path
+      ),
+    )?;
+
+    let config_path = config_path.to_string_lossy();
+    let cfg = Config::load(Some(&config_path))?;
+
+    assert_eq!(cfg.upstreams[0].password.as_deref(), Some(" secret "));
+    Ok(())
+  }
+
+  #[test]
+  fn password_and_password_file_are_mutually_exclusive()
+  -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str(
+      "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
+       \"alice\"\npassword = \"inline\"\npassword_file = \"/run/secrets/pw\"\n",
+    )?;
+
+    let result = cfg.validate();
+
+    assert!(result.is_err(), "expected validation failure");
+    if let Err(err) = result {
+      assert!(
+        err
+          .to_string()
+          .contains("password and password_file are mutually exclusive")
+      );
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn upstream_debug_redacts_password() {
+    let mut upstream = upstream("https://cache.example.com");
+    upstream.password = Some("secret".to_string());
+
+    let debug = format!("{upstream:?}");
+
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("secret"));
   }
 }
 
@@ -495,7 +625,7 @@ pub struct FilterRule {
   pub pattern: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
   /// Base URL of the substituter (http, https, or `s3://`).
@@ -512,6 +642,8 @@ pub struct UpstreamConfig {
   pub username:        String,
   /// HTTP Basic Auth password.
   pub password:        Option<String>,
+  /// Path to a file containing the HTTP Basic Auth password.
+  pub password_file:   Option<String>,
   /// Per-upstream allow/deny path filters evaluated after the narinfo is
   /// fetched. Deny rules reject immediately; if any allow rules exist,
   /// at least one must match.
@@ -528,6 +660,24 @@ pub struct UpstreamConfig {
   /// Not set directly in config, but populated automatically at load time.
   #[serde(skip)]
   pub s3:              Option<S3Config>,
+}
+
+impl fmt::Debug for UpstreamConfig {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("UpstreamConfig")
+      .field("url", &self.url)
+      .field("priority", &self.priority)
+      .field("public_key", &self.public_key)
+      .field("username", &self.username)
+      .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+      .field("password_file", &self.password_file)
+      .field("filters", &self.filters)
+      .field("nar_url_mode", &self.nar_url_mode)
+      .field("narinfo_timeout", &self.narinfo_timeout)
+      .field("nar_timeout", &self.nar_timeout)
+      .field("s3", &self.s3)
+      .finish()
+  }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -773,6 +923,16 @@ impl Config {
         Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
     }
 
+    for (i, upstream) in cfg.upstreams.iter_mut().enumerate() {
+      resolve_password_file(upstream, &format!("upstream[{i}]"))?;
+    }
+    if cfg.fallback_cache.enabled {
+      resolve_password_file(
+        &mut cfg.fallback_cache.upstream,
+        "fallback_cache",
+      )?;
+    }
+
     if let Ok(nrc) = Netrc::new() {
       apply_netrc(
         cfg
@@ -923,6 +1083,11 @@ fn validate_upstream(
   if !upstream.public_key.is_empty() && !upstream.public_key.contains(':') {
     return Err(ConfigError::Validation(format!(
       "{label}: public_key must be in 'name:base64(key)' Nix format"
+    )));
+  }
+  if upstream.password.is_some() && upstream.password_file.is_some() {
+    return Err(ConfigError::Validation(format!(
+      "{label}: password and password_file are mutually exclusive"
     )));
   }
   for (j, filter) in upstream.filters.iter().enumerate() {
