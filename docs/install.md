@@ -201,7 +201,7 @@ nix-shell -p hello \
 > [!TIP]
 > For persistent setup, add the URL to `nix.settings.substituters` and add every
 > upstream cache signing key to `nix.settings.trusted-public-keys`. The NixOS
-> module does this for configured `public_key` values unless
+> module does this for configured `public_key` and `public_keys` values unless
 > `services.ncro.addUpstreamPublicKeys` is disabled.
 
 ## Verification

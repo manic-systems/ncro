@@ -12,6 +12,12 @@ instead of `password` when the upstream Basic Auth password should be read from
 a secret file; one trailing newline is ignored, and `password` plus
 `password_file` is rejected.
 
+Use `public_keys` when an upstream may serve narinfos signed by more than one
+cache key, such as a pull-through cache that can return both locally signed
+narinfos and narinfos signed by `cache.nixos.org`. `public_key` remains valid as
+shorthand for a single accepted signing key. When both are set, ncro accepts
+signatures from either field.
+
 Upstream filters support `allow` and `deny` rules over narinfo fields. The
 available fields are `name`, `store_path`, `reference`, and `deriver`; patterns
 use `*` wildcards. Deny rules always win. If any allow rules are configured for
@@ -39,9 +45,9 @@ are registered as upstreams. The default `any` registers all routable addresses
 `fallback_cache` defines an optional last-resort backend. It is disabled by
 default and defaults to `https://cache.nixos.org` when enabled. The fallback
 cache accepts the same connection fields as an upstream (`url`, `public_key`,
-`username`, `password`, `password_file`, and `s3://` URLs), but it is not part
-of normal upstream routing. It is only used after normal candidates are
-unavailable and its responses are not persisted as route winners.
+`public_keys`, `username`, `password`, `password_file`, and `s3://` URLs), but
+it is not part of normal upstream routing. It is only used after normal
+candidates are unavailable and its responses are not persisted as route winners.
 
 `logging.level` is a tracing filter directive. Use a single level such as
 `debug`, `info`, `warn`, or `error` for global filtering, or a directive list
