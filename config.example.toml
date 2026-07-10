@@ -5,8 +5,13 @@ write_timeout = "30s"
 
 [[upstreams]]
 priority   = 10
-public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 url        = "https://cache.nixos.org"
+public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+# Pull-through caches may need to accept multiple narinfo signers:
+# public_keys = [
+#   "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+#   "origin-cache-1:...",
+# ]
 
 # Try without a public key.
 [[upstreams]]
@@ -33,12 +38,12 @@ url      = "https://nix-community.cachix.org"
 # Optional last-resort cache. Disabled by default. When enabled, this cache is
 # used only when the normal upstream set is unavailable, and is not part of
 # health probing, priority routing, discovery, filters, cooldown, or route DB
-# persistence. URL, public_key, username/password/password_file, and s3:// URLs
-# are accepted like regular upstreams.
+# persistence. URL, public_key/public_keys, username/password/password_file,
+# and s3:// URLs are accepted like regular upstreams.
 [fallback_cache]
 enabled    = false
-public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 url        = "https://cache.nixos.org"
+public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 
 [cache]
 db_path       = "/var/lib/ncro/routes.db"
