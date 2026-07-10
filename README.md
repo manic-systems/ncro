@@ -177,6 +177,12 @@ url = "https://cache.nixos.org"
 priority = 10 # lower = preferred on latency ties (within 10%)
 public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 
+# Pull-through caches can accept more than one narinfo signer.
+# public_keys = [
+#   "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+#   "origin-cache-1:...",
+# ]
+
 [[upstreams]]
 url = "https://nix-community.cachix.org"
 priority = 20
@@ -312,9 +318,9 @@ public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 ```
 
 The fallback cache accepts the same connection-related fields as an upstream:
-`url`, `public_key`, `username`, `password`, and Nix-style `s3://` URLs. It is
-not a member of `[[upstreams]]`, and ncro deliberately keeps it out of normal
-router behavior:
+`url`, `public_key`, `public_keys`, `username`, `password`, and Nix-style
+`s3://` URLs. It is not a member of `[[upstreams]]`, and ncro deliberately keeps
+it out of normal router behavior:
 
 - It is not health probed and does not appear in `/health`.
 - It is not affected by upstream priority, discovery, cooldown, or filters.
@@ -440,8 +446,8 @@ On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
   };
 
   # Point Nix at the proxy. By default the module appends every configured
-  # upstream public_key, plus the fallback_cache public_key when fallback is
-  # enabled, to nix.settings.trusted-public-keys; set
+  # upstream public_key/public_keys, plus the fallback_cache public keys when
+  # fallback is enabled, to nix.settings.trusted-public-keys; set
   # services.ncro.addUpstreamPublicKeys = false to manage those keys yourself.
   # NOTE: ncro needs to be the *only* substituter if you wish to benefit
   # from its capabilities fully. If there are other substituters in your
