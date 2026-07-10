@@ -1,4 +1,4 @@
-use ncro_config::Config;
+use ncro_config::{Config, LogFormat};
 use ncro_db::Db;
 use ncro_discovery::Discovery;
 use ncro_health::Prober;
@@ -95,7 +95,11 @@ pub async fn run() -> anyhow::Result<()> {
     cfg
   };
 
-  init_logging(&cfg.logging.level, &cfg.logging.format);
+  init_logging(
+    &cfg.logging.level,
+    cfg.logging.format,
+    cfg.logging.timestamps,
+  );
   buffer.replay();
 
   let _ = ncro_metrics::get();
@@ -261,13 +265,18 @@ pub async fn run() -> anyhow::Result<()> {
   Ok(())
 }
 
-fn init_logging(level: &str, format_name: &str) {
+fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
   let filter =
     EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
-  if format_name == "text" {
-    fmt().with_env_filter(filter).init();
-  } else {
-    fmt().json().with_env_filter(filter).init();
+  match (format, timestamps) {
+    (LogFormat::Json, true) => fmt().json().with_env_filter(filter).init(),
+    (LogFormat::Json, false) => {
+      fmt().json().without_time().with_env_filter(filter).init()
+    },
+    (LogFormat::Text, true) => fmt().with_env_filter(filter).init(),
+    (LogFormat::Text, false) => {
+      fmt().without_time().with_env_filter(filter).init()
+    },
   }
 }
 

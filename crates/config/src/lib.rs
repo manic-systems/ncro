@@ -3,6 +3,7 @@ use std::{env, fmt, fs, time::Duration};
 use netrc::Netrc;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -263,6 +264,59 @@ mod tests {
     assert_eq!(cfg.upstreams[0].filters.len(), 2);
     assert_eq!(cfg.upstreams[0].filters[0].action, FilterAction::Allow);
     assert_eq!(cfg.upstreams[0].filters[0].field, FilterField::Name);
+    Ok(())
+  }
+
+  #[test]
+  fn logging_level_accepts_tracing_filter_directives() -> Result<(), ConfigError>
+  {
+    let cfg: Config =
+      toml::from_str("[logging]\nlevel = \"ncro=debug,tower_http=warn\"\n")?;
+
+    cfg.validate()?;
+    Ok(())
+  }
+
+  #[test]
+  fn logging_level_rejects_invalid_filter_directives()
+  -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str("[logging]\nlevel = \"ncro==debug\"\n")?;
+
+    let result = cfg.validate();
+
+    assert!(result.is_err(), "expected validation failure");
+    if let Err(err) = result {
+      assert!(err.to_string().contains("logging.level"));
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn logging_level_rejects_empty_filter_directive()
+  -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str("[logging]\nlevel = \"\"\n")?;
+
+    let result = cfg.validate();
+
+    assert!(result.is_err(), "expected validation failure");
+    if let Err(err) = result {
+      assert!(err.to_string().contains("logging.level must not be empty"));
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn logging_format_rejects_unknown_values() {
+    let result = toml::from_str::<Config>("[logging]\nformat = \"pretty\"\n");
+
+    assert!(result.is_err(), "expected parse failure");
+  }
+
+  #[test]
+  fn logging_timestamps_default_to_enabled() -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str("[logging]\nlevel = \"info\"\n")?;
+
+    assert!(cfg.logging.timestamps);
     Ok(())
   }
 
@@ -840,17 +894,27 @@ impl Default for DiscoveryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {
-  pub level:  String,
-  pub format: String,
+  pub level:      String,
+  pub format:     LogFormat,
+  pub timestamps: bool,
 }
 
 impl Default for LoggingConfig {
   fn default() -> Self {
     Self {
-      level:  "info".to_string(),
-      format: "json".to_string(),
+      level:      "info".to_string(),
+      format:     LogFormat::default(),
+      timestamps: true,
     }
   }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+  #[default]
+  Json,
+  Text,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1019,6 +1083,18 @@ impl Config {
         "cache.mass_query.upstream_cooldown must be positive".to_string(),
       ));
     }
+    if self.logging.level.trim().is_empty() {
+      return Err(ConfigError::Validation(
+        "logging.level must not be empty".to_string(),
+      ));
+    }
+    EnvFilter::try_new(&self.logging.level).map_err(|err| {
+      ConfigError::Validation(format!(
+        "logging.level must be a valid tracing filter directive, got {:?}: \
+         {err}",
+        self.logging.level
+      ))
+    })?;
     if self.mesh.enabled && self.mesh.peers.is_empty() {
       return Err(ConfigError::Validation(
         "mesh.enabled is true but no peers configured".to_string(),
