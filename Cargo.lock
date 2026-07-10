@@ -2227,8 +2227,10 @@ dependencies = [
 name = "ncro-router"
 version = "2.2.2"
 dependencies = [
+ "base64",
  "chrono",
  "dashmap",
+ "ed25519-dalek",
  "futures-util",
  "moka",
  "ncro-config",
@@ -2237,6 +2239,7 @@ dependencies = [
  "ncro-metrics",
  "ncro-narinfo",
  "ncro-s3",
+ "rand 0.10.1",
  "reqwest",
  "thiserror 2.0.18",
  "tokio",

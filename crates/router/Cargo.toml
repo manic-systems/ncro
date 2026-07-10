@@ -23,5 +23,10 @@ thiserror.workspace    = true
 tokio                  = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
 tracing.workspace      = true
 
+[dev-dependencies]
+base64.workspace        = true
+ed25519-dalek.workspace = true
+rand.workspace          = true
+
 [lints]
 workspace = true

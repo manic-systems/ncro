@@ -54,6 +54,7 @@ pub enum UpstreamRegistrationError {
 pub trait RouterUpstream {
   fn url(&self) -> &str;
   fn public_key(&self) -> &str;
+  fn public_keys(&self) -> &[String];
   fn username(&self) -> &str;
   fn password(&self) -> Option<&str>;
   fn filters(&self) -> &[FilterRule];
@@ -69,6 +70,10 @@ impl RouterUpstream for UpstreamConfig {
 
   fn public_key(&self) -> &str {
     &self.public_key
+  }
+
+  fn public_keys(&self) -> &[String] {
+    &self.public_keys
   }
 
   fn username(&self) -> &str {
@@ -126,7 +131,7 @@ struct RouterInner {
   client:                   reqwest::Client,
   upstream_clients:         RwLock<HashMap<String, reqwest::Client>>,
   s3:                       S3ClientPool,
-  upstream_keys:            RwLock<HashMap<String, String>>,
+  upstream_keys:            RwLock<HashMap<String, Vec<String>>>,
   upstream_auth:            RwLock<HashMap<String, (String, Option<String>)>>,
   upstream_filters:         RwLock<HashMap<String, Vec<FilterRule>>>,
   upstream_nar_url_modes:   RwLock<HashMap<String, NarUrlMode>>,
@@ -250,7 +255,11 @@ impl Router {
       self.inner.s3.register(url.clone(), s3.clone());
     }
     self
-      .register_upstream_key(url.clone(), upstream.public_key().to_string())
+      .register_upstream_keys(
+        url.clone(),
+        upstream.public_key().to_string(),
+        upstream.public_keys().to_vec(),
+      )
       .await?;
     self
       .register_upstream_auth(
@@ -273,19 +282,23 @@ impl Router {
 
   /// # Errors
   ///
-  /// Returns [`NarInfoError`] if `public_key` is not in valid `name:base64`
-  /// Nix format.
-  async fn register_upstream_key(
+  /// Returns [`NarInfoError`] if any public key is not in valid
+  /// `name:base64` Nix format.
+  async fn register_upstream_keys(
     &self,
     url: String,
     public_key: String,
+    public_keys: Vec<String>,
   ) -> Result<(), NarInfoError> {
+    let keys = normalized_public_keys(public_key, public_keys);
+    for key in &keys {
+      parse_public_key(key)?;
+    }
     let mut map = self.inner.upstream_keys.write().await;
-    if public_key.is_empty() {
+    if keys.is_empty() {
       map.remove(&url);
     } else {
-      parse_public_key(&public_key)?;
-      map.insert(url, public_key);
+      map.insert(url, keys);
     }
     Ok(())
   }
@@ -944,8 +957,9 @@ impl Router {
       resp.bytes().await?.to_vec()
     };
     let parsed = NarInfo::parse(body.as_slice())?;
-    if let Some(pubkey) = self.inner.upstream_keys.read().await.get(upstream)
-      && !parsed.verify(pubkey).unwrap_or(false)
+    if let Some(public_keys) =
+      self.inner.upstream_keys.read().await.get(upstream)
+      && !narinfo_verifies_any_key(&parsed, public_keys)
     {
       tracing::warn!(
         upstream,
@@ -972,6 +986,27 @@ impl Router {
     }
     Some(rewrite_narinfo_url(body, upstream, mode))
   }
+}
+
+fn normalized_public_keys(
+  public_key: String,
+  public_keys: Vec<String>,
+) -> Vec<String> {
+  let mut keys =
+    Vec::with_capacity(usize::from(!public_key.is_empty()) + public_keys.len());
+  if !public_key.is_empty() {
+    keys.push(public_key);
+  }
+  keys.extend(public_keys);
+  keys.sort();
+  keys.dedup();
+  keys
+}
+
+fn narinfo_verifies_any_key(narinfo: &NarInfo, public_keys: &[String]) -> bool {
+  public_keys
+    .iter()
+    .any(|public_key| narinfo.verify(public_key).unwrap_or(false))
 }
 
 fn rewrite_narinfo_url(
@@ -1101,10 +1136,13 @@ mod tests {
   #![expect(clippy::unwrap_used, reason = "Fine in tests")]
   use std::{sync::Arc, time::Duration};
 
+  use base64::{Engine as _, engine::general_purpose::STANDARD};
   use chrono::Utc;
+  use ed25519_dalek::{Signer, SigningKey};
   use ncro_config::{NarUrlMode, UpstreamConfig};
   use ncro_db::{Db, RouteEntry};
   use ncro_health::Prober;
+  use rand::RngExt;
   use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -1120,6 +1158,7 @@ mod tests {
     Router,
     RouterTuning,
     filter_rule_matches,
+    narinfo_verifies_any_key,
     rewrite_narinfo_url,
     store_path_name,
     wildcard_match,
@@ -1222,6 +1261,27 @@ mod tests {
     format!("http://{addr}")
   }
 
+  fn signed_narinfo(key_name: &str) -> (NarInfo, String) {
+    let mut key_bytes = [0_u8; 32];
+    rand::rng().fill(&mut key_bytes);
+    let signing = SigningKey::from_bytes(&key_bytes);
+    let mut narinfo = NarInfo {
+      store_path: "/nix/store/abc123-test".to_string(),
+      nar_hash: "sha256:abc".to_string(),
+      nar_size: 12,
+      references: vec![],
+      ..Default::default()
+    };
+    let sig = signing.sign(narinfo.fingerprint().as_bytes());
+    narinfo.sig =
+      vec![format!("{key_name}:{}", STANDARD.encode(sig.to_bytes()))];
+    let public_key = format!(
+      "{key_name}:{}",
+      STANDARD.encode(signing.verifying_key().to_bytes())
+    );
+    (narinfo, public_key)
+  }
+
   #[test]
   fn extracts_store_path_name() {
     assert_eq!(
@@ -1236,6 +1296,18 @@ mod tests {
     assert!(wildcard_match("*-source", "foo-source"));
     assert!(wildcard_match("*zed*", "my-zedless-package"));
     assert!(!wildcard_match("zedless", "zedless-0.1.0"));
+  }
+
+  #[test]
+  fn narinfo_verification_accepts_any_configured_public_key() {
+    let (narinfo, matching_key) = signed_narinfo("origin");
+    let (_, other_key) = signed_narinfo("other");
+
+    assert!(narinfo_verifies_any_key(&narinfo, &[
+      other_key.clone(),
+      matching_key
+    ]));
+    assert!(!narinfo_verifies_any_key(&narinfo, &[other_key]));
   }
 
   #[test]

@@ -268,6 +268,22 @@ mod tests {
   }
 
   #[test]
+  fn validates_upstream_public_keys_entries() -> Result<(), toml::de::Error> {
+    let cfg: Config = toml::from_str(
+      "[[upstreams]]\nurl = \"https://cache.example\"\npublic_keys = \
+       [\"missing-separator\"]\n",
+    )?;
+
+    let result = cfg.validate();
+
+    assert!(result.is_err(), "expected validation failure");
+    if let Err(err) = result {
+      assert!(err.to_string().contains("public_keys[0]"));
+    }
+    Ok(())
+  }
+
+  #[test]
   fn logging_level_accepts_tracing_filter_directives() -> Result<(), ConfigError>
   {
     let cfg: Config =
@@ -689,8 +705,13 @@ pub struct UpstreamConfig {
   /// this priority.
   pub priority:        i32,
   /// Nix-style `name:base64(key)` public key for narinfo signature
-  /// verification. Leave empty to skip verification.
+  /// verification. Leave empty to skip verification unless `public_keys` is
+  /// set.
   pub public_key:      String,
+  /// Additional Nix-style public keys accepted for narinfo signature
+  /// verification. Useful for pull-through caches that may serve narinfos
+  /// signed by an origin cache key.
+  pub public_keys:     Vec<String>,
   /// HTTP Basic Auth username. Requests are made without authentication
   /// when empty.
   pub username:        String,
@@ -722,6 +743,7 @@ impl fmt::Debug for UpstreamConfig {
       .field("url", &self.url)
       .field("priority", &self.priority)
       .field("public_key", &self.public_key)
+      .field("public_keys", &self.public_keys)
       .field("username", &self.username)
       .field("password", &self.password.as_ref().map(|_| "<redacted>"))
       .field("password_file", &self.password_file)
@@ -1156,10 +1178,14 @@ fn validate_upstream(
       upstream.url
     ))
   })?;
-  if !upstream.public_key.is_empty() && !upstream.public_key.contains(':') {
-    return Err(ConfigError::Validation(format!(
-      "{label}: public_key must be in 'name:base64(key)' Nix format"
-    )));
+  if !upstream.public_key.is_empty() {
+    validate_nix_public_key(
+      &upstream.public_key,
+      &format!("{label}: public_key"),
+    )?;
+  }
+  for (i, public_key) in upstream.public_keys.iter().enumerate() {
+    validate_nix_public_key(public_key, &format!("{label}: public_keys[{i}]"))?;
   }
   if upstream.password.is_some() && upstream.password_file.is_some() {
     return Err(ConfigError::Validation(format!(
@@ -1172,6 +1198,18 @@ fn validate_upstream(
         "{label}.filters[{j}]: pattern is empty"
       )));
     }
+  }
+  Ok(())
+}
+
+fn validate_nix_public_key(
+  public_key: &str,
+  label: &str,
+) -> Result<(), ConfigError> {
+  if public_key.is_empty() || !public_key.contains(':') {
+    return Err(ConfigError::Validation(format!(
+      "{label} must be in 'name:base64(key)' Nix format"
+    )));
   }
   Ok(())
 }
