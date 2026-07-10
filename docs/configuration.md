@@ -42,3 +42,9 @@ cache accepts the same connection fields as an upstream (`url`, `public_key`,
 `username`, `password`, `password_file`, and `s3://` URLs), but it is not part
 of normal upstream routing. It is only used after normal candidates are
 unavailable and its responses are not persisted as route winners.
+
+`logging.level` is a tracing filter directive. Use a single level such as
+`debug`, `info`, `warn`, or `error` for global filtering, or a directive list
+such as `ncro=debug,tower_http=warn` to tune specific modules. `logging.format`
+accepts `json` or `text`. `logging.timestamps` defaults to `true`; set it to
+`false` when a supervisor such as systemd/journald already records timestamps.

@@ -215,8 +215,9 @@ in_memory_negative_ttl = "5s" # short-lived miss suppression
 upstream_cooldown = "15s"     # cooldown on transient upstream network errors
 
 [logging]
-level = "info" # debug | info | warn | error
-format = "json" # json | text
+level = "info"    # tracing filter directive, e.g. debug or ncro=debug,tower_http=warn
+format = "json"   # json | text
+timestamps = true # disable under journald/systemd if timestamps are redundant
 
 [discovery]
 enabled = false
@@ -244,6 +245,14 @@ gossip_interval = "30s"
 
 Environment overrides are useful for containerized or Systemd deployments where
 you want a fixed config file but still need to tweak one or two settings.
+
+> [!NOTE]
+> `logging.level` uses tracing's `EnvFilter` syntax. A single level such as
+> `debug`, `info`, `warn`, or `error` applies globally; directives such as
+> `ncro=debug,tower_http=warn` can tune individual modules or dependencies.
+> `logging.timestamps` defaults to `true` so standalone logs remain
+> self-contained; set it to `false` when a supervisor such as systemd/journald
+> already records timestamps.
 
 ### Path Filters
 
@@ -426,6 +435,7 @@ On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
           public_key = "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=";
         }
       ];
+      logging.timestamps = false;
     };
   };
 
@@ -463,6 +473,11 @@ WantedBy=multi-user.target
 Place it in `/etc/systemd/system/` and enable the service with
 `systemctl enable`. In the case you want to test out first, run the binary with
 a sample configuration instead.
+
+> [!TIP]
+> For deployments using Systemd, set `logging.timestamps = false` in
+> `/etc/ncro/config.toml` to avoid duplicating the timestamp already recorded by
+> the journal.
 
 ## Discovery Mode
 
