@@ -68,5 +68,6 @@ peers           = [  ]
 private_key     = "/etc/ncro/node.key"
 
 [logging]
-format = "json"
-level  = "info"
+format     = "json"
+level      = "info" # tracing filter, e.g. "debug" or "ncro=debug,tower_http=warn"
+timestamps = true
