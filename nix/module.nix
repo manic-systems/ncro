@@ -28,16 +28,29 @@
     then "0.0.0.0${raw}"
     else raw;
 
-  fallbackPublicKeys =
-    optional
-    (cfg.settings.fallback_cache.enabled or false)
-    (cfg.settings.fallback_cache.public_key or "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=");
+  publicKeysFor = upstream:
+    optional ((upstream.public_key or "") != "") upstream.public_key
+    ++ (upstream.public_keys or []);
 
-  upstreamPublicKeys = lib.pipe ((cfg.settings.upstreams or []) ++ fallbackPublicKeys) [
+  fallbackPublicKeys =
+    if cfg.settings.fallback_cache.enabled or false
+    then
+      publicKeysFor (
+        cfg.settings.fallback_cache
+        // {
+          public_key =
+            cfg.settings.fallback_cache.public_key
+              or "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+        }
+      )
+    else [];
+
+  upstreamPublicKeys = lib.pipe ((cfg.settings.upstreams or []) ++ [fallbackPublicKeys]) [
     (builtins.map (upstream:
       if builtins.isAttrs upstream
-      then upstream.public_key or ""
+      then publicKeysFor upstream
       else upstream))
+    lib.flatten
     (builtins.filter (key: key != ""))
     lib.unique
   ];
@@ -49,7 +62,7 @@ in {
       type = bool;
       default = true;
       description = ''
-        Append non-empty upstream public_key values from {option}`services.ncro.settings`
+        Append non-empty upstream public_key and public_keys values from {option}`services.ncro.settings`
         to {option}`nix.settings.trusted-public-keys`.
 
         This keeps Nix client signature validation aligned with the upstream
