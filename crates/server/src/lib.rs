@@ -203,7 +203,7 @@ async fn narinfo(
         hash = hash,
         upstream = result.url,
         cache_hit = result.cache_hit,
-        latency_ms = result.latency_ms,
+        latency_ms = format_args!("{:.5}", result.latency_ms),
         "narinfo routed"
       );
       ncro_metrics::get()
@@ -341,7 +341,7 @@ async fn try_fallback_narinfo(
       tracing::warn!(
         hash,
         upstream = result.url,
-        latency_ms = result.latency_ms,
+        latency_ms = format_args!("{:.5}", result.latency_ms),
         "narinfo routed to fallback cache"
       );
       ncro_metrics::get()
