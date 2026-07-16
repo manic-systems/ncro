@@ -8,6 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, TimeZone, Utc};
+use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
 use sqlx::{
   Row,
   SqlitePool,
@@ -26,6 +27,21 @@ pub enum DbError {
   InvalidData(String),
 }
 
+#[derive(Debug, Error)]
+pub enum TrustClaimError {
+  #[error(transparent)]
+  NarInfo(#[from] NarInfoError),
+  #[error("narinfo signature verification failed")]
+  SignatureVerificationFailed,
+  #[error(
+    "store path {store_path:?} does not match narinfo hash {narinfo_hash:?}"
+  )]
+  StorePathMismatch {
+    narinfo_hash: String,
+    store_path:   String,
+  },
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteEntry {
   pub store_path:    String,
@@ -40,6 +56,74 @@ pub struct RouteEntry {
   pub nar_size:      u64,
   pub nar_url:       String,
   pub narinfo_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrustClaim {
+  pub narinfo_hash: String,
+  pub store_path:   String,
+  pub upstream_url: String,
+  pub signer_name:  String,
+  pub signer_key:   String,
+  pub nar_hash:     String,
+  pub nar_size:     u64,
+  pub references:   String,
+  pub deriver:      String,
+  pub ca:           String,
+  pub file_hash:    String,
+  pub file_size:    u64,
+  pub first_seen:   DateTime<Utc>,
+  pub last_seen:    DateTime<Utc>,
+  pub narinfo:      Vec<u8>,
+}
+
+impl TrustClaim {
+  /// Rebuild a claim from signed narinfo fields.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`TrustClaimError`] when the narinfo is malformed, its signature
+  /// does not verify, or its store path disagrees with the requested hash.
+  pub fn from_verified_narinfo(
+    narinfo_hash: &str,
+    upstream_url: &str,
+    signer_key: &str,
+    narinfo_bytes: &[u8],
+    observed_at: DateTime<Utc>,
+  ) -> Result<Self, TrustClaimError> {
+    let narinfo = NarInfo::parse(narinfo_bytes)?;
+    if !narinfo.verify(signer_key)? {
+      return Err(TrustClaimError::SignatureVerificationFailed);
+    }
+    let (signer_name, _) = parse_public_key(signer_key)?;
+    let store_hash = narinfo
+      .store_path
+      .strip_prefix("/nix/store/")
+      .and_then(|path| path.split_once('-').map(|(hash, _)| hash));
+    if store_hash != Some(narinfo_hash) {
+      return Err(TrustClaimError::StorePathMismatch {
+        narinfo_hash: narinfo_hash.to_string(),
+        store_path:   narinfo.store_path,
+      });
+    }
+    Ok(Self {
+      narinfo_hash: narinfo_hash.to_string(),
+      store_path: narinfo.store_path,
+      upstream_url: upstream_url.to_string(),
+      signer_name,
+      signer_key: signer_key.to_string(),
+      nar_hash: narinfo.nar_hash,
+      nar_size: narinfo.nar_size,
+      references: narinfo.references.join(" "),
+      deriver: narinfo.deriver,
+      ca: narinfo.ca,
+      file_hash: narinfo.file_hash,
+      file_size: narinfo.file_size,
+      first_seen: observed_at,
+      last_seen: observed_at,
+      narinfo: narinfo_bytes.to_vec(),
+    })
+  }
 }
 
 impl RouteEntry {
@@ -281,6 +365,97 @@ impl Db {
   /// # Errors
   ///
   /// Returns [`DbError`] on `SQLite` write failure.
+  pub async fn set_trust_claim(
+    &self,
+    claim: &TrustClaim,
+  ) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
+    sqlx::query(
+            r"INSERT INTO trust_claims
+               (narinfo_hash, store_path, upstream_url, signer_name, signer_key,
+                nar_hash, nar_size, references_key, deriver, ca, file_hash, file_size,
+                first_seen, last_seen, narinfo)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(narinfo_hash, signer_key, nar_hash, nar_size, references_key) DO UPDATE SET
+                 store_path = excluded.store_path,
+                 upstream_url = excluded.upstream_url,
+                 signer_name = excluded.signer_name,
+                 nar_hash = excluded.nar_hash,
+                 nar_size = excluded.nar_size,
+                 references_key = excluded.references_key,
+                 deriver = excluded.deriver,
+                 ca = excluded.ca,
+                 file_hash = excluded.file_hash,
+                 file_size = excluded.file_size,
+                 last_seen = excluded.last_seen,
+                 narinfo = excluded.narinfo",
+        )
+        .bind(&claim.narinfo_hash)
+        .bind(&claim.store_path)
+        .bind(&claim.upstream_url)
+        .bind(&claim.signer_name)
+        .bind(&claim.signer_key)
+        .bind(&claim.nar_hash)
+        .bind(i64::try_from(claim.nar_size).unwrap_or(i64::MAX))
+        .bind(&claim.references)
+        .bind(&claim.deriver)
+        .bind(&claim.ca)
+        .bind(&claim.file_hash)
+        .bind(i64::try_from(claim.file_size).unwrap_or(i64::MAX))
+        .bind(claim.first_seen.timestamp())
+        .bind(claim.last_seen.timestamp())
+        .bind(&claim.narinfo)
+        .execute(&self.pool)
+        .await?;
+    Ok(())
+  }
+
+  /// # Errors
+  ///
+  /// Returns [`DbError`] on `SQLite` query failure or invalid stored data.
+  pub async fn trust_claims(
+    &self,
+    narinfo_hash: &str,
+  ) -> Result<Vec<TrustClaim>, DbError> {
+    let rows = sqlx::query(
+            r"SELECT narinfo_hash, store_path, upstream_url, signer_name, signer_key,
+                      nar_hash, nar_size, references_key, deriver, ca, file_hash, file_size,
+                      first_seen, last_seen, narinfo
+                 FROM trust_claims WHERE narinfo_hash = ?
+                 ORDER BY last_seen DESC",
+        )
+        .bind(narinfo_hash)
+        .fetch_all(&self.pool)
+        .await?;
+    rows.iter().map(row_to_trust_claim).collect()
+  }
+
+  /// Return the `n` most recently seen trust claims, newest first.
+  ///
+  /// Used by the mesh gossip loop to relay locally-verified claims to peers.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`DbError`] on `SQLite` query failure or invalid stored data.
+  pub async fn list_recent_trust_claims(
+    &self,
+    n: i64,
+  ) -> Result<Vec<TrustClaim>, DbError> {
+    let rows = sqlx::query(
+            r"SELECT narinfo_hash, store_path, upstream_url, signer_name, signer_key,
+                      nar_hash, nar_size, references_key, deriver, ca, file_hash, file_size,
+                      first_seen, last_seen, narinfo
+                 FROM trust_claims ORDER BY last_seen DESC LIMIT ?",
+        )
+        .bind(n)
+        .fetch_all(&self.pool)
+        .await?;
+    rows.iter().map(row_to_trust_claim).collect()
+  }
+
+  /// # Errors
+  ///
+  /// Returns [`DbError`] on `SQLite` write failure.
   pub async fn save_health(
     &self,
     url: &str,
@@ -427,6 +602,34 @@ async fn migrate(pool: &SqlitePool) -> Result<(), DbError> {
   .execute(pool)
   .await?;
   add_column_if_missing(pool, "routes", "narinfo_bytes", "BLOB").await?;
+  sqlx::query(
+    r"CREATE TABLE IF NOT EXISTS trust_claims (
+             narinfo_hash TEXT NOT NULL,
+             store_path TEXT NOT NULL,
+             upstream_url TEXT NOT NULL,
+             signer_name TEXT NOT NULL,
+             signer_key TEXT NOT NULL,
+             nar_hash TEXT NOT NULL,
+             nar_size INTEGER NOT NULL,
+             references_key TEXT NOT NULL,
+             deriver TEXT NOT NULL,
+             ca TEXT NOT NULL,
+             file_hash TEXT NOT NULL,
+             file_size INTEGER NOT NULL,
+             first_seen INTEGER NOT NULL,
+             last_seen INTEGER NOT NULL,
+             narinfo BLOB NOT NULL,
+             PRIMARY KEY (narinfo_hash, signer_key, nar_hash, nar_size, references_key)
+           )",
+  )
+  .execute(pool)
+  .await?;
+  sqlx::query(
+    "CREATE INDEX IF NOT EXISTS idx_trust_claims_output ON \
+     trust_claims(narinfo_hash, nar_hash, nar_size, references_key)",
+  )
+  .execute(pool)
+  .await?;
   Ok(())
 }
 
@@ -455,6 +658,34 @@ fn row_to_route(row: &sqlx::sqlite::SqliteRow) -> Result<RouteEntry, DbError> {
     })?,
     nar_url:       row.get("nar_url"),
     narinfo_bytes: row.get("narinfo_bytes"),
+  })
+}
+
+fn row_to_trust_claim(
+  row: &sqlx::sqlite::SqliteRow,
+) -> Result<TrustClaim, DbError> {
+  let nar_size = row.get::<i64, _>("nar_size");
+  let file_size = row.get::<i64, _>("file_size");
+  Ok(TrustClaim {
+    narinfo_hash: row.get("narinfo_hash"),
+    store_path:   row.get("store_path"),
+    upstream_url: row.get("upstream_url"),
+    signer_name:  row.get("signer_name"),
+    signer_key:   row.get("signer_key"),
+    nar_hash:     row.get("nar_hash"),
+    nar_size:     u64::try_from(nar_size).map_err(|_| {
+      DbError::InvalidData(format!("nar_size out of range: {nar_size}"))
+    })?,
+    references:   row.get("references_key"),
+    deriver:      row.get("deriver"),
+    ca:           row.get("ca"),
+    file_hash:    row.get("file_hash"),
+    file_size:    u64::try_from(file_size).map_err(|_| {
+      DbError::InvalidData(format!("file_size out of range: {file_size}"))
+    })?,
+    first_seen:   timestamp(row.get("first_seen"), "first_seen")?,
+    last_seen:    timestamp(row.get("last_seen"), "last_seen")?,
+    narinfo:      row.get("narinfo"),
   })
 }
 
@@ -538,6 +769,40 @@ mod tests {
       .await?
       .ok_or_else(|| DbError::InvalidData("route not found".to_string()))?;
     assert_eq!(got.narinfo_bytes, Some(bytes));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn trust_claim_roundtrip() -> Result<(), DbError> {
+    let db = Db::open(":memory:", 100).await?;
+    let now = Utc::now();
+    let claim = TrustClaim {
+      narinfo_hash: "abc123".into(),
+      store_path:   "/nix/store/abc123-hello".into(),
+      upstream_url: "https://cache.example".into(),
+      signer_name:  "cache.example-1".into(),
+      signer_key:   "cache.example-1:pubkey".into(),
+      nar_hash:     "sha256:abc".into(),
+      nar_size:     42,
+      references:   "dep-one dep-two".into(),
+      deriver:      "abc123-hello.drv".into(),
+      ca:           String::new(),
+      file_hash:    "sha256:file".into(),
+      file_size:    7,
+      first_seen:   now,
+      last_seen:    now,
+      narinfo:      b"StorePath: /nix/store/abc123-hello\n".to_vec(),
+    };
+    db.set_trust_claim(&claim).await?;
+    let claims = db.trust_claims("abc123").await?;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].signer_name, claim.signer_name);
+    assert_eq!(claims[0].nar_hash, claim.nar_hash);
+
+    let recent = db.list_recent_trust_claims(10).await?;
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].narinfo_hash, claim.narinfo_hash);
+    assert_eq!(recent[0].narinfo, claim.narinfo);
     Ok(())
   }
 

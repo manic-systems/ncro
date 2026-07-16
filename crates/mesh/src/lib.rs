@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use ncro_db::{Db, RouteEntry};
+use ncro_db::{Db, RouteEntry, TrustClaim};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,6 +33,7 @@ pub enum MeshError {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MsgType {
   Announce = 1,
+  Claims   = 2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +41,12 @@ pub struct Message {
   pub r#type:    MsgType,
   pub node_id:   String,
   pub timestamp: i64,
+  /// Route gossip carried by an `Announce` message (empty for `Claims`).
+  #[serde(default)]
   pub routes:    Vec<RouteEntry>,
+  /// Trust claims carried by a `Claims` message (empty for `Announce`).
+  #[serde(default)]
+  pub claims:    Vec<TrustClaim>,
 }
 
 #[derive(Clone)]
@@ -127,13 +133,19 @@ pub fn verify(pubkey: &[u8], body: &[u8], sig: &[u8]) -> Result<(), MeshError> {
 /// # Errors
 ///
 /// Returns [`MeshError`] if the UDP socket cannot be bound to `addr`.
+/// `trusted_keys` is the set of Nix signer public keys (`name:base64(key)`)
+/// whose relayed trust claims may be accepted; claims signed by any other key
+/// are dropped (see [`merge_claims`]).
 pub async fn listen_and_serve(
   addr: &str,
   db: Db,
   allowed_keys: Vec<[u8; 32]>,
+  trusted_keys: Vec<String>,
   stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), MeshError> {
   let socket = UdpSocket::bind(addr).await?;
+  let trusted: std::collections::HashSet<String> =
+    trusted_keys.into_iter().collect();
   tokio::spawn(async move {
     let mut stop = stop;
     let mut buf = vec![0; MAX_PACKET_SIZE];
@@ -152,8 +164,15 @@ pub async fn listen_and_serve(
                           tracing::warn!(?src, error = %err, "mesh: signature verification failed");
                           continue;
                       }
-                      if msg.r#type == MsgType::Announce && !msg.routes.is_empty() {
-                          merge_routes(&db, msg.routes).await;
+                      match msg.r#type {
+                          MsgType::Announce if !msg.routes.is_empty() => {
+                              merge_routes(&db, msg.routes).await;
+                          }
+                          MsgType::Claims if !msg.claims.is_empty() => {
+                              let relay = format!("mesh://{src}");
+                              merge_claims(&db, msg.claims, &trusted, &relay).await;
+                          }
+                          _ => {}
                       }
                   }
                   Err(err) => tracing::warn!(?src, error = %err, "mesh: malformed packet"),
@@ -188,6 +207,55 @@ async fn merge_routes(db: &Db, incoming: Vec<RouteEntry>) {
   }
 }
 
+/// Merge trust claims relayed by a peer into the local store.
+///
+/// A relayed claim is accepted only if **both** hold:
+///
+/// 1. Its `signer_key` is in `trusted`, the set of Nix keys this node is
+///    configured to trust. Without this gate, distinct-signer quorum is
+///    security theatre: an attacker could generate any number of throwaway
+///    keypairs, self-sign forged content under each, and relay the claims to
+///    fabricate agreement. Dropping untrusted keys here also bounds how many
+///    claims a hostile peer can write to the database.
+/// 2. The embedded narinfo verifies against that `signer_key`, and the stored
+///    claim is rebuilt from its signed fields. The peer's packet signature only
+///    proves *who relayed* the claim; it cannot substitute a content tuple.
+async fn merge_claims(
+  db: &Db,
+  incoming: Vec<TrustClaim>,
+  trusted: &std::collections::HashSet<String>,
+  relay: &str,
+) {
+  for claim in incoming {
+    if !trusted.contains(&claim.signer_key) {
+      tracing::warn!(
+        store = claim.store_path,
+        signer = claim.signer_name,
+        "mesh: rejecting relayed trust claim from untrusted signer key"
+      );
+      continue;
+    }
+    let Ok(claim) = TrustClaim::from_verified_narinfo(
+      &claim.narinfo_hash,
+      relay,
+      &claim.signer_key,
+      &claim.narinfo,
+      Utc::now(),
+    ) else {
+      tracing::warn!(
+        store = claim.store_path,
+        signer = claim.signer_name,
+        "mesh: rejecting relayed trust claim that disagrees with its signed \
+         narinfo"
+      );
+      continue;
+    };
+    if let Err(err) = db.set_trust_claim(&claim).await {
+      tracing::warn!(error = %err, store = claim.store_path, "mesh: trust claim merge failed");
+    }
+  }
+}
+
 /// # Errors
 ///
 /// Returns [`MeshError`] if the message cannot be signed, the socket cannot
@@ -202,10 +270,72 @@ pub async fn announce(
     node_id: node.id(),
     timestamp: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
     routes,
+    claims: Vec::new(),
   };
   let packet = encode_packet(node, &msg)?;
   let socket = UdpSocket::bind("0.0.0.0:0").await?;
   socket.send_to(&packet, peer_addr).await?;
+  Ok(())
+}
+
+fn encode_claims(
+  node: &Node,
+  claims: &[TrustClaim],
+) -> Result<Vec<u8>, MeshError> {
+  let msg = Message {
+    r#type:    MsgType::Claims,
+    node_id:   node.id(),
+    timestamp: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+    routes:    Vec::new(),
+    claims:    claims.to_vec(),
+  };
+  encode_packet(node, &msg)
+}
+
+/// Relay trust claims to a peer, batching them so no UDP packet exceeds
+/// [`MAX_PACKET_SIZE`].  A single claim that cannot fit on its own (its raw
+/// narinfo is too large) is logged and skipped rather than silently dropped.
+///
+/// # Errors
+///
+/// Returns [`MeshError`] if a claim cannot be encoded, the socket cannot be
+/// bound, or a packet fails to send.
+pub async fn announce_claims(
+  peer_addr: &str,
+  node: &Node,
+  claims: Vec<TrustClaim>,
+) -> Result<(), MeshError> {
+  let socket = UdpSocket::bind("0.0.0.0:0").await?;
+  let mut batch: Vec<TrustClaim> = Vec::new();
+  for claim in claims {
+    // A claim that cannot fit in an empty packet on its own can never be
+    // gossiped; log and skip it rather than dropping silently.
+    if encode_claims(node, std::slice::from_ref(&claim))?.len()
+      > MAX_PACKET_SIZE
+    {
+      tracing::warn!(
+        store = claim.store_path,
+        "mesh: trust claim exceeds packet size, skipping"
+      );
+      continue;
+    }
+    batch.push(claim);
+    if encode_claims(node, &batch)?.len() <= MAX_PACKET_SIZE {
+      continue;
+    }
+    // Adding the last claim overflowed the packet: flush the batch without it,
+    // then start a fresh batch holding the claim that did not fit.
+    let overflow = batch.split_off(batch.len() - 1);
+    socket
+      .send_to(&encode_claims(node, &batch)?, peer_addr)
+      .await?;
+    batch = overflow;
+  }
+  if !batch.is_empty() {
+    socket
+      .send_to(&encode_claims(node, &batch)?, peer_addr)
+      .await?;
+  }
   Ok(())
 }
 
@@ -214,6 +344,7 @@ pub async fn run_gossip_loop(
   db: Db,
   peers: Vec<String>,
   interval: Duration,
+  gossip_claims: bool,
   mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
   let mut ticker = tokio::time::interval(interval);
@@ -221,13 +352,22 @@ pub async fn run_gossip_loop(
     tokio::select! {
         _ = stop.changed() => return,
         _ = ticker.tick() => {
-            let Ok(routes) = db.list_recent_routes(MAX_GOSSIP_ROUTES).await else { continue; };
-            if routes.is_empty() { continue; }
+            let routes = db.list_recent_routes(MAX_GOSSIP_ROUTES).await.unwrap_or_default();
+            let claims = if gossip_claims {
+                db.list_recent_trust_claims(MAX_GOSSIP_ROUTES).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if routes.is_empty() && claims.is_empty() { continue; }
             for peer in &peers {
                 let peer = peer.clone();
                 let node = node.clone();
                 let routes = routes.clone();
-                tokio::spawn(async move { let _ = announce(&peer, &node, routes).await; });
+                let claims = claims.clone();
+                tokio::spawn(async move {
+                    if !routes.is_empty() { let _ = announce(&peer, &node, routes).await; }
+                    if !claims.is_empty() { let _ = announce_claims(&peer, &node, claims).await; }
+                });
             }
         }
     }
@@ -256,9 +396,132 @@ fn decode_packet(packet: &[u8]) -> Result<DecodedPacket<'_>, MeshError> {
 
 #[cfg(test)]
 mod tests {
-  use ncro_db::{Db, RouteEntry};
+  use base64::{Engine, engine::general_purpose::STANDARD};
+  use ed25519_dalek::{Signer, SigningKey};
+  use ncro_db::{Db, RouteEntry, TrustClaim};
+  use ncro_narinfo::NarInfo;
+  use rand::RngExt;
 
-  use super::merge_routes;
+  use super::{merge_claims, merge_routes};
+
+  /// Build a trust claim carrying a narinfo signed by `signer_key` so it
+  /// re-verifies, unless `tamper` flips a content field after signing.
+  fn signed_claim(store_hash: &str, tamper: bool) -> TrustClaim {
+    let mut key_bytes = [0_u8; 32];
+    rand::rng().fill(&mut key_bytes);
+    let signing = SigningKey::from_bytes(&key_bytes);
+    let store_path = format!("/nix/store/{store_hash}-pkg");
+    let mut ni = NarInfo {
+      store_path: store_path.clone(),
+      nar_hash: "sha256:abc".into(),
+      nar_size: 12,
+      references: vec![format!("{store_hash}-pkg")],
+      ..Default::default()
+    };
+    let sig = signing.sign(ni.fingerprint().as_bytes());
+    let signer_key = format!(
+      "test:{}",
+      STANDARD.encode(signing.verifying_key().to_bytes())
+    );
+    ni.sig = vec![format!("test:{}", STANDARD.encode(sig.to_bytes()))];
+    if tamper {
+      ni.nar_size = 999;
+    }
+    let now = chrono::Utc::now();
+    let narinfo = format!(
+      "StorePath: {}\nNarHash: {}\nNarSize: {}\nReferences: {}\nSig: {}\n",
+      ni.store_path,
+      ni.nar_hash,
+      ni.nar_size,
+      ni.references.join(" "),
+      ni.sig[0],
+    );
+    TrustClaim {
+      narinfo_hash: store_hash.into(),
+      store_path,
+      upstream_url: "https://cache.example".into(),
+      signer_name: "test".into(),
+      signer_key,
+      nar_hash: ni.nar_hash.clone(),
+      nar_size: ni.nar_size,
+      references: ni.references.join(" "),
+      deriver: String::new(),
+      ca: String::new(),
+      file_hash: String::new(),
+      file_size: 0,
+      first_seen: now,
+      last_seen: now,
+      narinfo: narinfo.into_bytes(),
+    }
+  }
+
+  fn trust_set(claim: &TrustClaim) -> std::collections::HashSet<String> {
+    std::iter::once(claim.signer_key.clone()).collect()
+  }
+
+  #[tokio::test]
+  async fn merge_claims_accepts_valid_trusted_signature()
+  -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open(":memory:", 100).await?;
+    let claim = signed_claim("aaa111", false);
+    let trusted = trust_set(&claim);
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    assert_eq!(db.trust_claims("aaa111").await?.len(), 1);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn merge_claims_rejects_tampered_claim()
+  -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open(":memory:", 100).await?;
+    let claim = signed_claim("bbb222", true);
+    // Trust the signer key so we isolate the *signature* check.
+    let trusted = trust_set(&claim);
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    assert!(
+      db.trust_claims("bbb222").await?.is_empty(),
+      "a claim whose narinfo signature does not verify must be dropped"
+    );
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn merge_claims_rejects_forged_signed_fields()
+  -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open(":memory:", 100).await?;
+    let mut claim = signed_claim("forged", false);
+    let trusted = trust_set(&claim);
+    claim.nar_hash = "sha256:attacker-controlled".into();
+    claim.references = "attacker-controlled".into();
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    let claims = db.trust_claims("forged").await?;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].nar_hash, "sha256:abc");
+    assert_eq!(claims[0].references, "forged-pkg");
+
+    let mut claim = signed_claim("source", false);
+    let trusted = trust_set(&claim);
+    claim.narinfo_hash = "target".into();
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    assert!(db.trust_claims("target").await?.is_empty());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn merge_claims_rejects_untrusted_signer()
+  -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open(":memory:", 100).await?;
+    // A perfectly valid self-signed claim, but the signer key is not trusted:
+    // this is the attacker-generated-key case and must be dropped.
+    let claim = signed_claim("ccc333", false);
+    let trusted = std::collections::HashSet::new();
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    assert!(
+      db.trust_claims("ccc333").await?.is_empty(),
+      "a validly-signed claim from an untrusted key must be dropped"
+    );
+    Ok(())
+  }
 
   fn route(store_path: &str, latency_ema: f64, ttl_secs: i64) -> RouteEntry {
     let now = chrono::Utc::now();

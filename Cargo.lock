@@ -2161,6 +2161,7 @@ name = "ncro-db"
 version = "2.2.2"
 dependencies = [
  "chrono",
+ "ncro-narinfo",
  "serde",
  "sqlx",
  "thiserror 2.0.18",
@@ -2193,10 +2194,12 @@ dependencies = [
 name = "ncro-mesh"
 version = "2.2.2"
 dependencies = [
+ "base64",
  "chrono",
  "ed25519-dalek",
  "hex",
  "ncro-db",
+ "ncro-narinfo",
  "rand 0.10.1",
  "rmp-serde",
  "serde",
@@ -2239,7 +2242,6 @@ dependencies = [
  "ncro-metrics",
  "ncro-narinfo",
  "ncro-s3",
- "rand 0.10.1",
  "reqwest",
  "thiserror 2.0.18",
  "tokio",

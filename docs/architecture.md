@@ -127,6 +127,18 @@ this prevents project-specific caches from becoming winners for unrelated paths.
 Fallback cache traffic bypasses these router features and does not update health
 or routing state.
 
+Optional trust enforcement runs at the same acceptance point as filters. After a
+candidate narinfo is fetched, ncro verifies the configured upstream signing key
+when present and can record the signed narinfo as a local claim. In `signed`
+mode, one valid configured signer is enough. In `quorum` mode, ncro only stores
+a route after enough signer keys agree on the same `StorePath`, `NarHash`,
+`NarSize`, and `References`. Rejected candidates are handled like filter
+rejections: the route is not cached and ncro keeps trying remaining candidates.
+When the policy is not satisfied and `trust.fail_closed = false`, the content is
+served anyway but the bypass is logged and counted (`ncro_trust_bypass_total`).
+The signature covers only the signed fingerprint, not the streamed NAR bytes;
+the full model and that boundary are documented in [trust.md](trust.md).
+
 > [!NOTE]
 > Persistence is intentionally narrow. SQLite stores two kinds of data so a
 > restart does not force ncro to relearn everything from scratch.
@@ -135,13 +147,23 @@ First type of stored data is **route entries**, a mapping from narinfo hash to
 the winning upstream URL, stored with a creation timestamp and TTL. When the
 cache exceeds `max_entries`, the least recently used entry is evicted first.
 **Health snapshots** on another hand are per-upstream EMA latency estimates and
-failure counts, refreshed by the background probe loop. Fallback-cache responses
-are (intentionally) not stored as route entries, so normal upstreams become
-active again as soon as they recover.
+failure counts, refreshed by the background probe loop. **Trust claims** (when
+trust is enabled) are a third kind of stored data: durable records of which
+signer vouched for which content. Fallback-cache responses are (intentionally)
+not stored as route entries, so normal upstreams become active again as soon as
+they recover.
+
+Negative lookups are cached in two layers: a short-lived in-memory LRU
+(`in_memory_negative_ttl`) absorbs rapid-fire duplicate misses, while a
+longer-lived SQLite entry (`negative_ttl`) lets a known miss survive a restart.
+The in-memory layer is the only routing state that does not live in SQLite.
 
 Discovery and mesh are optional extensions. Discovery can add peers from the
-local network, while mesh gossip shares recent route decisions across trusted
-nodes using signed UDP packets. Consider:
+local network, while mesh gossip shares recent route decisions (and, when
+`mesh.gossip_trust_claims` is enabled, re-verified trust claims) across trusted
+nodes using signed UDP packets. Relayed claims are re-verified against their
+original Nix signer key before being trusted, so a peer is a witness, not a
+signing authority. Consider:
 
 ```mermaid
 flowchart LR

@@ -141,7 +141,7 @@ pub async fn run() -> anyhow::Result<()> {
     });
   }
 
-  let router = Router::new(
+  let router = Router::new_with_trust(
     db.clone(),
     prober.clone(),
     cfg.cache.ttl.0,
@@ -153,6 +153,7 @@ pub async fn run() -> anyhow::Result<()> {
       in_memory_negative_ttl:    cfg.cache.mass_query.in_memory_negative_ttl.0,
       upstream_cooldown:         cfg.cache.mass_query.upstream_cooldown.0,
     },
+    cfg.trust.clone(),
   )?;
 
   for upstream in &cfg.upstreams {
@@ -210,10 +211,18 @@ pub async fn run() -> anyhow::Result<()> {
       .iter()
       .filter_map(|p| hex::decode(&p.public_key).ok()?.try_into().ok())
       .collect::<Vec<[u8; 32]>>();
+    let trusted_keys = cfg.trust.trusted_signer_keys(
+      &cfg.upstreams,
+      cfg
+        .fallback_cache
+        .enabled
+        .then_some(&cfg.fallback_cache.upstream),
+    );
     ncro_mesh::listen_and_serve(
       &cfg.mesh.bind_addr,
       db.clone(),
       allowed,
+      trusted_keys.into_iter().collect(),
       stop_rx.clone(),
     )
     .await?;
@@ -228,6 +237,7 @@ pub async fn run() -> anyhow::Result<()> {
       db.clone(),
       peers,
       cfg.mesh.gossip_interval.0,
+      cfg.mesh.gossip_trust_claims,
       stop_rx.clone(),
     ));
   }
@@ -241,6 +251,7 @@ pub async fn run() -> anyhow::Result<()> {
     cache_priority: cfg.server.cache_priority,
     read_timeout:   cfg.server.read_timeout.0,
     write_timeout:  cfg.server.write_timeout.0,
+    trust:          cfg.trust,
   })?;
   let listener = match inherited_listener() {
     Some(std_listener) => {
@@ -271,11 +282,11 @@ fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
   match (format, timestamps) {
     (LogFormat::Json, true) => fmt().json().with_env_filter(filter).init(),
     (LogFormat::Json, false) => {
-      fmt().json().without_time().with_env_filter(filter).init()
+      fmt().json().without_time().with_env_filter(filter).init();
     },
     (LogFormat::Text, true) => fmt().with_env_filter(filter).init(),
     (LogFormat::Text, false) => {
-      fmt().without_time().with_env_filter(filter).init()
+      fmt().without_time().with_env_filter(filter).init();
     },
   }
 }

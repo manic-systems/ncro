@@ -8,25 +8,26 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-chrono.workspace       = true
-dashmap.workspace      = true
-futures-util.workspace = true
-moka.workspace         = true
-ncro-config.workspace  = true
-ncro-db.workspace      = true
-ncro-health.workspace  = true
-ncro-metrics.workspace = true
-ncro-narinfo.workspace = true
-ncro-s3.workspace      = true
-reqwest                = { workspace = true, features = [ "rustls" ] }
-thiserror.workspace    = true
-tokio                  = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
-tracing.workspace      = true
+base64.workspace        = true
+chrono.workspace        = true
+dashmap.workspace       = true
+ed25519-dalek.workspace = true
+futures-util.workspace  = true
+moka.workspace          = true
+ncro-config.workspace   = true
+ncro-db.workspace       = true
+ncro-health.workspace   = true
+ncro-metrics.workspace  = true
+ncro-narinfo.workspace  = true
+ncro-s3.workspace       = true
+reqwest                 = { workspace = true, features = [ "rustls" ] }
+thiserror.workspace     = true
+tokio                   = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
+tracing.workspace       = true
 
 [dev-dependencies]
 base64.workspace        = true
 ed25519-dalek.workspace = true
-rand.workspace          = true
 
 [lints]
 workspace = true

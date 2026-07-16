@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, HashMap, HashSet},
   sync::Arc,
   time::{Duration, Instant},
 };
@@ -14,9 +14,11 @@ use ncro_config::{
   FilterRule,
   NarUrlMode,
   S3Config,
+  TrustConfig,
+  TrustMode,
   UpstreamConfig,
 };
-use ncro_db::{Db, DbError, RouteEntry};
+use ncro_db::{Db, DbError, RouteEntry, TrustClaim, TrustClaimError};
 use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
 use ncro_s3::{S3ClientPool, S3Error};
@@ -33,6 +35,8 @@ pub enum RouterError {
   NoCandidates(String),
   #[error("narinfo signature verification failed")]
   SignatureVerificationFailed,
+  #[error("narinfo did not satisfy trust policy")]
+  TrustPolicyFailed,
   #[error("fetch narinfo: {0}")]
   FetchNarinfo(#[from] reqwest::Error),
   #[error("S3 request failed: {0}")]
@@ -41,6 +45,8 @@ pub enum RouterError {
   ParseNarinfo(#[from] NarInfoError),
   #[error(transparent)]
   Db(#[from] DbError),
+  #[error(transparent)]
+  TrustClaim(#[from] TrustClaimError),
 }
 
 #[derive(Debug, Error)]
@@ -135,6 +141,7 @@ struct RouterInner {
   upstream_auth:            RwLock<HashMap<String, (String, Option<String>)>>,
   upstream_filters:         RwLock<HashMap<String, Vec<FilterRule>>>,
   upstream_nar_url_modes:   RwLock<HashMap<String, NarUrlMode>>,
+  trust:                    TrustConfig,
   inflight:                 DashMap<String, Arc<Mutex<()>>>,
   lru:                      MokaCache<String, Arc<ResolveResult>>,
   miss_lru:                 MokaCache<String, ()>,
@@ -149,6 +156,16 @@ struct RouterInner {
 struct RaceResult {
   url:        String,
   latency_ms: f64,
+}
+
+struct FetchedNarInfo {
+  body:   Option<Vec<u8>>,
+  parsed: NarInfo,
+  signer: Option<VerifiedSigner>,
+}
+
+struct VerifiedSigner {
+  public_key: String,
 }
 
 enum CommitOutcome {
@@ -208,6 +225,31 @@ impl Router {
     negative_ttl: Duration,
     tuning: RouterTuning,
   ) -> Result<Self, reqwest::Error> {
+    Self::new_with_trust(
+      db,
+      prober,
+      route_ttl,
+      race_timeout,
+      negative_ttl,
+      tuning,
+      TrustConfig::default(),
+    )
+  }
+
+  /// Create a router with an explicit trust policy.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the HTTP client cannot be constructed.
+  pub fn new_with_trust(
+    db: Db,
+    prober: Prober,
+    route_ttl: Duration,
+    race_timeout: Duration,
+    negative_ttl: Duration,
+    tuning: RouterTuning,
+    trust: TrustConfig,
+  ) -> Result<Self, reqwest::Error> {
     Ok(Self {
       inner: Arc::new(RouterInner {
         db,
@@ -222,6 +264,7 @@ impl Router {
         upstream_auth: RwLock::new(HashMap::new()),
         upstream_filters: RwLock::new(HashMap::new()),
         upstream_nar_url_modes: RwLock::new(HashMap::new()),
+        trust,
         inflight: DashMap::new(),
         lru: MokaCache::builder()
           .max_capacity(1024)
@@ -300,6 +343,7 @@ impl Router {
     } else {
       map.insert(url, keys);
     }
+    drop(map);
     Ok(())
   }
 
@@ -355,10 +399,12 @@ impl Router {
     url: String,
     timeout: Option<Duration>,
   ) -> Result<(), reqwest::Error> {
-    let mut map = self.inner.upstream_clients.write().await;
     if let Some(timeout) = timeout {
-      map.insert(url, reqwest::Client::builder().timeout(timeout).build()?);
+      let client = reqwest::Client::builder().timeout(timeout).build()?;
+      let mut map = self.inner.upstream_clients.write().await;
+      map.insert(url, client);
     } else {
+      let mut map = self.inner.upstream_clients.write().await;
       map.remove(&url);
     }
     Ok(())
@@ -377,12 +423,23 @@ impl Router {
     upstream: &str,
   ) -> Result<ResolveResult, RouterError> {
     let start = Instant::now();
-    let (body, _) = self.fetch_narinfo(upstream, store_hash).await?;
-    let narinfo_bytes =
-      self.response_narinfo_bytes(upstream, body.as_deref()).await;
+    let fetched = self.fetch_narinfo(upstream, store_hash).await?;
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if !self
+      .accepts_trust_claim(upstream, store_hash, &fetched, latency_ms)
+      .await?
+    {
+      if self.inner.trust.fail_closed {
+        return Err(RouterError::TrustPolicyFailed);
+      }
+      note_trust_bypass(upstream, &fetched);
+    }
+    let narinfo_bytes = self
+      .response_narinfo_bytes(upstream, fetched.body.as_deref())
+      .await;
     Ok(ResolveResult {
       url: upstream.to_string(),
-      latency_ms: start.elapsed().as_secs_f64() * 1000.0,
+      latency_ms,
       cache_hit: false,
       narinfo_bytes,
     })
@@ -461,6 +518,18 @@ impl Router {
         self.inner.lru.invalidate(store_hash).await;
         return Ok(None);
       };
+      if !self
+        .cached_route_satisfies_trust(
+          &cached.url,
+          store_hash,
+          narinfo_bytes.as_deref(),
+          cached.latency_ms,
+        )
+        .await?
+      {
+        self.inner.lru.invalidate(store_hash).await;
+        return Ok(None);
+      }
       ncro_metrics::get().narinfo_cache_hits.inc();
       let mut result = (*cached).clone();
       if result.narinfo_bytes.is_none() {
@@ -495,6 +564,17 @@ impl Router {
     else {
       return Ok(None);
     };
+    if !self
+      .cached_route_satisfies_trust(
+        &entry.upstream_url,
+        store_hash,
+        narinfo_bytes.as_deref(),
+        entry.latency_ms,
+      )
+      .await?
+    {
+      return Ok(None);
+    }
     if entry.narinfo_bytes.is_none() && narinfo_bytes.is_some() {
       entry.narinfo_bytes = narinfo_bytes;
       self.inner.db.set_route(&entry).await?;
@@ -783,22 +863,43 @@ impl Router {
     winner: RaceResult,
     store_hash: &str,
   ) -> Result<CommitOutcome, RouterError> {
-    let (body, parsed) = self.fetch_narinfo(&winner.url, store_hash).await?;
-    if !self.upstream_allows_narinfo(&winner.url, &parsed).await {
+    let fetched = self.fetch_narinfo(&winner.url, store_hash).await?;
+    if !self
+      .upstream_allows_narinfo(&winner.url, &fetched.parsed)
+      .await
+    {
       tracing::debug!(
         upstream = &winner.url,
-        store_path = &parsed.store_path,
+        store_path = &fetched.parsed.store_path,
         "narinfo rejected by upstream filter"
       );
       return Ok(CommitOutcome::Rejected);
     }
+    let trust_accepted = self
+      .accepts_trust_claim(&winner.url, store_hash, &fetched, winner.latency_ms)
+      .await?;
+    if !trust_accepted {
+      if self.inner.trust.fail_closed {
+        tracing::debug!(
+          upstream = &winner.url,
+          store_path = &fetched.parsed.store_path,
+          "narinfo rejected by trust policy"
+        );
+        return Ok(CommitOutcome::Rejected);
+      }
+      note_trust_bypass(&winner.url, &fetched);
+    }
     // Strip leading slash and query string (harmonia appends ?hash=STORE_HASH)
     // so the DB key is just the path component for consistent lookups.
-    let nar_url = parsed
+    let nar_url = fetched
+      .parsed
       .url
       .trim_start_matches('/')
       .split_once('?')
-      .map_or_else(|| parsed.url.trim_start_matches('/'), |(path, _)| path)
+      .map_or_else(
+        || fetched.parsed.url.trim_start_matches('/'),
+        |(path, _)| path,
+      )
       .to_string();
 
     ncro_metrics::get()
@@ -839,10 +940,10 @@ impl Router {
         ttl: now
           + chrono::Duration::from_std(self.inner.route_ttl)
             .unwrap_or_default(),
-        nar_hash: parsed.nar_hash,
-        nar_size: parsed.nar_size,
+        nar_hash: fetched.parsed.nar_hash,
+        nar_size: fetched.parsed.nar_size,
         nar_url,
-        narinfo_bytes: body.clone(),
+        narinfo_bytes: fetched.body.clone(),
       })
       .await?;
     let result = ResolveResult {
@@ -850,7 +951,7 @@ impl Router {
       latency_ms:    winner.latency_ms,
       cache_hit:     false,
       narinfo_bytes: self
-        .response_narinfo_bytes(&winner.url, body.as_deref())
+        .response_narinfo_bytes(&winner.url, fetched.body.as_deref())
         .await,
     };
     self
@@ -916,10 +1017,12 @@ impl Router {
       return CachedFilterCheck::Accepted(Some(bytes.to_vec()));
     }
 
-    if let Ok((body, parsed)) = self.fetch_narinfo(upstream, store_hash).await
-      && self.upstream_allows_narinfo(upstream, &parsed).await
+    if let Ok(fetched) = self.fetch_narinfo(upstream, store_hash).await
+      && self
+        .upstream_allows_narinfo(upstream, &fetched.parsed)
+        .await
     {
-      return CachedFilterCheck::Accepted(body);
+      return CachedFilterCheck::Accepted(fetched.body);
     }
     CachedFilterCheck::Rejected
   }
@@ -928,7 +1031,7 @@ impl Router {
     &self,
     upstream: &str,
     store_hash: &str,
-  ) -> Result<(Option<Vec<u8>>, NarInfo), RouterError> {
+  ) -> Result<FetchedNarInfo, RouterError> {
     let body = if self.inner.s3.contains(upstream) {
       self
         .inner
@@ -957,18 +1060,146 @@ impl Router {
       resp.bytes().await?.to_vec()
     };
     let parsed = NarInfo::parse(body.as_slice())?;
-    if let Some(public_keys) =
-      self.inner.upstream_keys.read().await.get(upstream)
-      && !narinfo_verifies_any_key(&parsed, public_keys)
-    {
-      tracing::warn!(
-        upstream,
-        store = store_hash,
-        "narinfo signature verification failed"
-      );
-      return Err(RouterError::SignatureVerificationFailed);
+    let signer = self.verified_signer(upstream, &parsed).await?;
+    Ok(FetchedNarInfo {
+      body: Some(body),
+      parsed,
+      signer,
+    })
+  }
+
+  async fn cached_route_satisfies_trust(
+    &self,
+    upstream: &str,
+    store_hash: &str,
+    narinfo_bytes: Option<&[u8]>,
+    latency_ms: f64,
+  ) -> Result<bool, RouterError> {
+    if self.inner.trust.mode == TrustMode::Off {
+      return Ok(true);
     }
-    Ok((Some(body), parsed))
+    if let Some(bytes) = narinfo_bytes
+      && let Ok(parsed) = NarInfo::parse(bytes)
+    {
+      let signer = self.verified_signer(upstream, &parsed).await?;
+      let fetched = FetchedNarInfo {
+        body: Some(bytes.to_vec()),
+        parsed,
+        signer,
+      };
+      return self
+        .accepts_trust_claim(upstream, store_hash, &fetched, latency_ms)
+        .await;
+    }
+    let fetched = self.fetch_narinfo(upstream, store_hash).await?;
+    self
+      .accepts_trust_claim(upstream, store_hash, &fetched, latency_ms)
+      .await
+  }
+
+  async fn verified_signer(
+    &self,
+    upstream: &str,
+    narinfo: &NarInfo,
+  ) -> Result<Option<VerifiedSigner>, RouterError> {
+    let Some(public_keys) =
+      self.inner.upstream_keys.read().await.get(upstream).cloned()
+    else {
+      return Ok(None);
+    };
+    let Some(public_key) = public_keys
+      .iter()
+      .find(|key| narinfo.verify(key).unwrap_or(false))
+      .cloned()
+    else {
+      return Err(RouterError::SignatureVerificationFailed);
+    };
+    Ok(Some(VerifiedSigner { public_key }))
+  }
+
+  async fn accepts_trust_claim(
+    &self,
+    upstream: &str,
+    store_hash: &str,
+    fetched: &FetchedNarInfo,
+    latency_ms: f64,
+  ) -> Result<bool, RouterError> {
+    match self.inner.trust.mode {
+      TrustMode::Off => Ok(true),
+      TrustMode::Signed => {
+        if fetched.signer.is_none() {
+          return Ok(false);
+        }
+        self
+          .record_trust_claim(upstream, store_hash, fetched, latency_ms)
+          .await?;
+        Ok(true)
+      },
+      TrustMode::Quorum => {
+        if fetched.signer.is_none() {
+          return Ok(false);
+        }
+        self
+          .record_trust_claim(upstream, store_hash, fetched, latency_ms)
+          .await?;
+        let claims = self.inner.db.trust_claims(store_hash).await?;
+        let trusted = self.trusted_signer_keys().await;
+        let matching = matching_claim_count(
+          &claims,
+          &fetched.parsed.nar_hash,
+          fetched.parsed.nar_size,
+          &references_key(&fetched.parsed.references),
+          self.inner.trust.require_distinct_signers,
+          &trusted,
+        );
+        Ok(matching >= self.inner.trust.threshold)
+      },
+    }
+  }
+
+  /// The set of signer keys trusted to vouch for content in `quorum` mode:
+  /// the `public_key` of every configured upstream plus any explicit
+  /// `trust.trusted_keys`.  Locally-recorded claims always use a configured
+  /// upstream key, so this never excludes a legitimate local observation; it
+  /// only bounds which *relayed* signers can contribute to a quorum.
+  async fn trusted_signer_keys(&self) -> HashSet<String> {
+    let mut keys: HashSet<String> =
+      self.inner.trust.trusted_keys.iter().cloned().collect();
+    keys.extend(
+      self
+        .inner
+        .upstream_keys
+        .read()
+        .await
+        .values()
+        .flatten()
+        .cloned(),
+    );
+    keys
+  }
+
+  async fn record_trust_claim(
+    &self,
+    upstream: &str,
+    store_hash: &str,
+    fetched: &FetchedNarInfo,
+    _latency_ms: f64,
+  ) -> Result<(), RouterError> {
+    let Some(signer) = &fetched.signer else {
+      return Ok(());
+    };
+    let Some(body) = fetched.body.as_deref() else {
+      return Ok(());
+    };
+    let claim = TrustClaim::from_verified_narinfo(
+      store_hash,
+      upstream,
+      &signer.public_key,
+      body,
+      Utc::now(),
+    )?;
+    self.inner.db.set_trust_claim(&claim).await?;
+    Ok(())
   }
 
   async fn response_narinfo_bytes(
@@ -1001,12 +1232,6 @@ fn normalized_public_keys(
   keys.sort();
   keys.dedup();
   keys
-}
-
-fn narinfo_verifies_any_key(narinfo: &NarInfo, public_keys: &[String]) -> bool {
-  public_keys
-    .iter()
-    .any(|public_key| narinfo.verify(public_key).unwrap_or(false))
 }
 
 fn rewrite_narinfo_url(
@@ -1101,6 +1326,62 @@ fn store_path_name(store_path: &str) -> &str {
   base.split_once('-').map_or(base, |(_, name)| name)
 }
 
+fn references_key(references: &[String]) -> String {
+  references.join(" ")
+}
+
+/// Record that content was served despite a failed/absent trust check.
+///
+/// Only reached when `trust.fail_closed = false`: the policy is advisory, so
+/// make the bypass observable rather than silent via a warning and the
+/// `ncro_trust_bypass_total` counter.
+fn note_trust_bypass(upstream: &str, fetched: &FetchedNarInfo) {
+  let reason = if fetched.signer.is_none() {
+    "unsigned"
+  } else {
+    "below_quorum"
+  };
+  tracing::warn!(
+    upstream,
+    reason,
+    store_path = %fetched.parsed.store_path,
+    "trust check failed but fail_closed=false; serving content anyway"
+  );
+  ncro_metrics::get()
+    .trust_bypass
+    .with_label_values(&[reason])
+    .inc();
+}
+
+fn matching_claim_count(
+  claims: &[TrustClaim],
+  nar_hash: &str,
+  nar_size: u64,
+  references: &str,
+  distinct_signers: bool,
+  trusted_keys: &HashSet<String>,
+) -> u32 {
+  let matches = |claim: &&TrustClaim| {
+    claim.nar_hash == nar_hash
+      && claim.nar_size == nar_size
+      && claim.references == references
+      // Only keys in the configured trusted set count toward a quorum.
+      // Without this an attacker could self-sign forged content under any
+      // number of throwaway keys and manufacture agreement.
+      && trusted_keys.contains(&claim.signer_key)
+  };
+  if distinct_signers {
+    let signers = claims
+      .iter()
+      .filter(matches)
+      .map(|claim| claim.signer_key.as_str())
+      .collect::<HashSet<_>>();
+    return u32::try_from(signers.len()).unwrap_or(u32::MAX);
+  }
+  let count = claims.iter().filter(matches).count();
+  u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 fn wildcard_match(pattern: &str, value: &str) -> bool {
   if pattern == "*" {
     return true;
@@ -1134,15 +1415,14 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   #![expect(clippy::unwrap_used, reason = "Fine in tests")]
-  use std::{sync::Arc, time::Duration};
+  use std::{collections::HashSet, sync::Arc, time::Duration};
 
   use base64::{Engine as _, engine::general_purpose::STANDARD};
   use chrono::Utc;
   use ed25519_dalek::{Signer, SigningKey};
-  use ncro_config::{NarUrlMode, UpstreamConfig};
+  use ncro_config::{NarUrlMode, TrustConfig, TrustMode, UpstreamConfig};
   use ncro_db::{Db, RouteEntry};
   use ncro_health::Prober;
-  use rand::RngExt;
   use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -1158,7 +1438,6 @@ mod tests {
     Router,
     RouterTuning,
     filter_rule_matches,
-    narinfo_verifies_any_key,
     rewrite_narinfo_url,
     store_path_name,
     wildcard_match,
@@ -1172,10 +1451,18 @@ mod tests {
     cooldown: Duration,
     upstreams: &[UpstreamConfig],
   ) -> Router {
+    make_router_with_trust(cooldown, upstreams, TrustConfig::default()).await
+  }
+
+  async fn make_router_with_trust(
+    cooldown: Duration,
+    upstreams: &[UpstreamConfig],
+    trust: TrustConfig,
+  ) -> Router {
     let db = Db::open(":memory:", 100).await.unwrap();
     let prober = Prober::new(0.3).unwrap();
     prober.init_upstreams(upstreams).await;
-    Router::new(
+    let router = Router::new_with_trust(
       db,
       prober,
       Duration::from_hours(1),
@@ -1187,8 +1474,13 @@ mod tests {
         in_memory_negative_ttl:    Duration::from_mins(5),
         upstream_cooldown:         cooldown,
       },
+      trust,
     )
-    .unwrap()
+    .unwrap();
+    for upstream in upstreams {
+      router.register_upstream(upstream).await.unwrap();
+    }
+    router
   }
 
   async fn spawn_narinfo_server(get_status: u16, store_name: &str) -> String {
@@ -1236,6 +1528,69 @@ mod tests {
     format!("http://{addr}")
   }
 
+  fn signing_key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+  }
+
+  fn public_key(name: &str, key: &SigningKey) -> String {
+    format!("{name}:{}", STANDARD.encode(key.verifying_key().to_bytes()))
+  }
+
+  fn signed_narinfo_body(
+    key_name: &str,
+    key: &SigningKey,
+    store_name: &str,
+  ) -> String {
+    let store_path = format!("/nix/store/abc123-{store_name}");
+    let fingerprint = format!("1;{store_path};sha256:abc;1;");
+    let signature = key.sign(fingerprint.as_bytes());
+    format!(
+      "StorePath: {store_path}\nURL: nar/test.nar.xz\nCompression: \
+       xz\nNarHash: sha256:abc\nNarSize: 1\nReferences: \nSig: {key_name}:{}\n",
+      STANDARD.encode(signature.to_bytes())
+    )
+  }
+
+  async fn spawn_signed_narinfo_server(
+    key_name: &'static str,
+    key: SigningKey,
+    store_name: &'static str,
+  ) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+      loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+          return;
+        };
+        let key = key.clone();
+        tokio::spawn(async move {
+          let mut buf = [0_u8; 1024];
+          let Ok(n) = stream.read(&mut buf).await else {
+            return;
+          };
+          let request = String::from_utf8_lossy(&buf[..n]);
+          if request.starts_with("HEAD ") {
+            let _ = stream
+              .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+              .await;
+            return;
+          }
+          if request.starts_with("GET ") {
+            let body = signed_narinfo_body(key_name, &key, store_name);
+            let response = format!(
+              "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+              body.len(),
+              body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+          }
+        });
+      }
+    });
+    format!("http://{addr}")
+  }
+
   async fn spawn_head_ok_get_drop_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1261,27 +1616,6 @@ mod tests {
     format!("http://{addr}")
   }
 
-  fn signed_narinfo(key_name: &str) -> (NarInfo, String) {
-    let mut key_bytes = [0_u8; 32];
-    rand::rng().fill(&mut key_bytes);
-    let signing = SigningKey::from_bytes(&key_bytes);
-    let mut narinfo = NarInfo {
-      store_path: "/nix/store/abc123-test".to_string(),
-      nar_hash: "sha256:abc".to_string(),
-      nar_size: 12,
-      references: vec![],
-      ..Default::default()
-    };
-    let sig = signing.sign(narinfo.fingerprint().as_bytes());
-    narinfo.sig =
-      vec![format!("{key_name}:{}", STANDARD.encode(sig.to_bytes()))];
-    let public_key = format!(
-      "{key_name}:{}",
-      STANDARD.encode(signing.verifying_key().to_bytes())
-    );
-    (narinfo, public_key)
-  }
-
   #[test]
   fn extracts_store_path_name() {
     assert_eq!(
@@ -1296,18 +1630,6 @@ mod tests {
     assert!(wildcard_match("*-source", "foo-source"));
     assert!(wildcard_match("*zed*", "my-zedless-package"));
     assert!(!wildcard_match("zedless", "zedless-0.1.0"));
-  }
-
-  #[test]
-  fn narinfo_verification_accepts_any_configured_public_key() {
-    let (narinfo, matching_key) = signed_narinfo("origin");
-    let (_, other_key) = signed_narinfo("other");
-
-    assert!(narinfo_verifies_any_key(&narinfo, &[
-      other_key.clone(),
-      matching_key
-    ]));
-    assert!(!narinfo_verifies_any_key(&narinfo, &[other_key]));
   }
 
   #[test]
@@ -1449,6 +1771,162 @@ mod tests {
       .unwrap();
 
     assert_eq!(result.url, accepted);
+  }
+
+  #[tokio::test]
+  async fn signed_trust_rejects_unsigned_winner_and_uses_signed_candidate() {
+    let unsigned = spawn_narinfo_server(200, "zedless-0.1.0").await;
+    let key = signing_key(7);
+    let signed =
+      spawn_signed_narinfo_server("cache-a", key.clone(), "zedless-0.1.0")
+        .await;
+    let router = make_router_with_trust(
+      Duration::from_mins(1),
+      &[
+        UpstreamConfig {
+          url: unsigned.clone(),
+          priority: 1,
+          ..Default::default()
+        },
+        UpstreamConfig {
+          url: signed.clone(),
+          priority: 2,
+          public_key: public_key("cache-a", &key),
+          ..Default::default()
+        },
+      ],
+      TrustConfig {
+        mode: TrustMode::Signed,
+        ..Default::default()
+      },
+    )
+    .await;
+
+    let result = router
+      .resolve("abc123", &[unsigned, signed.clone()])
+      .await
+      .unwrap();
+
+    assert_eq!(result.url, signed);
+    assert_eq!(
+      router.inner.db.trust_claims("abc123").await.unwrap().len(),
+      1
+    );
+  }
+
+  #[tokio::test]
+  async fn quorum_trust_requires_matching_claims_from_distinct_signers() {
+    let key_a = signing_key(8);
+    let key_b = signing_key(9);
+    let cache_a =
+      spawn_signed_narinfo_server("cache-a", key_a.clone(), "zedless-0.1.0")
+        .await;
+    let cache_b =
+      spawn_signed_narinfo_server("cache-b", key_b.clone(), "zedless-0.1.0")
+        .await;
+    let router = make_router_with_trust(
+      Duration::from_mins(1),
+      &[
+        UpstreamConfig {
+          url: cache_a.clone(),
+          priority: 1,
+          public_key: public_key("cache-a", &key_a),
+          ..Default::default()
+        },
+        UpstreamConfig {
+          url: cache_b.clone(),
+          priority: 2,
+          public_key: public_key("cache-b", &key_b),
+          ..Default::default()
+        },
+      ],
+      TrustConfig {
+        mode: TrustMode::Quorum,
+        threshold: 2,
+        ..Default::default()
+      },
+    )
+    .await;
+
+    let result = router
+      .resolve("abc123", &[cache_a, cache_b.clone()])
+      .await
+      .unwrap();
+
+    assert_eq!(result.url, cache_b);
+    assert_eq!(
+      router.inner.db.trust_claims("abc123").await.unwrap().len(),
+      2
+    );
+  }
+
+  fn claim_for(
+    signer_key: &str,
+    last_seen: chrono::DateTime<Utc>,
+  ) -> ncro_db::TrustClaim {
+    ncro_db::TrustClaim {
+      narinfo_hash: "abc123".into(),
+      store_path: "/nix/store/abc123-pkg".into(),
+      upstream_url: format!("https://{signer_key}.example"),
+      signer_name: signer_key.into(),
+      signer_key: signer_key.into(),
+      nar_hash: "sha256:abc".into(),
+      nar_size: 12,
+      references: "abc123-pkg".into(),
+      deriver: String::new(),
+      ca: String::new(),
+      file_hash: String::new(),
+      file_size: 0,
+      first_seen: last_seen,
+      last_seen,
+      narinfo: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn quorum_count_dedupes_repeated_signer() {
+    let now = Utc::now();
+    // Same signer key seen twice (e.g. via two upstream URLs) must count once.
+    let claims = vec![
+      claim_for("signer-a", now),
+      claim_for("signer-a", now),
+      claim_for("signer-b", now),
+    ];
+    let trusted: HashSet<String> =
+      ["signer-a".to_string(), "signer-b".to_string()]
+        .into_iter()
+        .collect();
+    let distinct = super::matching_claim_count(
+      &claims,
+      "sha256:abc",
+      12,
+      "abc123-pkg",
+      true,
+      &trusted,
+    );
+    assert_eq!(distinct, 2, "distinct signers must dedupe by signer_key");
+  }
+
+  #[test]
+  fn quorum_count_ignores_untrusted_signer() {
+    let now = Utc::now();
+    // Two validly-distinct signers, but only one is in the trusted set: an
+    // attacker self-signing under a throwaway key must not count.
+    let claims = vec![
+      claim_for("trusted-signer", now),
+      claim_for("attacker-key", now),
+    ];
+    let trusted: HashSet<String> =
+      std::iter::once("trusted-signer".to_string()).collect();
+    let counted = super::matching_claim_count(
+      &claims,
+      "sha256:abc",
+      12,
+      "abc123-pkg",
+      true,
+      &trusted,
+    );
+    assert_eq!(counted, 1, "claims from untrusted keys must not count");
   }
 
   #[tokio::test]

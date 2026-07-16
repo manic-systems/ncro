@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, HashMap, HashSet},
   sync::Arc,
 };
 
@@ -13,8 +13,8 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::TryStreamExt;
-use ncro_config::UpstreamConfig;
-use ncro_db::Db;
+use ncro_config::{TrustConfig, TrustMode, UpstreamConfig};
+use ncro_db::{Db, TrustClaim};
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_router::{Router, RouterError};
 use ncro_s3::S3ClientPool;
@@ -32,6 +32,7 @@ pub struct AppState {
   nar_clients:    HashMap<String, reqwest::Client>,
   default_client: reqwest::Client,
   cache_priority: i32,
+  trust:          TrustConfig,
 }
 
 impl AppState {
@@ -46,6 +47,7 @@ pub struct AppConfig {
   pub cache_priority: i32,
   pub read_timeout:   std::time::Duration,
   pub write_timeout:  std::time::Duration,
+  pub trust:          TrustConfig,
 }
 
 /// Build the HTTP application router.
@@ -65,6 +67,7 @@ pub fn app(
     cache_priority,
     read_timeout,
     write_timeout,
+    trust,
   } = config;
   let s3 = S3ClientPool::default();
   for upstream in &upstreams {
@@ -110,6 +113,7 @@ pub fn app(
     nar_clients,
     default_client,
     cache_priority,
+    trust,
   };
   Ok(
     AxumRouter::new()
@@ -118,6 +122,7 @@ pub fn app(
           .route("/nix-cache-info", get(cache_info).head(cache_info))
           .route("/health", get(health))
           .route("/metrics", get(metrics_endpoint))
+          .route("/trust/{hash_narinfo}", get(trust_endpoint))
           .route("/{hash_narinfo}", get(narinfo).head(narinfo))
           .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
       )
@@ -186,6 +191,105 @@ async fn metrics_endpoint() -> Response {
     ncro_metrics::gather(),
   )
     .into_response()
+}
+
+#[derive(Serialize)]
+struct TrustResponse {
+  hash:            String,
+  mode:            TrustMode,
+  threshold:       u32,
+  trusted:         bool,
+  matching_claims: u32,
+  claims:          Vec<TrustClaim>,
+}
+
+async fn trust_endpoint(
+  State(state): State<Arc<AppState>>,
+  Path(hash_narinfo): Path<String>,
+) -> Response {
+  let Some(hash) = hash_narinfo.strip_suffix(".narinfo") else {
+    return StatusCode::NOT_FOUND.into_response();
+  };
+  match state.db.trust_claims(hash).await {
+    Ok(claims) => {
+      axum::Json(trust_response(
+        hash,
+        &state.trust,
+        &trusted_signer_keys(&state),
+        claims,
+      ))
+      .into_response()
+    },
+    Err(err) => {
+      tracing::warn!(hash, error = %err, "trust lookup failed");
+      StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    },
+  }
+}
+
+/// The signer keys whose claims count toward a quorum: explicit
+/// `trust.trusted_keys` plus every configured upstream key. Mirrors the mesh
+/// policy, including secondary and fallback keys.
+fn trusted_signer_keys(state: &AppState) -> HashSet<String> {
+  state
+    .trust
+    .trusted_signer_keys(&state.upstreams, state.fallback_cache.as_ref())
+}
+
+fn trust_response(
+  hash: &str,
+  trust: &TrustConfig,
+  trusted_keys: &HashSet<String>,
+  claims: Vec<TrustClaim>,
+) -> TrustResponse {
+  let matching_claims =
+    max_matching_claims(&claims, trust.require_distinct_signers, trusted_keys);
+  let trusted = match trust.mode {
+    TrustMode::Off => true,
+    TrustMode::Signed => !claims.is_empty(),
+    TrustMode::Quorum => matching_claims >= trust.threshold,
+  };
+  TrustResponse {
+    hash: hash.to_string(),
+    mode: trust.mode,
+    threshold: trust.threshold,
+    trusted,
+    matching_claims,
+    claims,
+  }
+}
+
+fn max_matching_claims(
+  claims: &[TrustClaim],
+  distinct_signers: bool,
+  trusted_keys: &HashSet<String>,
+) -> u32 {
+  let mut groups: HashMap<(&str, u64, &str), Vec<&TrustClaim>> = HashMap::new();
+  for claim in claims {
+    // Only claims from trusted signer keys count toward a quorum.
+    if !trusted_keys.contains(&claim.signer_key) {
+      continue;
+    }
+    groups
+      .entry((&claim.nar_hash, claim.nar_size, &claim.references))
+      .or_default()
+      .push(claim);
+  }
+  groups
+    .values()
+    .map(|claims| {
+      if distinct_signers {
+        let signers = claims
+          .iter()
+          .map(|claim| claim.signer_key.as_str())
+          .collect::<HashSet<_>>();
+        u32::try_from(signers.len()).unwrap_or(u32::MAX)
+      } else {
+        u32::try_from(claims.len()).unwrap_or(u32::MAX)
+      }
+    })
+    .max()
+    .unwrap_or_default()
 }
 
 async fn narinfo(

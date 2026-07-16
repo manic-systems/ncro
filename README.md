@@ -115,8 +115,11 @@ further in the [architechture document].
 - `GET /nar/<path>.nar`: streamed NAR content from the chosen upstream
 - `GET /metrics`: Prometheus metrics
 - `GET /health`: JSON health summary of configured upstreams
+- `GET /trust/<hash>.narinfo`: trust decision and matching claim count
 
-### Routing Notes
+### Notes
+
+#### Routing
 
 - Route cache decisions are stored in SQLite and reused until their TTL expires
   (or they are evicted by the LRU policy when `max_entries` is reached).
@@ -138,6 +141,25 @@ further in the [architechture document].
   defaults to `https://cache.nixos.org` when enabled, and is intentionally not
   part of health probing, discovery, priority routing, filters, cooldown, or
   route persistence.
+
+#### Trust
+
+[trust documentation]: ./docs/trust.md
+
+`trust.mode = "signed"` accepts only narinfos that verify against the selected
+upstream's configured signer keys (`public_key` and `public_keys`).
+`trust.mode = "quorum"` records signed
+claims and accepts a route only after enough distinct signer keys agree on the
+same `StorePath`, `NarHash`, `NarSize`, and `References`. With
+`mesh.gossip_trust_claims`, peers relay re-verified claims so a quorum can form
+across a mesh where each node sees only one upstream.
+
+> [!NOTE]
+> This is output consensus, not full source attestation, and the signature
+> covers only the signed fingerprint; not the streamed NAR bytes. See
+> [trust documentation] for the complete model: what is and is not verified, how
+> a quorum is counted, the `fail_closed` open/closed behavior, and how mesh
+> claim relay stays trustworthy.
 
 ## Quick Start
 
@@ -220,6 +242,12 @@ per_upstream_max_inflight = 8 # per-upstream narinfo head concurrency
 in_memory_negative_ttl = "5s" # short-lived miss suppression
 upstream_cooldown = "15s"     # cooldown on transient upstream network errors
 
+[trust]
+mode = "off"                    # off | signed | quorum
+threshold = 2                   # signer agreement needed in quorum mode
+require_distinct_signers = true # count signer keys, not upstream URLs
+fail_closed = true              # reject untrusted candidates when enabled
+
 [logging]
 level = "info"    # tracing filter directive, e.g. debug or ncro=debug,tower_http=warn
 format = "json"   # json | text
@@ -239,6 +267,7 @@ bind_addr = "0.0.0.0:7946"
 peers = []       # list of {addr, public_key} peer entries
 private_key = "" # path to ed25519 key file; empty = ephemeral
 gossip_interval = "30s"
+gossip_trust_claims = false # also gossip + re-verify trust claims across peers
 ```
 
 ### Environment Overrides
@@ -524,6 +553,15 @@ Each peer entry takes an address and an optional ed25519 public key. When a
 public key is provided, incoming gossip packets are verified against it; packets
 from unlisted senders or with invalid signatures are silently dropped.
 
+> [!TIP]
+> Setting `mesh.gossip_trust_claims = true` additionally gossips the trust
+> claims this node has verified and accepts claims relayed by peers,
+> letting a `quorum` policy form across the mesh. A relayed claim only counts if
+> its signer key is trusted (a configured upstream or enabled fallback key, or one listed in
+> `trust.trusted_keys`) **and** its narinfo re-verifies against that key, so a
+> peer can only relay real signatures from trusted signers, never fabricate a
+> quorum with throwaway keys.
+
 If `mesh.private_key` is left empty, ncro generates an ephemeral identity on
 startup. That is fine for testing, but persistent gossip requires a stable key
 so peers can recognize the node across restarts.
@@ -556,15 +594,16 @@ Prometheus metrics are available at `/metrics`.
 
 <!--markdownlint-disable MD013-->
 
-| Metric                                    | Type      | Description                              |
-| ----------------------------------------- | --------- | ---------------------------------------- |
-| `ncro_narinfo_cache_hits_total`           | counter   | Narinfo requests served from route cache |
-| `ncro_narinfo_cache_misses_total`         | counter   | Narinfo requests requiring upstream race |
-| `ncro_narinfo_requests_total{status}`     | counter   | Narinfo requests by status (200/error)   |
-| `ncro_nar_requests_total`                 | counter   | NAR streaming requests                   |
-| `ncro_upstream_race_wins_total{upstream}` | counter   | Race wins per upstream                   |
-| `ncro_upstream_latency_seconds{upstream}` | histogram | Race latency per upstream                |
-| `ncro_route_entries`                      | gauge     | Current route entries in SQLite          |
+| Metric                                    | Type      | Description                                                   |
+| ----------------------------------------- | --------- | ------------------------------------------------------------- |
+| `ncro_narinfo_cache_hits_total`           | counter   | Narinfo requests served from route cache                      |
+| `ncro_narinfo_cache_misses_total`         | counter   | Narinfo requests requiring upstream race                      |
+| `ncro_narinfo_requests_total{status}`     | counter   | Narinfo requests by status (200/error)                        |
+| `ncro_nar_requests_total`                 | counter   | NAR streaming requests                                        |
+| `ncro_upstream_race_wins_total{upstream}` | counter   | Race wins per upstream                                        |
+| `ncro_upstream_latency_seconds{upstream}` | histogram | Race latency per upstream                                     |
+| `ncro_route_entries`                      | gauge     | Current route entries in SQLite                               |
+| `ncro_trust_bypass_total{reason}`         | counter   | Content served despite failed trust check (fail_closed=false) |
 
 <!--markdownlint-enable MD013-->
 

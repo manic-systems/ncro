@@ -8,16 +8,20 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-chrono.workspace    = true
-ed25519-dalek       = { workspace = true, features = [ "rand_core" ] }
-hex.workspace       = true
-ncro-db.workspace   = true
-rand.workspace      = true
-rmp-serde.workspace = true
-serde               = { workspace = true, features = [ "derive" ] }
-thiserror.workspace = true
-tokio               = { workspace = true, features = [ "fs", "macros", "net", "rt", "sync", "time" ] }
-tracing.workspace   = true
+chrono.workspace       = true
+ed25519-dalek          = { workspace = true, features = [ "rand_core" ] }
+hex.workspace          = true
+ncro-db.workspace      = true
+ncro-narinfo.workspace = true
+rand.workspace         = true
+rmp-serde.workspace    = true
+serde                  = { workspace = true, features = [ "derive" ] }
+thiserror.workspace    = true
+tokio                  = { workspace = true, features = [ "fs", "macros", "net", "rt", "sync", "time" ] }
+tracing.workspace      = true
+
+[dev-dependencies]
+base64.workspace = true
 
 [lints]
 workspace = true
