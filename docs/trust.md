@@ -62,7 +62,7 @@ is cached.
 | Mode     | Requirement to accept a candidate                                               |
 | -------- | ------------------------------------------------------------------------------- |
 | `off`    | No verification. Route-only behavior (default).                                 |
-| `signed` | The narinfo must verify against the serving upstream's configured `public_key`. |
+| `signed` | The narinfo must verify against one of the serving upstream's configured signer keys. |
 | `quorum` | A verified signature **plus** at least `threshold` matching claims (below).     |
 
 <!--markdownlint-enable MD013-->
@@ -77,7 +77,8 @@ Every time ncro verifies a signature it records a **trust claim** in SQLite (see
 vouched for what:
 
 - `signer_key` / `signer_name` -> the Nix signing key that verified.
-- `upstream_url` -> which upstream served this observation.
+- `upstream_url` -> the serving upstream for a local claim, or the
+  `mesh://<relay-address>` that supplied a relayed claim.
 - the signed content tuple: `nar_hash`, `nar_size`, `references` (and the
   `store_path` / `narinfo_hash`).
 - provenance-only fields recorded for audit but **not** covered by the
@@ -85,8 +86,9 @@ vouched for what:
   bytes.
 
 Claims are what make `quorum` and the mesh integration possible: they are a
-durable, queryable record of "signer X, via upstream Y, attests that path H has
-this NAR hash."
+durable, queryable record that signer X attests that path H has this NAR hash.
+For relayed claims, the relay address is recorded rather than an unverified
+assertion about the original upstream.
 
 ## Quorum counting
 
@@ -114,7 +116,7 @@ The signature check alone would be theatre.
 ncro therefore counts a claim toward a quorum **only if its `signer_key` is in
 the trusted set**:
 
-$$\text{trusted set} = \left\{ \text{upstream}_i.\text{public\_key} \right\} \cup
+$$\text{trusted set} = \left\{ \text{all configured upstream and enabled fallback signing keys} \right\} \cup
   \text{trust.trusted\_keys}$$
 
 - Locally-recorded claims always use a configured upstream key, so a single node
@@ -123,11 +125,6 @@ $$\text{trusted set} = \left\{ \text{upstream}_i.\text{public\_key} \right\} \cu
   nodes' trusted upstreams in `trust.trusted_keys`. Otherwise a relayed claim
   signed by an unknown key is dropped (and never even stored). This is what
   bounds a quorum to _trusted_ signers rather than _any_ signer.
-
-`trust.claim_ttl` (optional, e.g. `"30d"`) bounds how old a claim may be and
-still count. Claims whose `last_seen` is older than the TTL are ignored when
-evaluating the quorum, so a signer that has long stopped serving a path cannot
-prop up a quorum forever. Unset means claims never expire.
 
 > [!WARNING]
 > Quorum needs more than one independent signer to ever see the same path. On a
@@ -166,33 +163,29 @@ With `mesh.gossip_trust_claims = true`, a node:
      set (above). A claim from any other key is dropped immediately, this is
      what stops an attacker from minting throwaway keys to forge a quorum, and
      it also bounds how many claims a hostile peer can write to the database.
-   - **Valid signature.** The claim carries the original narinfo bytes, and the
-     receiver re-verifies that narinfo against the claim's `signer_key`. The
-     peer's packet signature only proves _which peer relayed it_, not that the
-     content was signed; re-verifying means a peer cannot forge a claim under a
-     trusted key it does not actually hold.
+   - **Valid signature and canonical fields.** The claim carries the original
+     narinfo bytes. The receiver re-verifies that narinfo against the claim's
+     `signer_key` and rebuilds every signed field from it, so a peer cannot
+     substitute a different path or content tuple.
 
 This means **a peer becomes a witness, never a substitute for a real Nix
 signature.** A malicious or compromised peer cannot inflate a quorum: a claim
 signed by an untrusted key is dropped, and a claim claiming a trusted key but
 without a valid signature fails re-verification. A quorum therefore counts
 distinct _trusted Nix signers_, whether those signatures were observed locally
-or relayed by a peer. Peers are also allowlisted by their mesh public key
-(`mesh.peers[].public_key`), so unknown senders are rejected before any claim is
-even parsed.
+or relayed by a peer. Configure `mesh.peers[].public_key` to also allowlist mesh
+senders; peers without configured keys are accepted at the transport layer but
+still cannot alter the signed claim tuple.
 
 ## Inspecting Trust (At Runtime)
 
-Two read endpoints expose the recorded claims:
+The trust endpoint exposes the recorded claims:
 
 - `GET /trust/<hash>.narinfo` - the current trust decision for a path: the mode,
   threshold, the count of matching claims, whether the path is currently
   trusted, and the full list of claims.
-- `GET /provenance/<hash>.narinfo` - the same claim list, framed as an audit of
-  who has vouched for the path (including the unsigned provenance fields).
-
-Both are useful for confirming that claims are propagating across a mesh: after
-a path is resolved on one node, it should appear in `/trust` on a peer within a
+It is useful for confirming that claims are propagating across a mesh: after a
+path is resolved on one node, it should appear in `/trust` on a peer within a
 gossip interval or two.
 
 ## Configuration Summary
@@ -203,7 +196,6 @@ mode                     = "quorum" # off | signed | quorum
 threshold                = 2        # matching claims required in quorum mode
 require_distinct_signers = true     # count distinct signer keys, not mirrors
 fail_closed              = true     # reject (true) vs serve+warn (false)
-claim_ttl                = "30d"    # optional: ignore claims older than this
 
 # Signer keys trusted to vouch in quorum mode, in addition to upstream keys.
 # In a mesh, list the OTHER nodes' upstream signer keys here.

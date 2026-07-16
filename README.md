@@ -116,7 +116,6 @@ further in the [architechture document].
 - `GET /metrics`: Prometheus metrics
 - `GET /health`: JSON health summary of configured upstreams
 - `GET /trust/<hash>.narinfo`: trust decision and matching claim count
-- `GET /provenance/<hash>.narinfo`: stored signer claims for a narinfo hash
 
 ### Notes
 
@@ -148,7 +147,8 @@ further in the [architechture document].
 [trust documentation]: ./docs/trust.md
 
 `trust.mode = "signed"` accepts only narinfos that verify against the selected
-upstream's configured `public_key`. `trust.mode = "quorum"` records signed
+upstream's configured signer keys (`public_key` and `public_keys`).
+`trust.mode = "quorum"` records signed
 claims and accepts a route only after enough distinct signer keys agree on the
 same `StorePath`, `NarHash`, `NarSize`, and `References`. With
 `mesh.gossip_trust_claims`, peers relay re-verified claims so a quorum can form
@@ -247,7 +247,6 @@ mode = "off"                    # off | signed | quorum
 threshold = 2                   # signer agreement needed in quorum mode
 require_distinct_signers = true # count signer keys, not upstream URLs
 fail_closed = true              # reject untrusted candidates when enabled
-# claim_ttl = "30d"             # optional: ignore claims older than this in quorum
 
 [logging]
 level = "info"    # tracing filter directive, e.g. debug or ncro=debug,tower_http=warn
@@ -556,9 +555,9 @@ from unlisted senders or with invalid signatures are silently dropped.
 
 > [!TIP]
 > Setting `mesh.gossip_trust_claims = true` additionally gossips the trust
-> claims this node has verified locally and accepts claims relayed by peers,
+> claims this node has verified and accepts claims relayed by peers,
 > letting a `quorum` policy form across the mesh. A relayed claim only counts if
-> its signer key is trusted (a configured upstream key or one listed in
+> its signer key is trusted (a configured upstream or enabled fallback key, or one listed in
 > `trust.trusted_keys`) **and** its narinfo re-verifies against that key, so a
 > peer can only relay real signatures from trusted signers, never fabricate a
 > quorum with throwaway keys.
