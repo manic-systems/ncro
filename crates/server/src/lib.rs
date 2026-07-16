@@ -122,7 +122,6 @@ pub fn app(
           .route("/nix-cache-info", get(cache_info).head(cache_info))
           .route("/health", get(health))
           .route("/metrics", get(metrics_endpoint))
-          .route("/provenance/{hash_narinfo}", get(provenance))
           .route("/trust/{hash_narinfo}", get(trust_endpoint))
           .route("/{hash_narinfo}", get(narinfo).head(narinfo))
           .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
@@ -228,47 +227,13 @@ async fn trust_endpoint(
   }
 }
 
-async fn provenance(
-  State(state): State<Arc<AppState>>,
-  Path(hash_narinfo): Path<String>,
-) -> Response {
-  let Some(hash) = hash_narinfo.strip_suffix(".narinfo") else {
-    return StatusCode::NOT_FOUND.into_response();
-  };
-  match state.db.trust_claims(hash).await {
-    Ok(claims) => {
-      axum::Json(trust_response(
-        hash,
-        &state.trust,
-        &trusted_signer_keys(&state),
-        claims,
-      ))
-      .into_response()
-    },
-    Err(err) => {
-      tracing::warn!(hash, error = %err, "provenance lookup failed");
-      StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    },
-  }
-}
-
 /// The signer keys whose claims count toward a quorum: explicit
-/// `trust.trusted_keys` plus every configured upstream's `public_key`.  Mirrors
-/// the router's enforcement so the endpoint reports the same decision.
+/// `trust.trusted_keys` plus every configured upstream key. Mirrors the mesh
+/// policy, including secondary and fallback keys.
 fn trusted_signer_keys(state: &AppState) -> HashSet<String> {
   state
     .trust
-    .trusted_keys
-    .iter()
-    .cloned()
-    .chain(
-      state
-        .upstreams
-        .iter()
-        .map(|u| u.public_key.clone())
-        .filter(|k| !k.is_empty()),
-    )
-    .collect()
+    .trusted_signer_keys(&state.upstreams, state.fallback_cache.as_ref())
 }
 
 fn trust_response(

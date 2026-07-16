@@ -211,27 +211,18 @@ pub async fn run() -> anyhow::Result<()> {
       .iter()
       .filter_map(|p| hex::decode(&p.public_key).ok()?.try_into().ok())
       .collect::<Vec<[u8; 32]>>();
-    // Relayed trust claims are only honored if signed by a key in this set:
-    // the explicit trust.trusted_keys plus every configured upstream's
-    // public_key. This keeps a quorum a count of *trusted* signers.
-    let trusted_keys = cfg
-      .trust
-      .trusted_keys
-      .iter()
-      .cloned()
-      .chain(
-        cfg
-          .upstreams
-          .iter()
-          .map(|u| u.public_key.clone())
-          .filter(|k| !k.is_empty()),
-      )
-      .collect::<Vec<String>>();
+    let trusted_keys = cfg.trust.trusted_signer_keys(
+      &cfg.upstreams,
+      cfg
+        .fallback_cache
+        .enabled
+        .then_some(&cfg.fallback_cache.upstream),
+    );
     ncro_mesh::listen_and_serve(
       &cfg.mesh.bind_addr,
       db.clone(),
       allowed,
-      trusted_keys,
+      trusted_keys.into_iter().collect(),
       stop_rx.clone(),
     )
     .await?;
@@ -291,11 +282,11 @@ fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
   match (format, timestamps) {
     (LogFormat::Json, true) => fmt().json().with_env_filter(filter).init(),
     (LogFormat::Json, false) => {
-      fmt().json().without_time().with_env_filter(filter).init()
+      fmt().json().without_time().with_env_filter(filter).init();
     },
     (LogFormat::Text, true) => fmt().with_env_filter(filter).init(),
     (LogFormat::Text, false) => {
-      fmt().without_time().with_env_filter(filter).init()
+      fmt().without_time().with_env_filter(filter).init();
     },
   }
 }

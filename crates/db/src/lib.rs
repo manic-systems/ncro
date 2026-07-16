@@ -8,6 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, TimeZone, Utc};
+use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
 use sqlx::{
   Row,
   SqlitePool,
@@ -24,6 +25,21 @@ pub enum DbError {
   CreateDir(#[from] std::io::Error),
   #[error("invalid stored route data: {0}")]
   InvalidData(String),
+}
+
+#[derive(Debug, Error)]
+pub enum TrustClaimError {
+  #[error(transparent)]
+  NarInfo(#[from] NarInfoError),
+  #[error("narinfo signature verification failed")]
+  SignatureVerificationFailed,
+  #[error(
+    "store path {store_path:?} does not match narinfo hash {narinfo_hash:?}"
+  )]
+  StorePathMismatch {
+    narinfo_hash: String,
+    store_path:   String,
+  },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -59,6 +75,55 @@ pub struct TrustClaim {
   pub first_seen:   DateTime<Utc>,
   pub last_seen:    DateTime<Utc>,
   pub narinfo:      Vec<u8>,
+}
+
+impl TrustClaim {
+  /// Rebuild a claim from signed narinfo fields.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`TrustClaimError`] when the narinfo is malformed, its signature
+  /// does not verify, or its store path disagrees with the requested hash.
+  pub fn from_verified_narinfo(
+    narinfo_hash: &str,
+    upstream_url: &str,
+    signer_key: &str,
+    narinfo_bytes: &[u8],
+    observed_at: DateTime<Utc>,
+  ) -> Result<Self, TrustClaimError> {
+    let narinfo = NarInfo::parse(narinfo_bytes)?;
+    if !narinfo.verify(signer_key)? {
+      return Err(TrustClaimError::SignatureVerificationFailed);
+    }
+    let (signer_name, _) = parse_public_key(signer_key)?;
+    let store_hash = narinfo
+      .store_path
+      .strip_prefix("/nix/store/")
+      .and_then(|path| path.split_once('-').map(|(hash, _)| hash));
+    if store_hash != Some(narinfo_hash) {
+      return Err(TrustClaimError::StorePathMismatch {
+        narinfo_hash: narinfo_hash.to_string(),
+        store_path:   narinfo.store_path,
+      });
+    }
+    Ok(Self {
+      narinfo_hash: narinfo_hash.to_string(),
+      store_path: narinfo.store_path,
+      upstream_url: upstream_url.to_string(),
+      signer_name,
+      signer_key: signer_key.to_string(),
+      nar_hash: narinfo.nar_hash,
+      nar_size: narinfo.nar_size,
+      references: narinfo.references.join(" "),
+      deriver: narinfo.deriver,
+      ca: narinfo.ca,
+      file_hash: narinfo.file_hash,
+      file_size: narinfo.file_size,
+      first_seen: observed_at,
+      last_seen: observed_at,
+      narinfo: narinfo_bytes.to_vec(),
+    })
+  }
 }
 
 impl RouteEntry {

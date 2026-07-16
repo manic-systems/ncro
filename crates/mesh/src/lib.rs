@@ -3,7 +3,6 @@ use std::{path::Path, sync::Arc};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ncro_db::{Db, RouteEntry, TrustClaim};
-use ncro_narinfo::NarInfo;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -170,7 +169,8 @@ pub async fn listen_and_serve(
                               merge_routes(&db, msg.routes).await;
                           }
                           MsgType::Claims if !msg.claims.is_empty() => {
-                              merge_claims(&db, msg.claims, &trusted).await;
+                              let relay = format!("mesh://{src}");
+                              merge_claims(&db, msg.claims, &trusted, &relay).await;
                           }
                           _ => {}
                       }
@@ -217,14 +217,14 @@ async fn merge_routes(db: &Db, incoming: Vec<RouteEntry>) {
 ///    keypairs, self-sign forged content under each, and relay the claims to
 ///    fabricate agreement. Dropping untrusted keys here also bounds how many
 ///    claims a hostile peer can write to the database.
-/// 2. The embedded narinfo actually verifies against that `signer_key`. The
-///    peer's packet signature only proves *who relayed* the claim, not that the
-///    content was signed; re-verifying means a peer cannot forge a claim for a
-///    trusted key it does not hold.
+/// 2. The embedded narinfo verifies against that `signer_key`, and the stored
+///    claim is rebuilt from its signed fields. The peer's packet signature only
+///    proves *who relayed* the claim; it cannot substitute a content tuple.
 async fn merge_claims(
   db: &Db,
   incoming: Vec<TrustClaim>,
   trusted: &std::collections::HashSet<String>,
+  relay: &str,
 ) {
   for claim in incoming {
     if !trusted.contains(&claim.signer_key) {
@@ -235,18 +235,21 @@ async fn merge_claims(
       );
       continue;
     }
-    let verified = NarInfo::parse(claim.narinfo.as_slice())
-      .ok()
-      .and_then(|parsed| parsed.verify(&claim.signer_key).ok())
-      .unwrap_or(false);
-    if !verified {
+    let Ok(claim) = TrustClaim::from_verified_narinfo(
+      &claim.narinfo_hash,
+      relay,
+      &claim.signer_key,
+      &claim.narinfo,
+      Utc::now(),
+    ) else {
       tracing::warn!(
         store = claim.store_path,
         signer = claim.signer_name,
-        "mesh: rejecting relayed trust claim with invalid signature"
+        "mesh: rejecting relayed trust claim that disagrees with its signed \
+         narinfo"
       );
       continue;
-    }
+    };
     if let Err(err) = db.set_trust_claim(&claim).await {
       tracing::warn!(error = %err, store = claim.store_path, "mesh: trust claim merge failed");
     }
@@ -462,7 +465,7 @@ mod tests {
     let db = Db::open(":memory:", 100).await?;
     let claim = signed_claim("aaa111", false);
     let trusted = trust_set(&claim);
-    merge_claims(&db, vec![claim], &trusted).await;
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
     assert_eq!(db.trust_claims("aaa111").await?.len(), 1);
     Ok(())
   }
@@ -474,11 +477,33 @@ mod tests {
     let claim = signed_claim("bbb222", true);
     // Trust the signer key so we isolate the *signature* check.
     let trusted = trust_set(&claim);
-    merge_claims(&db, vec![claim], &trusted).await;
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
     assert!(
       db.trust_claims("bbb222").await?.is_empty(),
       "a claim whose narinfo signature does not verify must be dropped"
     );
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn merge_claims_rejects_forged_signed_fields()
+  -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::open(":memory:", 100).await?;
+    let mut claim = signed_claim("forged", false);
+    let trusted = trust_set(&claim);
+    claim.nar_hash = "sha256:attacker-controlled".into();
+    claim.references = "attacker-controlled".into();
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    let claims = db.trust_claims("forged").await?;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].nar_hash, "sha256:abc");
+    assert_eq!(claims[0].references, "forged-pkg");
+
+    let mut claim = signed_claim("source", false);
+    let trusted = trust_set(&claim);
+    claim.narinfo_hash = "target".into();
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
+    assert!(db.trust_claims("target").await?.is_empty());
     Ok(())
   }
 
@@ -490,7 +515,7 @@ mod tests {
     // this is the attacker-generated-key case and must be dropped.
     let claim = signed_claim("ccc333", false);
     let trusted = std::collections::HashSet::new();
-    merge_claims(&db, vec![claim], &trusted).await;
+    merge_claims(&db, vec![claim], &trusted, "mesh://test").await;
     assert!(
       db.trust_claims("ccc333").await?.is_empty(),
       "a validly-signed claim from an untrusted key must be dropped"

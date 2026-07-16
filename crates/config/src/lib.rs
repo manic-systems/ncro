@@ -1,4 +1,4 @@
-use std::{env, fmt, fs, time::Duration};
+use std::{collections::HashSet, env, fmt, fs, time::Duration};
 
 use netrc::Netrc;
 use serde::{Deserialize, Deserializer};
@@ -570,8 +570,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       &config_path,
       format!(
         "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
-         \"alice\"\npassword_file = {:?}\n",
-        password_path
+         \"alice\"\npassword_file = {password_path:?}\n",
       ),
     )?;
 
@@ -593,8 +592,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       &config_path,
       format!(
         "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
-         \"alice\"\npassword_file = {:?}\n",
-        password_path
+         \"alice\"\npassword_file = {password_path:?}\n",
       ),
     )?;
 
@@ -660,23 +658,25 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   }
 
   #[test]
-  fn parses_trust_hardening_fields() -> Result<(), ConfigError> {
-    let cfg: Config = toml::from_str(
-      "[trust]\nmode = \"quorum\"\nthreshold = 2\nclaim_ttl = \"90s\"\n",
-    )?;
-    assert_eq!(
-      cfg.trust.claim_ttl.as_ref().map(|d| d.0),
-      Some(std::time::Duration::from_secs(90))
-    );
-    cfg.validate()?;
-    Ok(())
-  }
-
-  #[test]
-  fn trust_hardening_fields_default_off() {
-    let cfg = Config::default();
-    assert!(cfg.trust.claim_ttl.is_none());
-    assert!(!cfg.mesh.gossip_trust_claims);
+  fn trusted_signer_keys_include_all_upstream_and_fallback_keys() {
+    let trust = TrustConfig {
+      trusted_keys: vec!["explicit".into()],
+      ..Default::default()
+    };
+    let upstreams = vec![UpstreamConfig {
+      public_key: "primary".into(),
+      public_keys: vec!["secondary".into()],
+      ..Default::default()
+    }];
+    let fallback = UpstreamConfig {
+      public_key: "fallback".into(),
+      ..Default::default()
+    };
+    let keys = trust.trusted_signer_keys(&upstreams, Some(&fallback));
+    assert_eq!(keys.len(), 4);
+    for key in ["explicit", "primary", "secondary", "fallback"] {
+      assert!(keys.contains(key));
+    }
   }
 
   #[test]
@@ -836,6 +836,15 @@ impl fmt::Debug for UpstreamConfig {
       .field("nar_timeout", &self.nar_timeout)
       .field("s3", &self.s3)
       .finish()
+  }
+}
+
+impl UpstreamConfig {
+  /// Iterate every Nix signing key accepted from this upstream.
+  pub fn signer_keys(&self) -> impl Iterator<Item = &str> {
+    std::iter::once(self.public_key.as_str())
+      .filter(|key| !key.is_empty())
+      .chain(self.public_keys.iter().map(String::as_str))
   }
 }
 
@@ -1054,11 +1063,6 @@ pub struct TrustConfig {
   pub threshold:                u32,
   pub require_distinct_signers: bool,
   pub fail_closed:              bool,
-  /// Optional maximum age for a trust claim to count toward a quorum.  Claims
-  /// whose `last_seen` is older than this are ignored when evaluating the
-  /// policy, preventing a long-dead signer from propping up a quorum forever.
-  /// Unset (the default) means claims never expire.
-  pub claim_ttl:                Option<HumanDuration>,
   /// Nix public keys (`name:base64(key)`) that are trusted to vouch for
   /// content in `quorum` mode, *in addition to* the `public_key` of every
   /// configured upstream.  A quorum counts only claims signed by a key in
@@ -1080,9 +1084,31 @@ impl Default for TrustConfig {
       threshold:                2,
       require_distinct_signers: true,
       fail_closed:              true,
-      claim_ttl:                None,
       trusted_keys:             Vec::new(),
     }
+  }
+}
+
+impl TrustConfig {
+  /// Return every signing key that may contribute to a quorum.
+  #[must_use]
+  pub fn trusted_signer_keys(
+    &self,
+    upstreams: &[UpstreamConfig],
+    fallback: Option<&UpstreamConfig>,
+  ) -> HashSet<String> {
+    self
+      .trusted_keys
+      .iter()
+      .cloned()
+      .chain(
+        upstreams
+          .iter()
+          .chain(fallback)
+          .flat_map(UpstreamConfig::signer_keys)
+          .map(str::to_string),
+      )
+      .collect()
   }
 }
 

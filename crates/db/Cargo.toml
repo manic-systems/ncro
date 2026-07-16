@@ -9,6 +9,7 @@ repository.workspace  = true
 
 [dependencies]
 chrono = { workspace = true, features = [ "serde" ] }
+ncro-narinfo.workspace = true
 serde = { workspace = true, features = [ "derive" ] }
 sqlx = { workspace = true, features = [
   "runtime-tokio",
