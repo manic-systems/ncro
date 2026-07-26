@@ -2,7 +2,7 @@ use std::{
   collections::{BTreeMap, HashMap},
   io,
   sync::Arc,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use axum::{
@@ -42,6 +42,7 @@ pub struct AppState {
   nar_clients:    HashMap<String, reqwest::Client>,
   default_client: reqwest::Client,
   cache_priority: i32,
+  started:        Instant,
 }
 
 impl AppState {
@@ -120,6 +121,7 @@ pub fn app(
     nar_clients,
     default_client,
     cache_priority,
+    started: Instant::now(),
   };
   Ok(
     AxumRouter::new()
@@ -127,6 +129,7 @@ pub fn app(
         AxumRouter::new()
           .route("/nix-cache-info", get(cache_info).head(cache_info))
           .route("/health", get(health))
+          .route("/status", get(status_endpoint))
           .route("/metrics", get(metrics_endpoint))
           .route("/{hash_narinfo}", get(narinfo).head(narinfo))
           .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
@@ -150,42 +153,157 @@ async fn cache_info(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Serialize)]
 struct HealthResponse {
-  status:    String,
-  upstreams: Vec<UpstreamStatus>,
+  status: String,
 }
 
-#[derive(Serialize)]
-struct UpstreamStatus {
-  url:               String,
-  status:            String,
-  latency_ms:        f64,
-  consecutive_fails: u32,
-}
-
-async fn health(State(state): State<Arc<AppState>>) -> Response {
-  let sorted = state.prober.sorted_by_latency().await;
-  let down_count = sorted.iter().filter(|h| h.status == Status::Down).count();
-  let any_degraded = sorted.iter().any(|h| h.status == Status::Degraded);
-  let status = if !sorted.is_empty() && down_count == sorted.len() {
+/// Derive an overall health verdict from per-upstream statuses.
+///
+/// Returns `"down"` only when every upstream is [`Status::Down`],
+/// `"degraded"` when any upstream is down or degraded, and `"ok"` otherwise.
+fn overall_status(health: &[UpstreamHealth]) -> &'static str {
+  let down_count = health.iter().filter(|h| h.status == Status::Down).count();
+  let any_degraded = health.iter().any(|h| h.status == Status::Degraded);
+  if !health.is_empty() && down_count == health.len() {
     "down"
   } else if down_count > 0 || any_degraded {
     "degraded"
   } else {
     "ok"
+  }
+}
+
+/// Liveness/readiness probe. Returns `503` when every upstream is down (ncro
+/// cannot serve any cache), `200` otherwise. Per-upstream detail lives at
+/// `/status`.
+async fn health(State(state): State<Arc<AppState>>) -> Response {
+  let sorted = state.prober.sorted_by_latency().await;
+  let status = overall_status(&sorted);
+  let code = if status == "down" {
+    StatusCode::SERVICE_UNAVAILABLE
+  } else {
+    StatusCode::OK
   };
-  axum::Json(HealthResponse {
-    status:    status.to_string(),
-    upstreams: sorted
-      .into_iter()
-      .map(|h| {
-        UpstreamStatus {
-          url:               h.url,
-          status:            h.status.as_str().to_string(),
-          latency_ms:        h.ema_latency,
-          consecutive_fails: h.consecutive_fails,
-        }
-      })
-      .collect(),
+  (code, axum::Json(HealthResponse { status: status.to_string() })).into_response()
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+  version:    &'static str,
+  uptime_secs: u64,
+  status:     String,
+  cache:      CacheStatus,
+  config:     ConfigStatus,
+  upstreams:  Vec<UpstreamStatusFull>,
+  fallback:   Option<UpstreamStatusFull>,
+}
+
+#[derive(Serialize)]
+struct CacheStatus {
+  route_entries:         i64,
+  narinfo_hits:          u64,
+  narinfo_misses:        u64,
+  narinfo_negative_hits: u64,
+  nar_requests:          u64,
+}
+
+#[derive(Serialize)]
+struct ConfigStatus {
+  cache_priority:      i32,
+  upstream_count:      usize,
+  fallback_configured: bool,
+}
+
+#[derive(Serialize)]
+struct UpstreamStatusFull {
+  url:                 String,
+  status:              String,
+  priority:            i32,
+  ema_latency_ms:      f64,
+  consecutive_fails:   u32,
+  total_queries:       u64,
+  last_probe_secs_ago: Option<u64>,
+  kind:                &'static str,
+  authenticated:       bool,
+}
+
+/// Build a detailed status view for a single upstream. `now` anchors the
+/// last-probe age; `kind` is `"s3"` or `"http"`; `authenticated` reflects
+/// whether credentials are configured for the upstream.
+fn upstream_status_full(
+  health: UpstreamHealth,
+  now: Instant,
+  kind: &'static str,
+  authenticated: bool,
+) -> UpstreamStatusFull {
+  UpstreamStatusFull {
+    last_probe_secs_ago: health
+      .last_probe
+      .map(|t| now.saturating_duration_since(t).as_secs()),
+    status: health.status.as_str().to_string(),
+    url: health.url,
+    priority: health.priority,
+    ema_latency_ms: health.ema_latency,
+    consecutive_fails: health.consecutive_fails,
+    total_queries: health.total_queries,
+    kind,
+    authenticated,
+  }
+}
+
+async fn status_endpoint(State(state): State<Arc<AppState>>) -> Response {
+  let now = Instant::now();
+  let sorted = state.prober.sorted_by_latency().await;
+  let status = overall_status(&sorted).to_string();
+
+  let metrics = ncro_metrics::get();
+  let cache = CacheStatus {
+    route_entries:         metrics.route_entries.get(),
+    narinfo_hits:          metrics.narinfo_cache_hits.get(),
+    narinfo_misses:        metrics.narinfo_cache_misses.get(),
+    narinfo_negative_hits: metrics.narinfo_memory_negative_hits.get(),
+    nar_requests:          metrics.nar_requests.get(),
+  };
+
+  let upstreams = sorted
+    .into_iter()
+    .map(|h| {
+      let kind = if state.s3.contains(&h.url) { "s3" } else { "http" };
+      let authenticated = upstream_auth(&state, &h.url).is_some();
+      upstream_status_full(h, now, kind, authenticated)
+    })
+    .collect();
+
+  let fallback = if let Some(fallback) = &state.fallback_cache {
+    let health = state
+      .prober
+      .get_health(&fallback.url)
+      .await
+      .unwrap_or_else(|| {
+        UpstreamHealth::new(fallback.url.clone(), fallback.priority)
+      });
+    let kind = if state.s3.contains(&fallback.url) {
+      "s3"
+    } else {
+      "http"
+    };
+    let authenticated = upstream_auth(&state, &fallback.url).is_some();
+    Some(upstream_status_full(health, now, kind, authenticated))
+  } else {
+    None
+  };
+
+  axum::Json(StatusResponse {
+    version: env!("CARGO_PKG_VERSION"),
+    uptime_secs: now.saturating_duration_since(state.started).as_secs(),
+    status,
+    cache,
+    config: ConfigStatus {
+      cache_priority:      state.cache_priority,
+      upstream_count:      state.upstreams.len(),
+      fallback_configured: state.fallback_cache.is_some(),
+    },
+    upstreams,
+    fallback,
   })
   .into_response()
 }
@@ -635,4 +753,55 @@ fn response_from_s3_head(metadata: ncro_s3::S3ObjectHead) -> Response {
   out
     .body(Body::empty())
     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Instant;
+
+  use ncro_health::{Status, UpstreamHealth};
+
+  use super::{overall_status, upstream_status_full};
+
+  fn health(url: &str, status: Status) -> UpstreamHealth {
+    let mut h = UpstreamHealth::new(url.to_string(), 40);
+    h.status = status;
+    h
+  }
+
+  #[test]
+  fn overall_status_ok_when_all_active() {
+    let all = [health("a", Status::Active), health("b", Status::Active)];
+    assert_eq!(overall_status(&all), "ok");
+  }
+
+  #[test]
+  fn overall_status_degraded_when_any_down_or_degraded() {
+    let mixed = [health("a", Status::Active), health("b", Status::Down)];
+    assert_eq!(overall_status(&mixed), "degraded");
+    let degraded = [health("a", Status::Degraded)];
+    assert_eq!(overall_status(&degraded), "degraded");
+  }
+
+  #[test]
+  fn overall_status_down_only_when_all_down() {
+    let all = [health("a", Status::Down), health("b", Status::Down)];
+    assert_eq!(overall_status(&all), "down");
+  }
+
+  #[test]
+  fn overall_status_ok_when_empty() {
+    assert_eq!(overall_status(&[]), "ok");
+  }
+
+  #[test]
+  fn upstream_status_full_never_probed_has_no_age() {
+    let now = Instant::now();
+    let full =
+      upstream_status_full(health("a", Status::Active), now, "http", false);
+    assert_eq!(full.last_probe_secs_ago, None);
+    assert_eq!(full.kind, "http");
+    assert!(!full.authenticated);
+    assert_eq!(full.status, "ACTIVE");
+  }
 }

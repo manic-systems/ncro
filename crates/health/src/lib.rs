@@ -61,7 +61,10 @@ pub struct UpstreamHealth {
 }
 
 impl UpstreamHealth {
-  const fn new(url: String, priority: i32) -> Self {
+  /// Create a fresh health record for an upstream that has not been probed yet:
+  /// [`Status::Active`], zero latency, and no recorded queries.
+  #[must_use]
+  pub const fn new(url: String, priority: i32) -> Self {
     Self {
       url,
       priority,
