@@ -1,5 +1,6 @@
 use std::{
   collections::HashMap,
+  net::SocketAddr,
   sync::Arc,
   time::{Duration, Instant},
 };
@@ -7,7 +8,11 @@ use std::{
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use ncro_config::{AddressFamily, DiscoveryConfig};
 use ncro_health::Prober;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::{
+  sync::{Mutex, mpsc, watch},
+  task::spawn_blocking,
+  time,
+};
 
 /// fullname -> (list of upstream URLs for all routable addresses, last seen)
 type PeerMap = Arc<Mutex<HashMap<String, (Vec<String>, Instant)>>>;
@@ -46,7 +51,7 @@ impl Discovery {
     );
     let receiver = self.daemon.browse(&service)?;
     let (event_tx, mut event_rx) = mpsc::channel(16);
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking(move || {
       while let Ok(event) = receiver.recv() {
         if event_tx.blocking_send(event).is_err() {
           break;
@@ -56,7 +61,7 @@ impl Discovery {
     let peers = Arc::clone(&self.peers);
     let prober = self.prober.clone();
     let priority = self.cfg.priority;
-    let mut cleanup = tokio::time::interval(Duration::from_secs(10));
+    let mut cleanup = time::interval(Duration::from_secs(10));
     let expiration = if self.cfg.discovery_time.0.is_zero() {
       Duration::from_secs(30)
     } else {
@@ -105,7 +110,7 @@ impl Discovery {
                       .map(|addr| {
                           format!(
                               "http://{}",
-                              std::net::SocketAddr::new(addr, info.get_port())
+                            SocketAddr::new(addr, info.get_port())
                           )
                       })
                       .collect();

@@ -1,6 +1,10 @@
-use std::io::{BufRead, BufReader, Read};
+use std::{
+  io::{self, BufRead, BufReader, Read},
+  num::ParseIntError,
+};
 
 use base64::{
+  DecodeError,
   Engine,
   alphabet,
   engine::{
@@ -26,7 +30,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum NarInfoError {
   #[error("read narinfo: {0}")]
-  Io(#[from] std::io::Error),
+  Io(#[from] io::Error),
   #[error("malformed line: {0:?}")]
   MalformedLine(String),
   #[error("missing StorePath")]
@@ -34,15 +38,12 @@ pub enum NarInfoError {
   #[error("{field}: {source}")]
   ParseInt {
     field:  &'static str,
-    source: std::num::ParseIntError,
+    source: ParseIntError,
   },
   #[error("invalid public key {input:?}: missing ':'")]
   MissingPublicKeySeparator { input: String },
   #[error("invalid public key {input:?}: {source}")]
-  InvalidPublicKeyBase64 {
-    input:  String,
-    source: base64::DecodeError,
-  },
+  InvalidPublicKeyBase64 { input: String, source: DecodeError },
   #[error("invalid public key size {got}, want 32")]
   InvalidPublicKeySize { got: usize },
 }

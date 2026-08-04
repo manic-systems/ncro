@@ -1,4 +1,5 @@
 use std::{
+  io,
   path::Path,
   sync::{
     Arc,
@@ -12,17 +13,22 @@ use sqlx::{
   ConnectOptions,
   Row,
   SqlitePool,
-  sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+  sqlite::{
+    SqliteConnectOptions,
+    SqliteJournalMode,
+    SqlitePoolOptions,
+    SqliteRow,
+  },
 };
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::{fs as tokio_fs, sync::Mutex};
 
 #[derive(Debug, Error)]
 pub enum DbError {
   #[error("sqlite: {0}")]
   Sqlx(#[from] sqlx::Error),
   #[error("create database directory: {0}")]
-  CreateDir(#[from] std::io::Error),
+  CreateDir(#[from] io::Error),
   #[error("invalid stored route data: {0}")]
   InvalidData(String),
 }
@@ -79,7 +85,7 @@ impl Db {
     if path != ":memory:"
       && let Some(parent) = Path::new(path).parent()
     {
-      tokio::fs::create_dir_all(parent).await?;
+      tokio_fs::create_dir_all(parent).await?;
     }
 
     let options = if path == ":memory:" {
@@ -436,7 +442,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), DbError> {
   Ok(())
 }
 
-fn row_to_route(row: &sqlx::sqlite::SqliteRow) -> Result<RouteEntry, DbError> {
+fn row_to_route(row: &SqliteRow) -> Result<RouteEntry, DbError> {
   let query_count = row.get::<i64, _>("query_count");
   let failure_count = row.get::<i64, _>("failure_count");
   let nar_size = row.get::<i64, _>("nar_size");

@@ -10,6 +10,7 @@ use prometheus::{
   Opts,
   Registry,
   TextEncoder,
+  core::Collector,
 };
 
 pub struct Metrics {
@@ -117,8 +118,7 @@ pub fn get() -> &'static Metrics {
     .expect("valid metric");
 
     for collector in [
-      Box::new(narinfo_cache_hits.clone())
-        as Box<dyn prometheus::core::Collector>,
+      Box::new(narinfo_cache_hits.clone()) as Box<dyn Collector>,
       Box::new(narinfo_cache_misses.clone()),
       Box::new(narinfo_memory_negative_hits.clone()),
       Box::new(narinfo_singleflight_waiters.clone()),

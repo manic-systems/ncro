@@ -73,7 +73,7 @@ style      = { level = "warn", priority = -1 }
 
 # The lint groups above enable some less-than-desirable rules, we should manually
 # enable those to keep our sanity.
-absolute_paths                       = "allow"
+absolute_paths                       = "warn"
 arbitrary_source_item_ordering       = "allow"
 clone_on_ref_ptr                     = "warn"
 dbg_macro                            = "warn"

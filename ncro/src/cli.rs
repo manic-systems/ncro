@@ -1,4 +1,13 @@
-use std::io::Write as _;
+use std::{
+  env,
+  ffi::OsString,
+  io::{self, Write as _},
+  net::TcpListener as StdTcpListener,
+  os::unix::{ffi::OsStringExt, io::FromRawFd, net::UnixDatagram},
+  path::Path,
+  process,
+  time::Duration,
+};
 
 use ncro_config::{Config, LogFormat};
 use ncro_db::Db;
@@ -6,7 +15,8 @@ use ncro_discovery::Discovery;
 use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
 use pound::Parse;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, signal, sync::watch, time};
+use tracing::subscriber::set_default;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::warn_buffer::BufferLayer;
@@ -21,19 +31,18 @@ fn parse_listen_fds(val: Option<&str>) -> Option<u32> {
 /// Attempts to inherit a pre-bound TCP socket from systemd (fd 3).
 /// Returns `None` when `LISTEN_FDS` is absent or zero, or when `LISTEN_PID`
 /// does not match this process (guards against inheriting stale env vars).
-fn inherited_listener() -> Option<std::net::TcpListener> {
-  use std::os::unix::io::FromRawFd;
-  parse_listen_fds(std::env::var("LISTEN_FDS").ok().as_deref())?;
+fn inherited_listener() -> Option<StdTcpListener> {
+  parse_listen_fds(env::var("LISTEN_FDS").ok().as_deref())?;
   // Confirm the fds are intended for this process, as required by the
   // sd_listen_fds(3) protocol.
-  let our_pid = std::process::id().to_string();
-  if std::env::var("LISTEN_PID").ok().as_deref() != Some(our_pid.as_str()) {
+  let our_pid = process::id().to_string();
+  if env::var("LISTEN_PID").ok().as_deref() != Some(our_pid.as_str()) {
     return None;
   }
   // SAFETY: systemd passes a pre-bound TCP socket as fd 3
   // (SD_LISTEN_FDS_START). The fd is valid for the lifetime of this process
   // and not owned by anyone else when LISTEN_FDS >= 1 and LISTEN_PID matches.
-  let listener = unsafe { std::net::TcpListener::from_raw_fd(3) };
+  let listener = unsafe { StdTcpListener::from_raw_fd(3) };
   listener.set_nonblocking(true).ok()?;
   Some(listener)
 }
@@ -41,12 +50,7 @@ fn inherited_listener() -> Option<std::net::TcpListener> {
 /// Sends `READY=1` to the systemd notification socket if `$NOTIFY_SOCKET` is
 /// set. Logs a warning on error but does not abort startup.
 fn sd_notify_ready() {
-  use std::{
-    ffi::OsString,
-    os::unix::{ffi::OsStringExt, net::UnixDatagram},
-  };
-
-  let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
+  let Ok(socket_path) = env::var("NOTIFY_SOCKET") else {
     return;
   };
   let sock = match UnixDatagram::unbound() {
@@ -63,10 +67,7 @@ fn sd_notify_ready() {
     |name| {
       let mut bytes = vec![0u8];
       bytes.extend_from_slice(name.as_bytes());
-      sock.send_to(
-        b"READY=1\n",
-        std::path::Path::new(&OsString::from_vec(bytes)),
-      )
+      sock.send_to(b"READY=1\n", Path::new(&OsString::from_vec(bytes)))
     },
   );
   if let Err(e) = result {
@@ -116,11 +117,7 @@ pub async fn run() -> anyhow::Result<()> {
     Command::Serve { config } => serve(config.as_deref()).await,
     Command::GenerateMeshKey { path } => {
       let node = ncro_mesh::Node::new(&path).await?;
-      writeln!(
-        std::io::stdout().lock(),
-        "{}",
-        hex::encode(node.public_key())
-      )?;
+      writeln!(io::stdout().lock(), "{}", hex::encode(node.public_key()))?;
       Ok(())
     },
   }
@@ -132,7 +129,7 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
   let buffer = BufferLayer::default();
   let cfg = {
     let subscriber = tracing_subscriber::registry().with(buffer.clone());
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let _guard = set_default(subscriber);
     let cfg = Config::load(config)?;
     cfg.validate()?;
     cfg
@@ -193,7 +190,7 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
     db.clone(),
     prober.clone(),
     cfg.cache.ttl.0,
-    std::time::Duration::from_secs(5),
+    Duration::from_secs(5),
     cfg.cache.negative_ttl.0,
     RouterTuning {
       max_concurrent_races:      cfg.cache.mass_query.max_concurrent_races,
@@ -212,19 +209,19 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
       .await?;
   }
 
-  let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+  let (stop_tx, stop_rx) = watch::channel(false);
   let probe_prober = prober.clone();
   let probe_stop = stop_rx.clone();
   tokio::spawn(async move {
     probe_prober
-      .run_probe_loop(std::time::Duration::from_secs(30), probe_stop)
+      .run_probe_loop(Duration::from_secs(30), probe_stop)
       .await;
   });
 
   let db_for_expiry = db.clone();
   let mut expiry_stop = stop_rx.clone();
   tokio::spawn(async move {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_mins(5));
+    let mut ticker = time::interval(Duration::from_mins(5));
     loop {
       tokio::select! {
           _ = expiry_stop.changed() => return,
@@ -305,7 +302,7 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
   );
   sd_notify_ready();
   let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-    let _ = tokio::signal::ctrl_c().await;
+    let _ = signal::ctrl_c().await;
   });
   let result = server.await;
   let _ = stop_tx.send(true);

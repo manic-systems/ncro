@@ -1,8 +1,14 @@
+use std::{fmt::Display, io};
+
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{Client, config::Region, primitives::ByteStream};
+use aws_sdk_s3::{
+  Client,
+  config::{Builder, Region},
+  primitives::ByteStream,
+};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures_util::stream;
+use futures_util::{Stream, stream};
 use ncro_config::S3Config;
 use thiserror::Error;
 
@@ -159,13 +165,13 @@ impl S3ClientPool {
 
   pub fn body_stream(
     body: ByteStream,
-  ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+  ) -> impl Stream<Item = Result<Bytes, io::Error>> {
     stream::unfold(body, |mut body| {
       async move {
         match body.try_next().await {
           Ok(Some(bytes)) => Some((Ok(bytes), body)),
           Ok(None) => None,
-          Err(err) => Some((Err(std::io::Error::other(err)), body)),
+          Err(err) => Some((Err(io::Error::other(err)), body)),
         }
       }
     })
@@ -193,7 +199,7 @@ impl S3ClientPool {
       loader = loader.endpoint_url(endpoint_url);
     }
     let shared = loader.load().await;
-    let s3_config = aws_sdk_s3::config::Builder::from(&shared)
+    let s3_config = Builder::from(&shared)
       .force_path_style(config.force_path_style())
       .build();
     let client = Client::from_conf(s3_config);
@@ -202,7 +208,7 @@ impl S3ClientPool {
   }
 }
 
-fn is_not_found<E: std::fmt::Display>(err: &E) -> bool {
+fn is_not_found<E: Display>(err: &E) -> bool {
   let text = err.to_string();
   text.contains("NotFound")
     || text.contains("NoSuchKey")

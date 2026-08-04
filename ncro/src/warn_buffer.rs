@@ -1,5 +1,5 @@
 use std::{
-  fmt::Write as _,
+  fmt::{Debug, Write as _},
   sync::{Arc, Mutex},
 };
 
@@ -53,7 +53,7 @@ impl<S: tracing::Subscriber> Layer<S> for BufferLayer {
 struct MessageVisitor(String);
 
 impl Visit for MessageVisitor {
-  fn record_debug(&mut self, field: &Field, value: &dyn core::fmt::Debug) {
+  fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
     if field.name() == "message" {
       let _ = write!(self.0, "{value:?}");
     }

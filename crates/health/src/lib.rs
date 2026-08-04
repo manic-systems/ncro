@@ -26,7 +26,10 @@ const fn backoff_interval(base: Duration, consecutive_fails: u32) -> Duration {
 
 use ncro_config::UpstreamConfig;
 use ncro_s3::S3ClientPool;
-use tokio::sync::RwLock;
+use tokio::{
+  sync::{RwLock, watch},
+  time as tokio_time,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -305,12 +308,12 @@ impl Prober {
   pub async fn run_probe_loop(
     &self,
     interval: Duration,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
   ) {
     // Check for due probes at a fraction of the base interval so newly-added
     // upstreams and backoff expirations are picked up promptly.
     let check_tick = (interval / 4).max(Duration::from_secs(1));
-    let mut ticker = tokio::time::interval(check_tick);
+    let mut ticker = tokio_time::interval(check_tick);
 
     // When was it last probed. None means never, probe immediately.
     let mut last_probed: HashMap<String, Instant> = HashMap::new();
@@ -377,11 +380,12 @@ const fn compute_status(consecutive_fails: u32) -> Status {
 
 #[cfg(test)]
 mod tests {
+  use std::error::Error;
+
   use super::*;
 
   #[tokio::test]
-  async fn ema_and_status_progression() -> Result<(), Box<dyn std::error::Error>>
-  {
+  async fn ema_and_status_progression() -> Result<(), Box<dyn Error>> {
     let p = Prober::new(0.3)?;
     p.add_upstream("https://example.com".into(), 1).await;
     p.record_latency("https://example.com", 100.0).await;
@@ -426,8 +430,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn first_record_latency_sets_exact_ema()
-  -> Result<(), Box<dyn std::error::Error>> {
+  async fn first_record_latency_sets_exact_ema() -> Result<(), Box<dyn Error>> {
     let p = Prober::new(0.3)?;
     p.add_upstream("https://example.com".into(), 1).await;
     p.record_latency("https://example.com", 42.0).await;
@@ -443,7 +446,7 @@ mod tests {
 
   #[tokio::test]
   async fn record_latency_resets_consecutive_fails()
-  -> Result<(), Box<dyn std::error::Error>> {
+  -> Result<(), Box<dyn Error>> {
     let p = Prober::new(0.3)?;
     p.add_upstream("https://example.com".into(), 1).await;
     for _ in 0..5 {
@@ -464,8 +467,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn sorted_by_latency_down_goes_last()
-  -> Result<(), Box<dyn std::error::Error>> {
+  async fn sorted_by_latency_down_goes_last() -> Result<(), Box<dyn Error>> {
     use ncro_config::UpstreamConfig;
     let p = Prober::new(0.3)?;
     p.init_upstreams(&[
@@ -493,7 +495,7 @@ mod tests {
 
   #[tokio::test]
   async fn sorted_by_latency_priority_within_10pct_window()
-  -> Result<(), Box<dyn std::error::Error>> {
+  -> Result<(), Box<dyn Error>> {
     use ncro_config::UpstreamConfig;
     let p = Prober::new(0.3)?;
     p.init_upstreams(&[

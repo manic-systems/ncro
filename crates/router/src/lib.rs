@@ -1,5 +1,6 @@
 use std::{
   collections::{BTreeMap, HashMap},
+  str,
   sync::Arc,
   time::{Duration, Instant},
 };
@@ -21,7 +22,10 @@ use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
 use ncro_s3::{S3ClientPool, S3Error};
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::{
+  sync::{Mutex, RwLock, Semaphore},
+  time,
+};
 
 #[derive(Debug, Error)]
 pub enum RouterError {
@@ -684,7 +688,7 @@ impl Router {
     let mut net_errs = 0usize;
     let mut not_founds = 0usize;
     let mut attempts = 0_u32;
-    let deadline = tokio::time::sleep(self.inner.race_timeout);
+    let deadline = time::sleep(self.inner.race_timeout);
     tokio::pin!(deadline);
 
     let winner = loop {
@@ -1017,7 +1021,7 @@ fn rewrite_narinfo_url(
   if mode == NarUrlMode::Keep {
     return body.to_vec();
   }
-  let Ok(text) = std::str::from_utf8(body) else {
+  let Ok(text) = str::from_utf8(body) else {
     return body.to_vec();
   };
   let mut out = String::with_capacity(text.len() + upstream.len());
@@ -1134,7 +1138,7 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   #![expect(clippy::unwrap_used, reason = "Fine in tests")]
-  use std::{sync::Arc, time::Duration};
+  use std::{slice, sync::Arc, time::Duration};
 
   use base64::{Engine as _, engine::general_purpose::STANDARD};
   use chrono::Utc;
@@ -1492,7 +1496,7 @@ mod tests {
     .await;
 
     let cached = router
-      .resolve("abc123", std::slice::from_ref(&previously_accepted))
+      .resolve("abc123", slice::from_ref(&previously_accepted))
       .await
       .unwrap();
     assert_eq!(cached.url, previously_accepted);
@@ -1618,7 +1622,7 @@ mod tests {
       .await;
 
     let result = router
-      .resolve("abc123", std::slice::from_ref(&working))
+      .resolve("abc123", slice::from_ref(&working))
       .await
       .unwrap();
 

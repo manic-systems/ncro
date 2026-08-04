@@ -1,22 +1,20 @@
-use std::{env, fmt, fs, time::Duration};
+use std::{env, fmt, fs, io, iter, time::Duration};
 
 use netrc::Netrc;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
+use toml::de::Error as TomlError;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
   #[error("read config: {0}")]
-  Read(#[from] std::io::Error),
+  Read(#[from] io::Error),
   #[error("read password_file {path:?}: {source}")]
-  PasswordFile {
-    path:   String,
-    source: std::io::Error,
-  },
+  PasswordFile { path: String, source: io::Error },
   #[error("parse config: {0}")]
-  Parse(#[from] toml::de::Error),
+  Parse(#[from] TomlError),
   #[error("{0}")]
   Validation(String),
 }
@@ -215,7 +213,9 @@ fn resolve_password_file(
 #[cfg(test)]
 mod tests {
   use std::{
+    iter,
     path::PathBuf,
+    process,
     sync::atomic::{AtomicUsize, Ordering},
   };
 
@@ -226,7 +226,7 @@ mod tests {
   fn test_dir(name: &str) -> Result<PathBuf, ConfigError> {
     let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = env::temp_dir()
-      .join(format!("ncro-config-{name}-{}-{id}", std::process::id()));
+      .join(format!("ncro-config-{name}-{}-{id}", process::id()));
     fs::create_dir_all(&dir)?;
     Ok(dir)
   }
@@ -245,7 +245,7 @@ mod tests {
   }
 
   #[test]
-  fn parses_duration_toml() -> Result<(), toml::de::Error> {
+  fn parses_duration_toml() -> Result<(), TomlError> {
     let cfg: Config = toml::from_str(
       "[server]\ncache_priority = 40\n\n[cache]\nttl = \
        \"2h\"\nslow_statement_threshold = \"5s\"\n",
@@ -271,7 +271,7 @@ mod tests {
   }
 
   #[test]
-  fn validates_upstream_public_keys_entries() -> Result<(), toml::de::Error> {
+  fn validates_upstream_public_keys_entries() -> Result<(), TomlError> {
     let cfg: Config = toml::from_str(
       "[[upstreams]]\nurl = \"https://cache.example\"\npublic_keys = \
        [\"missing-separator\"]\n",
@@ -297,8 +297,8 @@ mod tests {
   }
 
   #[test]
-  fn logging_level_rejects_invalid_filter_directives()
-  -> Result<(), toml::de::Error> {
+  fn logging_level_rejects_invalid_filter_directives() -> Result<(), TomlError>
+  {
     let cfg: Config = toml::from_str("[logging]\nlevel = \"ncro==debug\"\n")?;
 
     let result = cfg.validate();
@@ -311,8 +311,7 @@ mod tests {
   }
 
   #[test]
-  fn logging_level_rejects_empty_filter_directive()
-  -> Result<(), toml::de::Error> {
+  fn logging_level_rejects_empty_filter_directive() -> Result<(), TomlError> {
     let cfg: Config = toml::from_str("[logging]\nlevel = \"\"\n")?;
 
     let result = cfg.validate();
@@ -332,7 +331,7 @@ mod tests {
   }
 
   #[test]
-  fn logging_timestamps_default_to_enabled() -> Result<(), toml::de::Error> {
+  fn logging_timestamps_default_to_enabled() -> Result<(), TomlError> {
     let cfg: Config = toml::from_str("[logging]\nlevel = \"info\"\n")?;
 
     assert!(cfg.logging.timestamps);
@@ -463,7 +462,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   }
 
   #[test]
-  fn validates_mass_query_limits() -> Result<(), toml::de::Error> {
+  fn validates_mass_query_limits() -> Result<(), TomlError> {
     let cfg: Config = toml::from_str(
       "[cache.mass_query]\nmax_concurrent_races = \
        0\nper_upstream_max_inflight = 1\nin_memory_negative_ttl = \
@@ -498,7 +497,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   fn netrc_fills_empty_credentials() {
     let nrc = netrc("machine cache.example.com login alice password secret\n");
     let mut up = upstream("https://cache.example.com");
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert_eq!(up.username, "alice");
     assert_eq!(up.password.as_deref(), Some("secret"));
   }
@@ -509,7 +508,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     let mut up = upstream("https://cache.example.com");
     up.username = "bob".to_string();
     up.password = Some("configpw".to_string());
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert_eq!(up.username, "bob");
     assert_eq!(up.password.as_deref(), Some("configpw"));
   }
@@ -518,7 +517,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   fn netrc_ignores_non_matching_host() {
     let nrc = netrc("machine other.example.com login alice password secret\n");
     let mut up = upstream("https://cache.example.com");
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert!(up.username.is_empty());
     assert!(up.password.is_none());
   }
@@ -529,7 +528,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     let nrc = netrc("machine my-cache login alice password secret\n");
     let mut up = upstream("s3://my-cache?endpoint=s3.example.com");
     up.s3 = Some(parse_s3_url(&up.url).expect("valid s3 url"));
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert!(up.username.is_empty());
     assert!(up.password.is_none());
   }
@@ -538,7 +537,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   fn netrc_empty_password_maps_to_none() {
     let nrc = netrc("machine cache.example.com login alice\n");
     let mut up = upstream("https://cache.example.com");
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert_eq!(up.username, "alice");
     assert!(up.password.is_none());
   }
@@ -547,7 +546,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   fn netrc_default_entry_matches_any_host() {
     let nrc = netrc("default login alice password secret\n");
     let mut up = upstream("https://cache.example.com");
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert_eq!(up.username, "alice");
     assert_eq!(up.password.as_deref(), Some("secret"));
   }
@@ -559,7 +558,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
        bob password fallback\n",
     );
     let mut up = upstream("https://cache.example.com");
-    apply_netrc(std::iter::once(&mut up), &nrc);
+    apply_netrc(iter::once(&mut up), &nrc);
     assert_eq!(up.username, "alice");
     assert_eq!(up.password.as_deref(), Some("secret"));
   }
@@ -610,8 +609,8 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   }
 
   #[test]
-  fn password_and_password_file_are_mutually_exclusive()
-  -> Result<(), toml::de::Error> {
+  fn password_and_password_file_are_mutually_exclusive() -> Result<(), TomlError>
+  {
     let cfg: Config = toml::from_str(
       "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
        \"alice\"\npassword = \"inline\"\npassword_file = \"/run/secrets/pw\"\n",
@@ -1029,7 +1028,7 @@ impl Config {
         cfg
           .upstreams
           .iter_mut()
-          .chain(std::iter::once(&mut cfg.fallback_cache.upstream)),
+          .chain(iter::once(&mut cfg.fallback_cache.upstream)),
         &nrc,
       );
     }

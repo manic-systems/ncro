@@ -1,4 +1,5 @@
 use std::{
+  io::{self, ErrorKind},
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -7,9 +8,16 @@ use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use ncro_db::{Db, RouteEntry};
 use rand::RngExt;
+use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, net::UdpSocket, time::Duration};
+use tokio::{
+  fs::{self, OpenOptions},
+  io::AsyncWriteExt,
+  net::UdpSocket,
+  sync::watch,
+  time::{self, Duration},
+};
 
 const MAX_PACKET_SIZE: usize = 1_400;
 const HEADER_SIZE: usize = 96;
@@ -20,11 +28,11 @@ type DecodedPacket<'a> = (&'a [u8], &'a [u8], &'a [u8], Message);
 #[derive(Debug, Error)]
 pub enum MeshError {
   #[error("io: {0}")]
-  Io(#[from] std::io::Error),
+  Io(#[from] io::Error),
   #[error("msgpack: {0}")]
-  Encode(#[from] rmp_serde::encode::Error),
+  Encode(#[from] EncodeError),
   #[error("decode msgpack: {0}")]
-  Decode(#[from] rmp_serde::decode::Error),
+  Decode(#[from] DecodeError),
   #[error("packet too short: {0} bytes")]
   PacketTooShort(usize),
   #[error("invalid signature")]
@@ -62,7 +70,7 @@ impl Node {
         signing_key: Arc::new(SigningKey::from_bytes(&random_key_bytes())),
       });
     }
-    match tokio::fs::read(key_path).await {
+    match fs::read(key_path).await {
       Ok(data) => {
         if data.len() != 32 && data.len() != 64 {
           return Err(MeshError::InvalidKeyFileSize { got: data.len() });
@@ -73,13 +81,13 @@ impl Node {
           signing_key: Arc::new(SigningKey::from_bytes(&bytes)),
         });
       },
-      Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+      Err(err) if err.kind() == ErrorKind::NotFound => {},
       Err(err) => return Err(MeshError::Io(err)),
     }
     if let Some(parent) = Path::new(key_path).parent()
       && !parent.as_os_str().is_empty()
     {
-      tokio::fs::create_dir_all(parent).await?;
+      fs::create_dir_all(parent).await?;
     }
     let key = SigningKey::from_bytes(&random_key_bytes());
     write_new_key(Path::new(key_path), &key.to_bytes()).await?;
@@ -111,9 +119,9 @@ impl Node {
 async fn write_new_key(
   key_path: &Path,
   key_bytes: &[u8; 32],
-) -> Result<(), std::io::Error> {
+) -> Result<(), io::Error> {
   let temp_path = temporary_key_path(key_path);
-  let mut options = tokio::fs::OpenOptions::new();
+  let mut options = OpenOptions::new();
   options.write(true).create_new(true);
   #[cfg(unix)]
   {
@@ -123,11 +131,11 @@ async fn write_new_key(
   let write_result = async {
     file.write_all(key_bytes).await?;
     file.sync_all().await?;
-    tokio::fs::hard_link(&temp_path, key_path).await
+    fs::hard_link(&temp_path, key_path).await
   }
   .await;
   drop(file);
-  let cleanup_result = tokio::fs::remove_file(temp_path).await;
+  let cleanup_result = fs::remove_file(temp_path).await;
   write_result?;
   cleanup_result
 }
@@ -166,7 +174,7 @@ pub async fn listen_and_serve(
   addr: &str,
   db: Db,
   allowed_keys: Vec<[u8; 32]>,
-  stop: tokio::sync::watch::Receiver<bool>,
+  stop: watch::Receiver<bool>,
 ) -> Result<(), MeshError> {
   let socket = UdpSocket::bind(addr).await?;
   tokio::spawn(async move {
@@ -249,9 +257,9 @@ pub async fn run_gossip_loop(
   db: Db,
   peers: Vec<String>,
   interval: Duration,
-  mut stop: tokio::sync::watch::Receiver<bool>,
+  mut stop: watch::Receiver<bool>,
 ) {
-  let mut ticker = tokio::time::interval(interval);
+  let mut ticker = time::interval(interval);
   loop {
     tokio::select! {
         _ = stop.changed() => return,
@@ -298,7 +306,9 @@ mod tests {
     time::{Duration, SystemTime, UNIX_EPOCH},
   };
 
+  use chrono::Duration as ChronoDuration;
   use ncro_db::{Db, RouteEntry};
+  use tokio::fs;
 
   use super::{Node, merge_routes};
 
@@ -318,7 +328,7 @@ mod tests {
     let reloaded = Node::new(&path).await?;
 
     assert_eq!(generated.public_key(), reloaded.public_key());
-    let metadata = tokio::fs::metadata(path.as_ref()).await?;
+    let metadata = fs::metadata(path.as_ref()).await?;
     assert_eq!(metadata.len(), 32);
     #[cfg(unix)]
     {
@@ -326,7 +336,7 @@ mod tests {
       let mode = metadata.permissions().mode();
       assert_eq!(mode & 0o777, 0o600);
     }
-    tokio::fs::remove_file(path.as_ref()).await?;
+    fs::remove_file(path.as_ref()).await?;
     Ok(())
   }
 
@@ -340,7 +350,7 @@ mod tests {
       last_verified: now,
       query_count: 1,
       failure_count: 0,
-      ttl: now + chrono::Duration::seconds(ttl_secs),
+      ttl: now + ChronoDuration::seconds(ttl_secs),
       nar_hash: "sha256:aabbcc".into(),
       nar_size: 42,
       nar_url: "nar/test.nar".into(),
@@ -349,8 +359,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_inserts_new_route()
-  -> Result<(), Box<dyn std::error::Error>> {
+  async fn merge_routes_inserts_new_route() -> Result<(), Box<dyn Error>> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     merge_routes(&db, vec![route("abc123", 10.0, 3600)]).await;
     assert!(db.get_route("abc123").await?.is_some());
@@ -358,8 +367,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_skips_expired_route()
-  -> Result<(), Box<dyn std::error::Error>> {
+  async fn merge_routes_skips_expired_route() -> Result<(), Box<dyn Error>> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     merge_routes(&db, vec![route("abc123", 10.0, -1)]).await;
     assert!(db.get_route("abc123").await?.is_none());
@@ -368,7 +376,7 @@ mod tests {
 
   #[tokio::test]
   async fn merge_routes_does_not_overwrite_lower_latency()
-  -> Result<(), Box<dyn std::error::Error>> {
+  -> Result<(), Box<dyn Error>> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     db.set_route(&route("abc123", 5.0, 3600)).await?;
     merge_routes(&db, vec![route("abc123", 20.0, 3600)]).await;
@@ -385,8 +393,8 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_overwrites_higher_latency()
-  -> Result<(), Box<dyn std::error::Error>> {
+  async fn merge_routes_overwrites_higher_latency() -> Result<(), Box<dyn Error>>
+  {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     db.set_route(&route("abc123", 20.0, 3600)).await?;
     merge_routes(&db, vec![route("abc123", 5.0, 3600)]).await;

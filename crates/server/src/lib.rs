@@ -1,13 +1,23 @@
 use std::{
   collections::{BTreeMap, HashMap},
+  io,
   sync::Arc,
+  time::Duration,
 };
 
 use axum::{
   Router as AxumRouter,
   body::Body,
   extract::{Path, State},
-  http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
+  http::{
+    HeaderMap,
+    HeaderName,
+    HeaderValue,
+    Method,
+    Request,
+    StatusCode,
+    uri::PathAndQuery,
+  },
   response::{IntoResponse, Response},
   routing::get,
 };
@@ -44,8 +54,8 @@ pub struct AppConfig {
   pub upstreams:      Vec<UpstreamConfig>,
   pub fallback_cache: Option<UpstreamConfig>,
   pub cache_priority: i32,
-  pub read_timeout:   std::time::Duration,
-  pub write_timeout:  std::time::Duration,
+  pub read_timeout:   Duration,
+  pub write_timeout:  Duration,
 }
 
 /// Build the HTTP application router.
@@ -268,7 +278,7 @@ async fn nar(
   let path_and_query = req
     .uri()
     .path_and_query()
-    .map_or_else(|| req.uri().path(), axum::http::uri::PathAndQuery::as_str)
+    .map_or_else(|| req.uri().path(), PathAndQuery::as_str)
     .to_string();
 
   if let Ok(Some(entry)) = state.db.get_route_by_nar_url(&nar_url).await
@@ -487,7 +497,7 @@ fn response_from_reqwest(resp: reqwest::Response) -> Response {
   let status = StatusCode::from_u16(resp.status().as_u16())
     .unwrap_or(StatusCode::BAD_GATEWAY);
   let headers = resp.headers().clone();
-  let stream = resp.bytes_stream().map_err(std::io::Error::other);
+  let stream = resp.bytes_stream().map_err(io::Error::other);
   let mut out = Response::builder().status(status);
   for name in [
     "accept-ranges",
