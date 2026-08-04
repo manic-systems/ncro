@@ -339,12 +339,13 @@ impl Router {
     url: String,
     mode: NarUrlMode,
   ) {
-    let mut map = self.inner.upstream_nar_url_modes.write().await;
-    if mode == NarUrlMode::Keep {
-      map.remove(&url);
-    } else {
-      map.insert(url, mode);
-    }
+    // `Keep` has to be stored, not skipped, since absence means the default.
+    self
+      .inner
+      .upstream_nar_url_modes
+      .write()
+      .await
+      .insert(url, mode);
   }
 
   /// Build and register a per-upstream HTTP client with a custom narinfo
@@ -382,8 +383,9 @@ impl Router {
   ) -> Result<ResolveResult, RouterError> {
     let start = Instant::now();
     let (body, _) = self.fetch_narinfo(upstream, store_hash).await?;
-    let narinfo_bytes =
-      self.response_narinfo_bytes(upstream, body.as_deref()).await;
+    let narinfo_bytes = self
+      .response_narinfo_bytes(upstream, store_hash, body.as_deref())
+      .await;
     Ok(ResolveResult {
       url: upstream.to_string(),
       latency_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -469,7 +471,11 @@ impl Router {
       let mut result = (*cached).clone();
       if result.narinfo_bytes.is_none() {
         result.narinfo_bytes = self
-          .response_narinfo_bytes(&cached.url, narinfo_bytes.as_deref())
+          .response_narinfo_bytes(
+            &cached.url,
+            store_hash,
+            narinfo_bytes.as_deref(),
+          )
           .await;
         self
           .inner
@@ -507,6 +513,7 @@ impl Router {
     let narinfo_bytes = self
       .response_narinfo_bytes(
         &entry.upstream_url,
+        store_hash,
         entry.narinfo_bytes.as_deref(),
       )
       .await;
@@ -796,14 +803,19 @@ impl Router {
       );
       return Ok(CommitOutcome::Rejected);
     }
-    // Strip leading slash and query string (harmonia appends ?hash=STORE_HASH)
-    // so the DB key is just the path component for consistent lookups.
-    let nar_url = parsed
-      .url
-      .trim_start_matches('/')
+    // harmonia appends `?hash=STORE_HASH` and needs it to locate the store
+    // path, so the fetch keeps the query and only the lookup key drops it.
+    let upstream_path = parsed.url.trim_start_matches('/');
+    let key = upstream_path
       .split_once('?')
-      .map_or_else(|| parsed.url.trim_start_matches('/'), |(path, _)| path)
-      .to_string();
+      .map_or(upstream_path, |(path, _)| path);
+    let nar_url = match self.nar_url_mode(&winner.url).await {
+      NarUrlMode::ToSelf => canonical_nar_url(&parsed.url, store_hash),
+      NarUrlMode::Keep | NarUrlMode::ToUpstream => key.to_string(),
+    };
+    // Stored `/`-prefixed and host-stripped because the NAR handler appends it
+    // to the upstream base. An upstream may publish an absolute URL here.
+    let upstream_nar_url = format!("/{}", relative_nar_url(&parsed.url));
 
     ncro_metrics::get()
       .upstream_race_wins
@@ -846,6 +858,7 @@ impl Router {
         nar_hash: parsed.nar_hash,
         nar_size: parsed.nar_size,
         nar_url,
+        upstream_nar_url,
         narinfo_bytes: body.clone(),
       })
       .await?;
@@ -854,7 +867,7 @@ impl Router {
       latency_ms:    winner.latency_ms,
       cache_hit:     false,
       narinfo_bytes: self
-        .response_narinfo_bytes(&winner.url, body.as_deref())
+        .response_narinfo_bytes(&winner.url, store_hash, body.as_deref())
         .await,
     };
     self
@@ -928,6 +941,24 @@ impl Router {
     CachedFilterCheck::Rejected
   }
 
+  /// Ask one upstream where it keeps the NAR for `store_hash`.
+  ///
+  /// A canonical path doesn't carry the upstream's layout, so retrying a
+  /// different upstream has to re-read its narinfo.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`RouterError::NotFound`] if the upstream does not have the path,
+  /// or propagates fetch, parse, and signature errors.
+  pub async fn upstream_nar_path(
+    &self,
+    upstream: &str,
+    store_hash: &str,
+  ) -> Result<String, RouterError> {
+    let (_, parsed) = self.fetch_narinfo(upstream, store_hash).await?;
+    Ok(format!("/{}", relative_nar_url(&parsed.url)))
+  }
+
   async fn fetch_narinfo(
     &self,
     upstream: &str,
@@ -978,17 +1009,20 @@ impl Router {
   async fn response_narinfo_bytes(
     &self,
     upstream: &str,
+    store_hash: &str,
     body: Option<&[u8]>,
   ) -> Option<Vec<u8>> {
     let body = body?;
-    let mode = {
-      let map = self.inner.upstream_nar_url_modes.read().await;
-      map.get(upstream).copied().unwrap_or_default()
-    };
+    let mode = self.nar_url_mode(upstream).await;
     if mode == NarUrlMode::Keep {
       return Some(body.to_vec());
     }
-    Some(rewrite_narinfo_url(body, upstream, mode))
+    Some(rewrite_narinfo_url(body, upstream, store_hash, mode))
+  }
+
+  async fn nar_url_mode(&self, upstream: &str) -> NarUrlMode {
+    let map = self.inner.upstream_nar_url_modes.read().await;
+    map.get(upstream).copied().unwrap_or_default()
   }
 }
 
@@ -1016,6 +1050,7 @@ fn narinfo_verifies_any_key(narinfo: &NarInfo, public_keys: &[String]) -> bool {
 fn rewrite_narinfo_url(
   body: &[u8],
   upstream: &str,
+  store_hash: &str,
   mode: NarUrlMode,
 ) -> Vec<u8> {
   if mode == NarUrlMode::Keep {
@@ -1033,7 +1068,7 @@ fn rewrite_narinfo_url(
     });
     if let Some(url) = line.strip_prefix("URL: ") {
       out.push_str("URL: ");
-      out.push_str(&rewrite_nar_url_value(url, upstream, mode));
+      out.push_str(&rewrite_nar_url_value(url, upstream, store_hash, mode));
     } else {
       out.push_str(line);
     }
@@ -1045,11 +1080,12 @@ fn rewrite_narinfo_url(
 fn rewrite_nar_url_value(
   url: &str,
   upstream: &str,
+  store_hash: &str,
   mode: NarUrlMode,
 ) -> String {
   match mode {
     NarUrlMode::Keep => url.to_string(),
-    NarUrlMode::ToSelf => relative_nar_url(url).to_string(),
+    NarUrlMode::ToSelf => canonical_nar_url(url, store_hash),
     NarUrlMode::ToUpstream => {
       format!(
         "{}/{}",
@@ -1058,6 +1094,31 @@ fn rewrite_nar_url_value(
       )
     },
   }
+}
+
+/// Build the `nar/<store-hash>` path NCRO serves for a NAR body.
+///
+/// Upstreams key NAR paths differently and a root-level one misses
+/// `/nar/{*path}` entirely, so only the store hash works against all of them.
+#[must_use]
+pub fn canonical_nar_url(url: &str, store_hash: &str) -> String {
+  format!("nar/{store_hash}{}", nar_extension(url))
+}
+
+fn nar_extension(url: &str) -> &str {
+  let path = relative_nar_url(url);
+  let path = path.split_once('?').map_or(path, |(path, _)| path);
+  let file = path.rsplit('/').next().unwrap_or(path);
+  file.rfind(".nar").map_or("", |idx| &file[idx..])
+}
+
+/// Recover the store hash from a [`canonical_nar_url`] path.
+#[must_use]
+pub fn store_hash_from_canonical_nar_url(path: &str) -> Option<&str> {
+  let rest = path.trim_start_matches('/').strip_prefix("nar/")?;
+  let hash = rest.split_once(".nar").map_or(rest, |(hash, _)| hash);
+  (hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_alphanumeric()))
+    .then_some(hash)
 }
 
 fn relative_nar_url(url: &str) -> &str {
@@ -1161,9 +1222,11 @@ mod tests {
     NarInfo,
     Router,
     RouterTuning,
+    canonical_nar_url,
     filter_rule_matches,
     narinfo_verifies_any_key,
     rewrite_narinfo_url,
+    store_hash_from_canonical_nar_url,
     store_path_name,
     wildcard_match,
   };
@@ -1343,15 +1406,39 @@ mod tests {
     ));
   }
 
-  #[test]
-  fn narinfo_url_to_self_preserves_path_and_query() {
-    let body = b"StorePath: /nix/store/abc-hello\nURL: https://cache.example/nar/abc.nar.xz?token=1\nNarHash: sha256:abc\nNarSize: 1\n";
+  const STORE_HASH: &str = "ad4slq98kiq9ypdd35yfg0bykdwj86ba";
 
-    let rewritten =
-      rewrite_narinfo_url(body, "https://cache.example", NarUrlMode::ToSelf);
+  #[test]
+  fn narinfo_url_to_self_rewrites_to_canonical_path() {
+    // An absolute URL with no `nar/` prefix
+    let body = b"StorePath: /nix/store/abc-hello\nURL: https://blobs.example/ad4slq98kiq9ypdd35yfg0bykdwj86ba-hello-1.0.nar.xz\nNarHash: sha256:abc\nNarSize: 1\n";
+
+    let rewritten = rewrite_narinfo_url(
+      body,
+      "https://cache.example",
+      STORE_HASH,
+      NarUrlMode::ToSelf,
+    );
 
     let rewritten = String::from_utf8(rewritten).unwrap();
-    assert!(rewritten.contains("URL: nar/abc.nar.xz?token=1\n"));
+    assert!(rewritten.contains(&format!("URL: nar/{STORE_HASH}.nar.xz\n")));
+  }
+
+  #[test]
+  fn canonical_nar_url_round_trips() {
+    let url =
+      canonical_nar_url("https://blobs.example/x-foo.nar.zst", STORE_HASH);
+    assert_eq!(url, format!("nar/{STORE_HASH}.nar.zst"));
+    assert_eq!(store_hash_from_canonical_nar_url(&url), Some(STORE_HASH));
+
+    // A `nar/` path keyed on the 52-character NAR hash belongs to an upstream,
+    // so a path NCRO didn't mint must not be taken for one it did.
+    assert_eq!(
+      store_hash_from_canonical_nar_url(
+        "nar/1bpq616dpxk1pn7f9w8pw1zjs9x2q3vv3f8kmc1a9k6ha2b4mmzz.nar.xz"
+      ),
+      None
+    );
   }
 
   #[test]
@@ -1361,6 +1448,7 @@ mod tests {
     let rewritten = rewrite_narinfo_url(
       body,
       "https://cache.example/root/",
+      STORE_HASH,
       NarUrlMode::ToUpstream,
     );
 
@@ -1535,18 +1623,19 @@ mod tests {
       .inner
       .db
       .set_route(&RouteEntry {
-        store_path:    "abc123".to_string(),
-        upstream_url:  upstream.clone(),
-        latency_ms:    5.0,
-        latency_ema:   5.0,
-        last_verified: now,
-        query_count:   1,
-        failure_count: 0,
-        ttl:           now + chrono::Duration::hours(1),
-        nar_hash:      "sha256:abc".to_string(),
-        nar_size:      1,
-        nar_url:       "nar/test.nar.xz".to_string(),
-        narinfo_bytes: None,
+        store_path:       "abc123".to_string(),
+        upstream_url:     upstream.clone(),
+        latency_ms:       5.0,
+        latency_ema:      5.0,
+        last_verified:    now,
+        query_count:      1,
+        failure_count:    0,
+        ttl:              now + chrono::Duration::hours(1),
+        nar_hash:         "sha256:abc".to_string(),
+        nar_size:         1,
+        nar_url:          "nar/test.nar.xz".to_string(),
+        upstream_nar_url: "nar/test.nar.xz".to_string(),
+        narinfo_bytes:    None,
       })
       .await
       .unwrap();
@@ -1598,18 +1687,19 @@ mod tests {
       .inner
       .db
       .set_route(&RouteEntry {
-        store_path:    "abc123".to_string(),
-        upstream_url:  stale.clone(),
-        latency_ms:    5.0,
-        latency_ema:   5.0,
-        last_verified: now,
-        query_count:   1,
-        failure_count: 0,
-        ttl:           now + chrono::Duration::hours(1),
-        nar_hash:      "sha256:abc".to_string(),
-        nar_size:      1,
-        nar_url:       "nar/test.nar.xz".to_string(),
-        narinfo_bytes: None,
+        store_path:       "abc123".to_string(),
+        upstream_url:     stale.clone(),
+        latency_ms:       5.0,
+        latency_ema:      5.0,
+        last_verified:    now,
+        query_count:      1,
+        failure_count:    0,
+        ttl:              now + chrono::Duration::hours(1),
+        nar_hash:         "sha256:abc".to_string(),
+        nar_size:         1,
+        nar_url:          "nar/test.nar.xz".to_string(),
+        upstream_nar_url: "nar/test.nar.xz".to_string(),
+        narinfo_bytes:    None,
       })
       .await
       .unwrap();

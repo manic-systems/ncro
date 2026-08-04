@@ -354,6 +354,7 @@ mod tests {
       nar_hash: "sha256:aabbcc".into(),
       nar_size: 42,
       nar_url: "nar/test.nar".into(),
+      upstream_nar_url: "nar/test.nar".into(),
       narinfo_bytes: None,
     }
   }
