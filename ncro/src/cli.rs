@@ -1,3 +1,5 @@
+use std::io::Write as _;
+
 use ncro_config::{Config, LogFormat};
 use ncro_db::Db;
 use ncro_discovery::Discovery;
@@ -79,18 +81,59 @@ pub struct Args {
   /// Path to the configuration file.
   #[pound(short, long, env = "NCRO_CONFIG")]
   pub config: Option<String>,
+
+  /// Create or read a mesh private key and print its public key.
+  #[pound(long)]
+  pub generate_mesh_key: Option<String>,
+}
+
+enum Command {
+  Serve { config: Option<String> },
+  GenerateMeshKey { path: String },
+}
+
+impl TryFrom<Args> for Command {
+  type Error = anyhow::Error;
+
+  fn try_from(args: Args) -> Result<Self, Self::Error> {
+    match (args.config, args.generate_mesh_key) {
+      (Some(_), Some(_)) => {
+        anyhow::bail!(
+          "--config and --generate-mesh-key cannot be used together"
+        )
+      },
+      (None, Some(path)) if path.is_empty() => {
+        anyhow::bail!("--generate-mesh-key requires a non-empty path")
+      },
+      (None, Some(path)) => Ok(Self::GenerateMeshKey { path }),
+      (config, None) => Ok(Self::Serve { config }),
+    }
+  }
 }
 
 pub async fn run() -> anyhow::Result<()> {
-  let args = Args::parse();
+  match Command::try_from(Args::parse())? {
+    Command::Serve { config } => serve(config.as_deref()).await,
+    Command::GenerateMeshKey { path } => {
+      let node = ncro_mesh::Node::new(&path).await?;
+      writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        hex::encode(node.public_key())
+      )?;
+      Ok(())
+    },
+  }
+}
 
+async fn serve(config: Option<&str>) -> anyhow::Result<()> {
   // Config loading happens before we know the configured log level/format, so
   // buffer any diagnostics it emits and replay them once logging is set up.
   let buffer = BufferLayer::default();
   let cfg = {
     let subscriber = tracing_subscriber::registry().with(buffer.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
-    let cfg = Config::load(args.config.as_deref())?;
+    let cfg = Config::load(config)?;
     cfg.validate()?;
     cfg
   };

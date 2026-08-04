@@ -16,7 +16,7 @@ rand.workspace      = true
 rmp-serde.workspace = true
 serde               = { workspace = true, features = [ "derive" ] }
 thiserror.workspace = true
-tokio               = { workspace = true, features = [ "fs", "macros", "net", "rt", "sync", "time" ] }
+tokio               = { workspace = true, features = [ "fs", "io-util", "macros", "net", "rt", "sync", "time" ] }
 tracing.workspace   = true
 
 [lints]

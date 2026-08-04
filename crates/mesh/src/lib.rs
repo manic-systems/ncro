@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+  path::{Path, PathBuf},
+  sync::Arc,
+};
 
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -6,7 +9,7 @@ use ncro_db::{Db, RouteEntry};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{net::UdpSocket, time::Duration};
+use tokio::{io::AsyncWriteExt, net::UdpSocket, time::Duration};
 
 const MAX_PACKET_SIZE: usize = 1_400;
 const HEADER_SIZE: usize = 96;
@@ -73,11 +76,13 @@ impl Node {
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
       Err(err) => return Err(MeshError::Io(err)),
     }
-    if let Some(parent) = Path::new(key_path).parent() {
+    if let Some(parent) = Path::new(key_path).parent()
+      && !parent.as_os_str().is_empty()
+    {
       tokio::fs::create_dir_all(parent).await?;
     }
     let key = SigningKey::from_bytes(&random_key_bytes());
-    tokio::fs::write(key_path, key.to_bytes()).await?;
+    write_new_key(Path::new(key_path), &key.to_bytes()).await?;
     Ok(Self {
       signing_key: Arc::new(key),
     })
@@ -101,6 +106,36 @@ impl Node {
       self.signing_key.sign(&body).to_bytes().to_vec(),
     ))
   }
+}
+
+async fn write_new_key(
+  key_path: &Path,
+  key_bytes: &[u8; 32],
+) -> Result<(), std::io::Error> {
+  let temp_path = temporary_key_path(key_path);
+  let mut options = tokio::fs::OpenOptions::new();
+  options.write(true).create_new(true);
+  #[cfg(unix)]
+  {
+    options.mode(0o600);
+  }
+  let mut file = options.open(&temp_path).await?;
+  let write_result = async {
+    file.write_all(key_bytes).await?;
+    file.sync_all().await?;
+    tokio::fs::hard_link(&temp_path, key_path).await
+  }
+  .await;
+  drop(file);
+  let cleanup_result = tokio::fs::remove_file(temp_path).await;
+  write_result?;
+  cleanup_result
+}
+
+fn temporary_key_path(key_path: &Path) -> PathBuf {
+  let mut path = key_path.as_os_str().to_os_string();
+  path.push(format!(".{}.tmp", hex::encode(random_key_bytes())));
+  path.into()
 }
 
 fn random_key_bytes() -> [u8; 32] {
@@ -256,13 +291,44 @@ fn decode_packet(packet: &[u8]) -> Result<DecodedPacket<'_>, MeshError> {
 
 #[cfg(test)]
 mod tests {
-  use std::time::Duration;
+  use std::{
+    env,
+    error::Error,
+    process,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+  };
 
   use ncro_db::{Db, RouteEntry};
 
-  use super::merge_routes;
+  use super::{Node, merge_routes};
 
   const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
+
+  #[tokio::test]
+  async fn node_generates_and_reloads_private_key() -> Result<(), Box<dyn Error>>
+  {
+    let path = env::temp_dir().join(format!(
+      "ncro-mesh-key-{}-{}",
+      process::id(),
+      SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let path = path.to_string_lossy();
+
+    let generated = Node::new(&path).await?;
+    let reloaded = Node::new(&path).await?;
+
+    assert_eq!(generated.public_key(), reloaded.public_key());
+    let metadata = tokio::fs::metadata(path.as_ref()).await?;
+    assert_eq!(metadata.len(), 32);
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let mode = metadata.permissions().mode();
+      assert_eq!(mode & 0o777, 0o600);
+    }
+    tokio::fs::remove_file(path.as_ref()).await?;
+    Ok(())
+  }
 
   fn route(store_path: &str, latency_ema: f64, ttl_secs: i64) -> RouteEntry {
     let now = chrono::Utc::now();

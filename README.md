@@ -542,8 +542,18 @@ addr = "100.64.1.3:7946"
 public_key = "d4e5f6..."
 ```
 
-The node logs its public key on startup (`mesh node identity` log line). You can
-share it with peers so they can add it to their config.
+Generate the key before starting ncro and capture its public key with:
+
+```bash
+$ ncro --generate-mesh-key /var/lib/ncro/node.key
+a1b2c3...
+```
+
+The command creates the private key if it does not exist, or reads the existing
+key, and prints the hex-encoded public key. New key files use mode `0600` on
+Unix. Configure the same path as `mesh.private_key` and share only the printed
+public key with peers. ncro also logs the public key on startup in the
+`mesh node identity` log line.
 
 > [!TIP]
 > Keep mesh traffic on a private network. The gossip protocol is signed, but it
