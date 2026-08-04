@@ -29,18 +29,20 @@ pub enum DbError {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteEntry {
-  pub store_path:    String,
-  pub upstream_url:  String,
-  pub latency_ms:    f64,
-  pub latency_ema:   f64,
-  pub last_verified: DateTime<Utc>,
-  pub query_count:   u32,
-  pub failure_count: u32,
-  pub ttl:           DateTime<Utc>,
-  pub nar_hash:      String,
-  pub nar_size:      u64,
-  pub nar_url:       String,
-  pub narinfo_bytes: Option<Vec<u8>>,
+  pub store_path:       String,
+  pub upstream_url:     String,
+  pub latency_ms:       f64,
+  pub latency_ema:      f64,
+  pub last_verified:    DateTime<Utc>,
+  pub query_count:      u32,
+  pub failure_count:    u32,
+  pub ttl:              DateTime<Utc>,
+  pub nar_hash:         String,
+  pub nar_size:         u64,
+  pub nar_url:          String,
+  /// The upstream's own path, since `nar_url` is canonical.
+  pub upstream_nar_url: String,
+  pub narinfo_bytes:    Option<Vec<u8>>,
 }
 
 impl RouteEntry {
@@ -119,7 +121,7 @@ impl Db {
   ) -> Result<Option<RouteEntry>, DbError> {
     let row = sqlx::query(
             r"SELECT store_path, upstream_url, latency_ms, latency_ema, query_count, failure_count,
-                      last_verified, ttl, nar_hash, nar_size, nar_url, narinfo_bytes
+                      last_verified, ttl, nar_hash, nar_size, nar_url, upstream_nar_url, narinfo_bytes
                  FROM routes WHERE store_path = ?",
         )
         .bind(store_path)
@@ -137,7 +139,7 @@ impl Db {
   ) -> Result<Option<RouteEntry>, DbError> {
     let row = sqlx::query(
             r"SELECT store_path, upstream_url, latency_ms, latency_ema, query_count, failure_count,
-                      last_verified, ttl, nar_hash, nar_size, nar_url, narinfo_bytes
+                      last_verified, ttl, nar_hash, nar_size, nar_url, upstream_nar_url, narinfo_bytes
                  FROM routes WHERE nar_url = ? AND ttl > ?",
         )
         .bind(nar_url)
@@ -155,8 +157,8 @@ impl Db {
     sqlx::query(
             r"INSERT INTO routes
                (store_path, upstream_url, latency_ms, latency_ema, query_count, failure_count,
-                last_verified, ttl, nar_hash, nar_size, nar_url, narinfo_bytes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_verified, ttl, nar_hash, nar_size, nar_url, upstream_nar_url, narinfo_bytes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(store_path) DO UPDATE SET
                  upstream_url = excluded.upstream_url,
                  latency_ms = excluded.latency_ms,
@@ -168,6 +170,7 @@ impl Db {
                  nar_hash = excluded.nar_hash,
                  nar_size = excluded.nar_size,
                  nar_url = excluded.nar_url,
+                 upstream_nar_url = excluded.upstream_nar_url,
                  narinfo_bytes = excluded.narinfo_bytes",
         )
         .bind(&entry.store_path)
@@ -181,6 +184,7 @@ impl Db {
         .bind(&entry.nar_hash)
         .bind(i64::try_from(entry.nar_size).unwrap_or(i64::MAX))
         .bind(&entry.nar_url)
+        .bind(&entry.upstream_nar_url)
         .bind(&entry.narinfo_bytes)
         .execute(&self.pool)
         .await?;
@@ -212,7 +216,7 @@ impl Db {
   ) -> Result<Vec<RouteEntry>, DbError> {
     let rows = sqlx::query(
             r"SELECT store_path, upstream_url, latency_ms, latency_ema, query_count, failure_count,
-                      last_verified, ttl, nar_hash, nar_size, nar_url, narinfo_bytes
+                      last_verified, ttl, nar_hash, nar_size, nar_url, upstream_nar_url, narinfo_bytes
                  FROM routes WHERE ttl > ? ORDER BY last_verified DESC LIMIT ?",
         )
         .bind(Utc::now().timestamp())
@@ -433,6 +437,13 @@ async fn migrate(pool: &SqlitePool) -> Result<(), DbError> {
   .execute(pool)
   .await?;
   add_column_if_missing(pool, "routes", "narinfo_bytes", "BLOB").await?;
+  add_column_if_missing(
+    pool,
+    "routes",
+    "upstream_nar_url",
+    "TEXT NOT NULL DEFAULT ''",
+  )
+  .await?;
   Ok(())
 }
 
@@ -441,26 +452,27 @@ fn row_to_route(row: &sqlx::sqlite::SqliteRow) -> Result<RouteEntry, DbError> {
   let failure_count = row.get::<i64, _>("failure_count");
   let nar_size = row.get::<i64, _>("nar_size");
   Ok(RouteEntry {
-    store_path:    row.get("store_path"),
-    upstream_url:  row.get("upstream_url"),
-    latency_ms:    row.get("latency_ms"),
-    latency_ema:   row.get("latency_ema"),
-    query_count:   u32::try_from(query_count).map_err(|_| {
+    store_path:       row.get("store_path"),
+    upstream_url:     row.get("upstream_url"),
+    latency_ms:       row.get("latency_ms"),
+    latency_ema:      row.get("latency_ema"),
+    query_count:      u32::try_from(query_count).map_err(|_| {
       DbError::InvalidData(format!("query_count out of range: {query_count}"))
     })?,
-    failure_count: u32::try_from(failure_count).map_err(|_| {
+    failure_count:    u32::try_from(failure_count).map_err(|_| {
       DbError::InvalidData(format!(
         "failure_count out of range: {failure_count}"
       ))
     })?,
-    last_verified: timestamp(row.get("last_verified"), "last_verified")?,
-    ttl:           timestamp(row.get("ttl"), "ttl")?,
-    nar_hash:      row.get("nar_hash"),
-    nar_size:      u64::try_from(nar_size).map_err(|_| {
+    last_verified:    timestamp(row.get("last_verified"), "last_verified")?,
+    ttl:              timestamp(row.get("ttl"), "ttl")?,
+    nar_hash:         row.get("nar_hash"),
+    nar_size:         u64::try_from(nar_size).map_err(|_| {
       DbError::InvalidData(format!("nar_size out of range: {nar_size}"))
     })?,
-    nar_url:       row.get("nar_url"),
-    narinfo_bytes: row.get("narinfo_bytes"),
+    nar_url:          row.get("nar_url"),
+    upstream_nar_url: row.get("upstream_nar_url"),
+    narinfo_bytes:    row.get("narinfo_bytes"),
   })
 }
 
@@ -496,18 +508,19 @@ mod tests {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let entry = RouteEntry {
-      store_path:    "abc123".into(),
-      upstream_url:  "https://cache.nixos.org".into(),
-      latency_ms:    10.0,
-      latency_ema:   10.0,
-      last_verified: now,
-      query_count:   1,
-      failure_count: 0,
-      ttl:           now + chrono::Duration::hours(1),
-      nar_hash:      "sha256:abc".into(),
-      nar_size:      42,
-      nar_url:       "nar/abc.nar.xz".into(),
-      narinfo_bytes: None,
+      store_path:       "abc123".into(),
+      upstream_url:     "https://cache.nixos.org".into(),
+      latency_ms:       10.0,
+      latency_ema:      10.0,
+      last_verified:    now,
+      query_count:      1,
+      failure_count:    0,
+      ttl:              now + chrono::Duration::hours(1),
+      nar_hash:         "sha256:abc".into(),
+      nar_size:         42,
+      nar_url:          "nar/abc.nar.xz".into(),
+      upstream_nar_url: "nar/abc.nar.xz".into(),
+      narinfo_bytes:    None,
     };
     db.set_route(&entry).await?;
     let got = db
@@ -527,18 +540,19 @@ mod tests {
     let now = Utc::now();
     let bytes = b"StorePath: /nix/store/abc\n".to_vec();
     let entry = RouteEntry {
-      store_path:    "abc".into(),
-      upstream_url:  "https://cache.nixos.org".into(),
-      latency_ms:    1.0,
-      latency_ema:   1.0,
-      last_verified: now,
-      query_count:   1,
-      failure_count: 0,
-      ttl:           now + chrono::Duration::hours(1),
-      nar_hash:      "sha256:abc".into(),
-      nar_size:      26,
-      nar_url:       "nar/abc.nar".into(),
-      narinfo_bytes: Some(bytes.clone()),
+      store_path:       "abc".into(),
+      upstream_url:     "https://cache.nixos.org".into(),
+      latency_ms:       1.0,
+      latency_ema:      1.0,
+      last_verified:    now,
+      query_count:      1,
+      failure_count:    0,
+      ttl:              now + chrono::Duration::hours(1),
+      nar_hash:         "sha256:abc".into(),
+      nar_size:         26,
+      nar_url:          "nar/abc.nar".into(),
+      upstream_nar_url: "nar/abc.nar".into(),
+      narinfo_bytes:    Some(bytes.clone()),
     };
     db.set_route(&entry).await?;
     let got = db
@@ -554,18 +568,19 @@ mod tests {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let entry = RouteEntry {
-      store_path:    "aaa".into(),
-      upstream_url:  "https://cache.nixos.org".into(),
-      latency_ms:    1.0,
-      latency_ema:   1.0,
-      last_verified: now,
-      query_count:   1,
-      failure_count: 0,
-      ttl:           now + chrono::Duration::hours(1),
-      nar_hash:      "sha256:x".into(),
-      nar_size:      1,
-      nar_url:       "nar/x.nar".into(),
-      narinfo_bytes: None,
+      store_path:       "aaa".into(),
+      upstream_url:     "https://cache.nixos.org".into(),
+      latency_ms:       1.0,
+      latency_ema:      1.0,
+      last_verified:    now,
+      query_count:      1,
+      failure_count:    0,
+      ttl:              now + chrono::Duration::hours(1),
+      nar_hash:         "sha256:x".into(),
+      nar_size:         1,
+      nar_url:          "nar/x.nar".into(),
+      upstream_nar_url: "nar/x.nar".into(),
+      narinfo_bytes:    None,
     };
     db.set_route(&entry).await?;
     let db = Arc::new(db);
@@ -603,18 +618,19 @@ mod tests {
         tokio::spawn(async move {
           let now = Utc::now();
           let entry = RouteEntry {
-            store_path:    format!("hash{i}"),
-            upstream_url:  "https://cache.nixos.org".into(),
-            latency_ms:    1.0,
-            latency_ema:   1.0,
-            last_verified: now,
-            query_count:   1,
-            failure_count: 0,
-            ttl:           now + chrono::Duration::hours(1),
-            nar_hash:      format!("sha256:{i}"),
-            nar_size:      1,
-            nar_url:       format!("nar/{i}.nar"),
-            narinfo_bytes: None,
+            store_path:       format!("hash{i}"),
+            upstream_url:     "https://cache.nixos.org".into(),
+            latency_ms:       1.0,
+            latency_ema:      1.0,
+            last_verified:    now,
+            query_count:      1,
+            failure_count:    0,
+            ttl:              now + chrono::Duration::hours(1),
+            nar_hash:         format!("sha256:{i}"),
+            nar_size:         1,
+            nar_url:          format!("nar/{i}.nar"),
+            upstream_nar_url: format!("nar/{i}.nar"),
+            narinfo_bytes:    None,
           };
           barrier.wait().await;
           db.set_route(&entry).await?;
@@ -643,18 +659,19 @@ mod tests {
   fn expired_route_is_not_valid() {
     let now = Utc::now();
     let entry = RouteEntry {
-      store_path:    "abc".into(),
-      upstream_url:  "https://cache.nixos.org".into(),
-      latency_ms:    1.0,
-      latency_ema:   1.0,
-      last_verified: now,
-      query_count:   1,
-      failure_count: 0,
-      ttl:           now - chrono::Duration::seconds(1),
-      nar_hash:      "sha256:abc".into(),
-      nar_size:      1,
-      nar_url:       "nar/abc.nar".into(),
-      narinfo_bytes: None,
+      store_path:       "abc".into(),
+      upstream_url:     "https://cache.nixos.org".into(),
+      latency_ms:       1.0,
+      latency_ema:      1.0,
+      last_verified:    now,
+      query_count:      1,
+      failure_count:    0,
+      ttl:              now - chrono::Duration::seconds(1),
+      nar_hash:         "sha256:abc".into(),
+      nar_size:         1,
+      nar_url:          "nar/abc.nar".into(),
+      upstream_nar_url: "nar/abc.nar".into(),
+      narinfo_bytes:    None,
     };
     assert!(!entry.is_valid());
     let fresh = RouteEntry {
@@ -669,18 +686,19 @@ mod tests {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let entry = RouteEntry {
-      store_path:    "exp".into(),
-      upstream_url:  "https://cache.nixos.org".into(),
-      latency_ms:    1.0,
-      latency_ema:   1.0,
-      last_verified: now,
-      query_count:   1,
-      failure_count: 0,
-      ttl:           now - chrono::Duration::seconds(1),
-      nar_hash:      "sha256:exp".into(),
-      nar_size:      1,
-      nar_url:       "nar/exp.nar".into(),
-      narinfo_bytes: None,
+      store_path:       "exp".into(),
+      upstream_url:     "https://cache.nixos.org".into(),
+      latency_ms:       1.0,
+      latency_ema:      1.0,
+      last_verified:    now,
+      query_count:      1,
+      failure_count:    0,
+      ttl:              now - chrono::Duration::seconds(1),
+      nar_hash:         "sha256:exp".into(),
+      nar_size:         1,
+      nar_url:          "nar/exp.nar".into(),
+      upstream_nar_url: "nar/exp.nar".into(),
+      narinfo_bytes:    None,
     };
     db.set_route(&entry).await?;
     assert!(
@@ -695,23 +713,25 @@ mod tests {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let expired = RouteEntry {
-      store_path:    "stale".into(),
-      upstream_url:  "https://cache.nixos.org".into(),
-      latency_ms:    1.0,
-      latency_ema:   1.0,
-      last_verified: now,
-      query_count:   1,
-      failure_count: 0,
-      ttl:           now - chrono::Duration::seconds(1),
-      nar_hash:      "sha256:stale".into(),
-      nar_size:      1,
-      nar_url:       "nar/stale.nar".into(),
-      narinfo_bytes: None,
+      store_path:       "stale".into(),
+      upstream_url:     "https://cache.nixos.org".into(),
+      latency_ms:       1.0,
+      latency_ema:      1.0,
+      last_verified:    now,
+      query_count:      1,
+      failure_count:    0,
+      ttl:              now - chrono::Duration::seconds(1),
+      nar_hash:         "sha256:stale".into(),
+      nar_size:         1,
+      nar_url:          "nar/stale.nar".into(),
+      upstream_nar_url: "nar/stale.nar".into(),
+      narinfo_bytes:    None,
     };
     let fresh = RouteEntry {
       store_path: "fresh".into(),
       nar_hash: "sha256:fresh".into(),
       nar_url: "nar/fresh.nar".into(),
+      upstream_nar_url: "nar/fresh.nar".into(),
       ttl: now + chrono::Duration::hours(1),
       ..expired.clone()
     };
@@ -733,18 +753,19 @@ mod tests {
     // 100 writes triggers eviction at write #100 (count 99 mod 100 == 99)
     for i in 0..100u64 {
       let entry = RouteEntry {
-        store_path:    format!("hash{i}"),
-        upstream_url:  "https://cache.nixos.org".into(),
-        latency_ms:    1.0,
-        latency_ema:   1.0,
-        last_verified: now,
-        query_count:   1,
-        failure_count: 0,
-        ttl:           now + chrono::Duration::hours(1),
-        nar_hash:      format!("sha256:{i}"),
-        nar_size:      1,
-        nar_url:       format!("nar/{i}.nar"),
-        narinfo_bytes: None,
+        store_path:       format!("hash{i}"),
+        upstream_url:     "https://cache.nixos.org".into(),
+        latency_ms:       1.0,
+        latency_ema:      1.0,
+        last_verified:    now,
+        query_count:      1,
+        failure_count:    0,
+        ttl:              now + chrono::Duration::hours(1),
+        nar_hash:         format!("sha256:{i}"),
+        nar_size:         1,
+        nar_url:          format!("nar/{i}.nar"),
+        upstream_nar_url: format!("nar/{i}.nar"),
+        narinfo_bytes:    None,
       };
       db.set_route(&entry).await?;
     }
@@ -761,18 +782,19 @@ mod tests {
     let now = Utc::now();
     for i in 0..3u64 {
       let entry = RouteEntry {
-        store_path:    format!("hash{i}"),
-        upstream_url:  "https://cache.nixos.org".into(),
-        latency_ms:    1.0,
-        latency_ema:   1.0,
-        last_verified: now,
-        query_count:   1,
-        failure_count: 0,
-        ttl:           now + chrono::Duration::hours(1),
-        nar_hash:      format!("sha256:{i}"),
-        nar_size:      1,
-        nar_url:       format!("nar/{i}.nar"),
-        narinfo_bytes: None,
+        store_path:       format!("hash{i}"),
+        upstream_url:     "https://cache.nixos.org".into(),
+        latency_ms:       1.0,
+        latency_ema:      1.0,
+        last_verified:    now,
+        query_count:      1,
+        failure_count:    0,
+        ttl:              now + chrono::Duration::hours(1),
+        nar_hash:         format!("sha256:{i}"),
+        nar_size:         1,
+        nar_url:          format!("nar/{i}.nar"),
+        upstream_nar_url: format!("nar/{i}.nar"),
+        narinfo_bytes:    None,
       };
       db.set_route(&entry).await?;
     }

@@ -682,9 +682,9 @@ pub enum FilterField {
 #[serde(rename_all = "snake_case")]
 pub enum NarUrlMode {
   /// Return the upstream narinfo `URL:` line unchanged.
-  #[default]
   Keep,
-  /// Rewrite `URL:` to a relative path so Nix fetches NARs through NCRO.
+  /// Rewrite `URL:` to a canonical `nar/<store-hash>` path served by NCRO.
+  #[default]
   ToSelf,
   /// Rewrite `URL:` to an absolute URL rooted at the selected upstream.
   ToUpstream,

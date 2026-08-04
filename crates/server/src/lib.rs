@@ -16,7 +16,7 @@ use futures_util::TryStreamExt;
 use ncro_config::UpstreamConfig;
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
-use ncro_router::{Router, RouterError};
+use ncro_router::{Router, RouterError, store_hash_from_canonical_nar_url};
 use ncro_s3::S3ClientPool;
 use serde::Serialize;
 use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
@@ -271,16 +271,42 @@ async fn nar(
     .map_or_else(|| req.uri().path(), axum::http::uri::PathAndQuery::as_str)
     .to_string();
 
-  if let Ok(Some(entry)) = state.db.get_route_by_nar_url(&nar_url).await
-    && entry.is_valid()
-    && let Some(resp) = try_nar_upstream(
+  let routed_upstream = 'routed: {
+    let Ok(Some(entry)) = state.db.get_route_by_nar_url(&nar_url).await else {
+      break 'routed None;
+    };
+    if !entry.is_valid() {
+      break 'routed None;
+    }
+    let upstream_path = if entry.upstream_nar_url.is_empty() {
+      &path_and_query
+    } else {
+      &entry.upstream_nar_url
+    };
+    if let Some(resp) = try_nar_upstream(
       state.nar_client(&entry.upstream_url),
       &state.s3,
       req.method().clone(),
       req.headers(),
       &entry.upstream_url,
-      &path_and_query,
+      upstream_path,
       upstream_auth(&state, &entry.upstream_url),
+    )
+    .await
+    {
+      return resp;
+    }
+    Some(entry.upstream_url)
+  };
+
+  // Only a canonical path carries the store hash the other upstreams need.
+  if let Some(store_hash) = store_hash_from_canonical_nar_url(&nar_url)
+    && let Some(resp) = retry_by_store_hash(
+      &state,
+      store_hash,
+      req.method(),
+      req.headers(),
+      routed_upstream.as_deref(),
     )
     .await
   {
@@ -328,6 +354,49 @@ async fn nar(
     return resp;
   }
   StatusCode::NOT_FOUND.into_response()
+}
+
+async fn retry_by_store_hash(
+  state: &AppState,
+  store_hash: &str,
+  method: &Method,
+  headers: &HeaderMap,
+  skip: Option<&str>,
+) -> Option<Response> {
+  let mut by_priority = BTreeMap::<i32, Vec<UpstreamHealth>>::new();
+  for h in state.prober.sorted_by_latency().await {
+    if h.status == Status::Down || Some(h.url.as_str()) == skip {
+      continue;
+    }
+    by_priority.entry(h.priority).or_default().push(h);
+  }
+  for (_priority, group) in by_priority {
+    for h in group {
+      let Ok(path) = state.router.upstream_nar_path(&h.url, store_hash).await
+      else {
+        continue;
+      };
+      if let Some(resp) = try_nar_upstream(
+        state.nar_client(&h.url),
+        &state.s3,
+        method.clone(),
+        headers,
+        &h.url,
+        &path,
+        upstream_auth(state, &h.url),
+      )
+      .await
+      {
+        tracing::warn!(
+          store = store_hash,
+          upstream = h.url,
+          "nar re-routed after primary upstream failed"
+        );
+        return Some(resp);
+      }
+    }
+  }
+  None
 }
 
 async fn try_fallback_narinfo(
