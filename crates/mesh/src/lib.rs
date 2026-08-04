@@ -256,9 +256,13 @@ fn decode_packet(packet: &[u8]) -> Result<DecodedPacket<'_>, MeshError> {
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use ncro_db::{Db, RouteEntry};
 
   use super::merge_routes;
+
+  const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
 
   fn route(store_path: &str, latency_ema: f64, ttl_secs: i64) -> RouteEntry {
     let now = chrono::Utc::now();
@@ -281,7 +285,7 @@ mod tests {
   #[tokio::test]
   async fn merge_routes_inserts_new_route()
   -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     merge_routes(&db, vec![route("abc123", 10.0, 3600)]).await;
     assert!(db.get_route("abc123").await?.is_some());
     Ok(())
@@ -290,7 +294,7 @@ mod tests {
   #[tokio::test]
   async fn merge_routes_skips_expired_route()
   -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     merge_routes(&db, vec![route("abc123", 10.0, -1)]).await;
     assert!(db.get_route("abc123").await?.is_none());
     Ok(())
@@ -299,7 +303,7 @@ mod tests {
   #[tokio::test]
   async fn merge_routes_does_not_overwrite_lower_latency()
   -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     db.set_route(&route("abc123", 5.0, 3600)).await?;
     merge_routes(&db, vec![route("abc123", 20.0, 3600)]).await;
     let got = db
@@ -317,7 +321,7 @@ mod tests {
   #[tokio::test]
   async fn merge_routes_overwrites_higher_latency()
   -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     db.set_route(&route("abc123", 20.0, 3600)).await?;
     merge_routes(&db, vec![route("abc123", 5.0, 3600)]).await;
     let got = db

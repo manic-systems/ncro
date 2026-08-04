@@ -36,6 +36,7 @@ ed25519-dalek      = "3.0.0"
 futures-util       = "0.3.32"
 hex                = "0.4.3"
 humantime-serde    = "1.1.1"
+log                = "0.4.29"
 mdns-sd            = "0.20.0"
 moka               = { version = "0.12.15", features = [ "future" ] }
 pound              = "0.1.6"

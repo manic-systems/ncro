@@ -5,8 +5,8 @@ write_timeout = "30s"
 
 [[upstreams]]
 priority   = 10
-url        = "https://cache.nixos.org"
 public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+url        = "https://cache.nixos.org"
 # Pull-through caches may need to accept multiple narinfo signers:
 # public_keys = [
 #   "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
@@ -42,15 +42,16 @@ url      = "https://nix-community.cachix.org"
 # and s3:// URLs are accepted like regular upstreams.
 [fallback_cache]
 enabled    = false
-url        = "https://cache.nixos.org"
 public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+url        = "https://cache.nixos.org"
 
 [cache]
-db_path       = "/var/lib/ncro/routes.db"
-latency_alpha = 0.3
-max_entries   = 100000
-negative_ttl  = "10m"
-ttl           = "1h"
+db_path                  = "/var/lib/ncro/routes.db"
+latency_alpha            = 0.3
+max_entries              = 100000
+negative_ttl             = "10m"
+slow_statement_threshold = "5s"
+ttl                      = "1h"
 
 [cache.mass_query]
 in_memory_negative_ttl    = "5s"

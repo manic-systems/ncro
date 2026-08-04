@@ -2150,6 +2150,7 @@ name = "ncro-db"
 version = "2.2.2"
 dependencies = [
  "chrono",
+ "log",
  "serde",
  "sqlx",
  "thiserror 2.0.19",

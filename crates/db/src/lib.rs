@@ -9,6 +9,7 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::{
+  ConnectOptions,
   Row,
   SqlitePool,
   sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -70,7 +71,11 @@ impl Db {
   ///
   /// Returns [`DbError`] if the database directory cannot be created, the
   /// connection pool fails to open, or the schema migration fails.
-  pub async fn open(path: &str, max_entries: i64) -> Result<Self, DbError> {
+  pub async fn open(
+    path: &str,
+    max_entries: i64,
+    slow_statement_threshold: Duration,
+  ) -> Result<Self, DbError> {
     if path != ":memory:"
       && let Some(parent) = Path::new(path).parent()
     {
@@ -85,7 +90,8 @@ impl Db {
         .create_if_missing(true)
     }
     .journal_mode(SqliteJournalMode::Wal)
-    .busy_timeout(Duration::from_secs(5));
+    .busy_timeout(Duration::from_secs(5))
+    .log_slow_statements(log::LevelFilter::Warn, slow_statement_threshold);
 
     // In-memory databases are per-connection; use a single connection so all
     // operations share the same database. File-based WAL allows concurrent
@@ -483,9 +489,11 @@ mod tests {
 
   use super::*;
 
+  const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
+
   #[tokio::test]
   async fn route_roundtrip_and_negative_cache() -> Result<(), DbError> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let entry = RouteEntry {
       store_path:    "abc123".into(),
@@ -515,7 +523,7 @@ mod tests {
 
   #[tokio::test]
   async fn narinfo_bytes_roundtrip() -> Result<(), DbError> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let bytes = b"StorePath: /nix/store/abc\n".to_vec();
     let entry = RouteEntry {
@@ -543,7 +551,7 @@ mod tests {
 
   #[tokio::test]
   async fn concurrent_reads_do_not_deadlock() -> Result<(), Box<dyn Error>> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let entry = RouteEntry {
       store_path:    "aaa".into(),
@@ -585,7 +593,7 @@ mod tests {
       .to_string_lossy()
       .into_owned();
     let _ = fs::remove_file(&path);
-    let db = Arc::new(Db::open(&path, 100).await?);
+    let db = Arc::new(Db::open(&path, 100, SLOW_STATEMENT_THRESHOLD).await?);
     let barrier = Arc::new(Barrier::new(65));
 
     let handles: Vec<_> = (0..64_u64)
@@ -658,7 +666,7 @@ mod tests {
 
   #[tokio::test]
   async fn get_route_by_nar_url_rejects_expired_ttl() -> Result<(), DbError> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let entry = RouteEntry {
       store_path:    "exp".into(),
@@ -684,7 +692,7 @@ mod tests {
 
   #[tokio::test]
   async fn expire_old_routes_removes_stale_entries() -> Result<(), DbError> {
-    let db = Db::open(":memory:", 100).await?;
+    let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     let expired = RouteEntry {
       store_path:    "stale".into(),
@@ -720,7 +728,7 @@ mod tests {
   #[tokio::test]
   async fn eviction_bounds_table_size() -> Result<(), DbError> {
     let max: i64 = 3;
-    let db = Db::open(":memory:", max).await?;
+    let db = Db::open(":memory:", max, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     // 100 writes triggers eviction at write #100 (count 99 mod 100 == 99)
     for i in 0..100u64 {
@@ -749,7 +757,7 @@ mod tests {
 
   #[tokio::test]
   async fn eviction_is_throttled() -> Result<(), DbError> {
-    let db = Db::open(":memory:", 2).await?;
+    let db = Db::open(":memory:", 2, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Utc::now();
     for i in 0..3u64 {
       let entry = RouteEntry {

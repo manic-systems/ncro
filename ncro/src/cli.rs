@@ -104,7 +104,12 @@ pub async fn run() -> anyhow::Result<()> {
 
   let _ = ncro_metrics::get();
 
-  let db = Db::open(&cfg.cache.db_path, cfg.cache.max_entries).await?;
+  let db = Db::open(
+    &cfg.cache.db_path,
+    cfg.cache.max_entries,
+    cfg.cache.slow_statement_threshold.0,
+  )
+  .await?;
   let prober = Prober::new(cfg.cache.latency_alpha)?;
   prober.init_upstreams(&cfg.upstreams).await;
   for row in db.load_all_health().await.unwrap_or_default() {

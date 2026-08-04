@@ -236,6 +236,7 @@ mod tests {
     let cfg = Config::load(None)?;
     assert_eq!(cfg.server.listen, ":8080");
     assert_eq!(cfg.cache.max_entries, 100_000);
+    assert_eq!(cfg.cache.slow_statement_threshold.0, Duration::from_secs(1));
     assert_eq!(cfg.upstreams.len(), 1);
     assert!(!cfg.fallback_cache.enabled);
     assert_eq!(cfg.fallback_cache.upstream.url, "https://cache.nixos.org");
@@ -246,10 +247,12 @@ mod tests {
   #[test]
   fn parses_duration_toml() -> Result<(), toml::de::Error> {
     let cfg: Config = toml::from_str(
-      "[server]\ncache_priority = 40\n\n[cache]\nttl = \"2h\"\n",
+      "[server]\ncache_priority = 40\n\n[cache]\nttl = \
+       \"2h\"\nslow_statement_threshold = \"5s\"\n",
     )?;
     assert_eq!(cfg.server.cache_priority, 40);
     assert_eq!(cfg.cache.ttl.0, Duration::from_hours(2));
+    assert_eq!(cfg.cache.slow_statement_threshold.0, Duration::from_secs(5));
     Ok(())
   }
 
@@ -802,23 +805,25 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CacheConfig {
-  pub db_path:       String,
-  pub max_entries:   i64,
-  pub ttl:           HumanDuration,
-  pub negative_ttl:  HumanDuration,
-  pub latency_alpha: f64,
-  pub mass_query:    MassQueryConfig,
+  pub db_path:                  String,
+  pub max_entries:              i64,
+  pub ttl:                      HumanDuration,
+  pub negative_ttl:             HumanDuration,
+  pub latency_alpha:            f64,
+  pub slow_statement_threshold: HumanDuration,
+  pub mass_query:               MassQueryConfig,
 }
 
 impl Default for CacheConfig {
   fn default() -> Self {
     Self {
-      db_path:       "/var/lib/ncro/routes.db".to_string(),
-      max_entries:   100_000,
-      ttl:           HumanDuration(Duration::from_hours(1)),
-      negative_ttl:  HumanDuration(Duration::from_mins(10)),
-      latency_alpha: 0.3,
-      mass_query:    MassQueryConfig::default(),
+      db_path:                  "/var/lib/ncro/routes.db".to_string(),
+      max_entries:              100_000,
+      ttl:                      HumanDuration(Duration::from_hours(1)),
+      negative_ttl:             HumanDuration(Duration::from_mins(10)),
+      latency_alpha:            0.3,
+      slow_statement_threshold: HumanDuration(Duration::from_secs(1)),
+      mass_query:               MassQueryConfig::default(),
     }
   }
 }

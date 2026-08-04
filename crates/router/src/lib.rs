@@ -1172,7 +1172,9 @@ mod tests {
     cooldown: Duration,
     upstreams: &[UpstreamConfig],
   ) -> Router {
-    let db = Db::open(":memory:", 100).await.unwrap();
+    let db = Db::open(":memory:", 100, Duration::from_secs(1))
+      .await
+      .unwrap();
     let prober = Prober::new(0.3).unwrap();
     prober.init_upstreams(upstreams).await;
     Router::new(
