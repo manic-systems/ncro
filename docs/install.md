@@ -151,6 +151,33 @@ By default, the module appends every non-empty
 you may set `services.ncro.addUpstreamPublicKeys` to false. The option defaults
 to true.
 
+### Multiple instances
+
+To serve different caches from one machine, declare named instances. The module
+starts the `ncro@.service` template as `ncro@<name>.service` and gives it an
+isolated `/var/lib/ncro-<name>` state directory for each one. Each instance must
+use a unique listen address:
+
+```nix
+services.ncro = {
+  enable = true;
+  instances = {
+    public.settings = {
+      server.listen = "127.0.0.1:8081";
+      upstreams = [{ url = "https://cache.nixos.org"; }];
+    };
+
+    internal.settings = {
+      server.listen = "127.0.0.1:8082";
+      upstreams = [{ url = "https://cache.internal.example"; }];
+    };
+  };
+};
+```
+
+With any named instances, the compatibility `ncro.service` is omitted. Set
+`socketActivation = true` on an instance to create its matching socket unit.
+
 ### Discovery
 
 If you enable discovery or mesh, those settings live in the same `settings`
