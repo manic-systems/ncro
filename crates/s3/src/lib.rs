@@ -85,6 +85,7 @@ impl S3ClientPool {
   ) -> Result<Option<S3ObjectHead>, S3Error> {
     let config = self.config(upstream)?;
     let client = self.client(upstream, &config).await;
+    let key = prefixed_key(&config, key);
     match client
       .head_object()
       .bucket(config.bucket)
@@ -141,6 +142,7 @@ impl S3ClientPool {
   ) -> Result<Option<S3Object>, S3Error> {
     let config = self.config(upstream)?;
     let client = self.client(upstream, &config).await;
+    let key = prefixed_key(&config, key);
     let mut req = client.get_object().bucket(config.bucket).key(key);
     if let Some(range) = range {
       req = req.range(range);
@@ -206,6 +208,13 @@ impl S3ClientPool {
     self.clients.insert(upstream.to_string(), client.clone());
     client
   }
+}
+
+fn prefixed_key(config: &S3Config, key: &str) -> String {
+  config
+    .key_prefix
+    .as_ref()
+    .map_or_else(|| key.to_string(), |prefix| format!("{prefix}/{key}"))
 }
 
 fn is_not_found<E: Display>(err: &E) -> bool {
