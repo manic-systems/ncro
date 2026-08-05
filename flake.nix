@@ -36,6 +36,7 @@
       s3 = pkgs.callPackage ./nix/tests/s3.nix {inherit self;};
       netrc = pkgs.callPackage ./nix/tests/netrc.nix {inherit self;};
       socket-activation = pkgs.callPackage ./nix/tests/socket-activation.nix {inherit self;};
+      multi-instance = pkgs.callPackage ./nix/tests/multi-instance.nix {inherit self;};
       public-keys = pkgs.callPackage ./nix/tests/public-keys.nix {inherit self;};
     });
 
