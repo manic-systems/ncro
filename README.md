@@ -421,7 +421,10 @@ entry is used as a fallback. Config credentials always win over netrc.
 
 On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
 
-## NixOS Integration
+## NixOS Module
+
+This repository provides a NixOS module. You may import it and use the provided
+`services.ncro` options as below. An example NixOS setup:
 
 ```nix
 {lib, ...}: {
@@ -456,6 +459,13 @@ On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
   nix.settings.substituters = lib.mkForce [ "http://localhost:8080" ];
 }
 ```
+
+> [!TIP]
+> For multiple independent routers on one host, use `services.ncro.instances`;
+> the [NixOS installation guide](docs/install.md#multiple-instances) shows the
+> complete configuration.
+
+## Non-NixOS
 
 Alternatively, if you're not using NixOS, create a Systemd service similar to
 this. You'll also want to harden this, but for the sake of brevity I will not
