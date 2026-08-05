@@ -33,6 +33,8 @@ pub enum S3AddressingStyle {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct S3Config {
   pub bucket:           String,
+  /// Optional key prefix. S3 keys are looked up as `{prefix}/{key}` when set.
+  pub key_prefix:       Option<String>,
   pub endpoint:         Option<String>,
   pub scheme:           String,
   pub region:           String,
@@ -80,6 +82,16 @@ fn parse_s3_url(raw: &str) -> Result<S3Config, ConfigError> {
     })?
     .to_string();
 
+  // Treat the URL path as a key prefix. A path like `s3://bucket/sub`
+  // would otherwise behave the same as `s3://bucket`.
+  let key_prefix = parsed
+    .path()
+    .split('/')
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("/");
+  let key_prefix = (!key_prefix.is_empty()).then_some(key_prefix);
+
   let mut endpoint: Option<String> = None;
   let mut scheme = "https".to_string();
   let mut region = "us-east-1".to_string();
@@ -110,6 +122,7 @@ fn parse_s3_url(raw: &str) -> Result<S3Config, ConfigError> {
 
   Ok(S3Config {
     bucket,
+    key_prefix,
     endpoint,
     scheme,
     region,
@@ -408,6 +421,27 @@ mod tests {
   #[test]
   fn s3_url_aws_no_params() -> Result<(), ConfigError> {
     assert_eq!(parse_s3_url("s3://my-cache")?.region, "us-east-1");
+    Ok(())
+  }
+
+  #[test]
+  fn s3_url_path_becomes_key_prefix() -> Result<(), ConfigError> {
+    let s3 = parse_s3_url("s3://my-cache/nix?endpoint=s3.example.com")?;
+    assert_eq!(s3.key_prefix.as_deref(), Some("nix"));
+    Ok(())
+  }
+
+  #[test]
+  fn s3_url_no_path_means_no_key_prefix() -> Result<(), ConfigError> {
+    let s3 = parse_s3_url("s3://my-cache?endpoint=s3.example.com")?;
+    assert_eq!(s3.key_prefix, None);
+    Ok(())
+  }
+
+  #[test]
+  fn s3_url_multi_segment_path_becomes_key_prefix() -> Result<(), ConfigError> {
+    let s3 = parse_s3_url("s3://my-cache/a/b?endpoint=s3.example.com")?;
+    assert_eq!(s3.key_prefix.as_deref(), Some("a/b"));
     Ok(())
   }
 
