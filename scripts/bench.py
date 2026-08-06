@@ -307,13 +307,24 @@ def render_chart(
         error_kw={"ecolor": "black", "elinewidth": 1.0, "capsize": 4},
     )
 
-    for pos, mean in zip(positions, means):
-        ax.text(pos, mean, f"{mean:.0f} ms", ha="center", va="bottom", fontsize=9)
+    # Place each value label above the error bar cap, not at the bar top, so
+    # the label and the +/-1 SD whisker never overlap.
+    for pos, mean, stdev in zip(positions, means, stdevs):
+        ax.annotate(
+            f"{mean:.0f} ms",
+            xy=(pos, mean + stdev),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
 
     ax.set_xticks(list(positions))
     ax.set_xticklabels([f"{label}\n{sub}" for label, sub in zip(labels, sublabels)])
     ax.set_ylabel("latency (ms)")
-    ax.set_ylim(0, (max(means) * 1.18) if means else 1.0)
+    tops = [mean + stdev for mean, stdev in zip(means, stdevs)]
+    ax.set_ylim(0, (max(tops) * 1.15) if tops else 1.0)
     ax.yaxis.grid(True, linestyle="--", color="#cccccc", linewidth=0.8)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
