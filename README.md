@@ -114,7 +114,10 @@ further in the [architechture document].
 - `GET /<hash>.narinfo`: route lookup and upstream selection
 - `GET /nar/<path>.nar`: streamed NAR content from the chosen upstream
 - `GET /metrics`: Prometheus metrics
-- `GET /health`: JSON health summary of configured upstreams
+- `GET /health`: liveness/readiness probe (`200` normally, `503` when every
+  upstream is down)
+- `GET /status`: JSON operator snapshot (version, uptime, cache counters, and
+  per-upstream detail)
 
 ### Routing Notes
 
@@ -171,6 +174,8 @@ Default config is embedded; create a TOML file to override any field.
 listen = ":8080"
 read_timeout = "30s"
 write_timeout = "30s"
+cache_priority = 30    # advertised as Priority in /nix-cache-info (lower = preferred)
+want_mass_query = true # advertised as WantMassQuery; false discourages bulk .narinfo queries
 
 [[upstreams]]
 url = "https://cache.nixos.org"
@@ -592,6 +597,16 @@ Prometheus metrics are available at `/metrics`.
 > If you are tuning upstreams, watch `ncro_upstream_latency_seconds` and
 > `ncro_upstream_race_wins_total` together. The first shows raw response timing;
 > the second shows which cache host is actually being chosen.
+
+A ready-made Grafana dashboard for these metrics lives at
+[`contrib/grafana-dashboard.json`](contrib/grafana-dashboard.json). Import it
+and select the Prometheus data source that scrapes ncro's `/metrics` endpoint.
+For a quick point-in-time view without a metrics stack, `GET /status` returns a
+JSON snapshot: ncro's version and uptime, an overall health verdict, cache
+counters (route entries, narinfo hits/misses, negative-cache denials, NAR
+requests), and per-upstream detail (status, priority, EMA latency, consecutive
+failures, total queries, seconds since last probe, `http`/`s3` kind, and whether
+credentials are configured).
 
 ## Operational Tips
 
