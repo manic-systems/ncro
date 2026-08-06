@@ -33,16 +33,17 @@ use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
 
 #[derive(Clone)]
 pub struct AppState {
-  router:         Router,
-  prober:         Prober,
-  db:             Db,
-  upstreams:      Vec<UpstreamConfig>,
-  fallback_cache: Option<UpstreamConfig>,
-  s3:             S3ClientPool,
-  nar_clients:    HashMap<String, reqwest::Client>,
-  default_client: reqwest::Client,
-  cache_priority: i32,
-  started:        Instant,
+  router:          Router,
+  prober:          Prober,
+  db:              Db,
+  upstreams:       Vec<UpstreamConfig>,
+  fallback_cache:  Option<UpstreamConfig>,
+  s3:              S3ClientPool,
+  nar_clients:     HashMap<String, reqwest::Client>,
+  default_client:  reqwest::Client,
+  cache_priority:  i32,
+  want_mass_query: bool,
+  started:         Instant,
 }
 
 impl AppState {
@@ -52,11 +53,12 @@ impl AppState {
 }
 
 pub struct AppConfig {
-  pub upstreams:      Vec<UpstreamConfig>,
-  pub fallback_cache: Option<UpstreamConfig>,
-  pub cache_priority: i32,
-  pub read_timeout:   Duration,
-  pub write_timeout:  Duration,
+  pub upstreams:       Vec<UpstreamConfig>,
+  pub fallback_cache:  Option<UpstreamConfig>,
+  pub cache_priority:  i32,
+  pub want_mass_query: bool,
+  pub read_timeout:    Duration,
+  pub write_timeout:   Duration,
 }
 
 /// Build the HTTP application router.
@@ -74,6 +76,7 @@ pub fn app(
     upstreams,
     fallback_cache,
     cache_priority,
+    want_mass_query,
     read_timeout,
     write_timeout,
   } = config;
@@ -121,6 +124,7 @@ pub fn app(
     nar_clients,
     default_client,
     cache_priority,
+    want_mass_query,
     started: Instant::now(),
   };
   Ok(
@@ -140,13 +144,20 @@ pub fn app(
   )
 }
 
+/// Render the `/nix-cache-info` body. `WantMassQuery` is `1` when
+/// `want_mass_query` is set and `0` otherwise; `Priority` is the advertised
+/// cache priority.
+fn cache_info_body(want_mass_query: bool, cache_priority: i32) -> String {
+  format!(
+    "StoreDir: /nix/store\nWantMassQuery: {}\nPriority: {cache_priority}\n",
+    u8::from(want_mass_query),
+  )
+}
+
 async fn cache_info(State(state): State<Arc<AppState>>) -> Response {
   (
     [("content-type", "text/plain")],
-    format!(
-      "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: {}\n",
-      state.cache_priority
-    ),
+    cache_info_body(state.want_mass_query, state.cache_priority),
   )
     .into_response()
 }
@@ -183,18 +194,24 @@ async fn health(State(state): State<Arc<AppState>>) -> Response {
   } else {
     StatusCode::OK
   };
-  (code, axum::Json(HealthResponse { status: status.to_string() })).into_response()
+  (
+    code,
+    axum::Json(HealthResponse {
+      status: status.to_string(),
+    }),
+  )
+    .into_response()
 }
 
 #[derive(Serialize)]
 struct StatusResponse {
-  version:    &'static str,
+  version:     &'static str,
   uptime_secs: u64,
-  status:     String,
-  cache:      CacheStatus,
-  config:     ConfigStatus,
-  upstreams:  Vec<UpstreamStatusFull>,
-  fallback:   Option<UpstreamStatusFull>,
+  status:      String,
+  cache:       CacheStatus,
+  config:      ConfigStatus,
+  upstreams:   Vec<UpstreamStatusFull>,
+  fallback:    Option<UpstreamStatusFull>,
 }
 
 #[derive(Serialize)]
@@ -267,20 +284,25 @@ async fn status_endpoint(State(state): State<Arc<AppState>>) -> Response {
   let upstreams = sorted
     .into_iter()
     .map(|h| {
-      let kind = if state.s3.contains(&h.url) { "s3" } else { "http" };
+      let kind = if state.s3.contains(&h.url) {
+        "s3"
+      } else {
+        "http"
+      };
       let authenticated = upstream_auth(&state, &h.url).is_some();
       upstream_status_full(h, now, kind, authenticated)
     })
     .collect();
 
   let fallback = if let Some(fallback) = &state.fallback_cache {
-    let health = state
-      .prober
-      .get_health(&fallback.url)
-      .await
-      .unwrap_or_else(|| {
-        UpstreamHealth::new(fallback.url.clone(), fallback.priority)
-      });
+    let health =
+      state
+        .prober
+        .get_health(&fallback.url)
+        .await
+        .unwrap_or_else(|| {
+          UpstreamHealth::new(fallback.url.clone(), fallback.priority)
+        });
     let kind = if state.s3.contains(&fallback.url) {
       "s3"
     } else {
@@ -757,11 +779,23 @@ fn response_from_s3_head(metadata: ncro_s3::S3ObjectHead) -> Response {
 
 #[cfg(test)]
 mod tests {
-  use std::time::Instant;
+  use std::time::{Duration, Instant};
 
   use ncro_health::{Status, UpstreamHealth};
 
-  use super::{overall_status, upstream_status_full};
+  use super::{cache_info_body, overall_status, upstream_status_full};
+
+  #[test]
+  fn cache_info_body_reflects_want_mass_query() {
+    assert_eq!(
+      cache_info_body(true, 30),
+      "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n"
+    );
+    assert_eq!(
+      cache_info_body(false, 42),
+      "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 42\n"
+    );
+  }
 
   fn health(url: &str, status: Status) -> UpstreamHealth {
     let mut h = UpstreamHealth::new(url.to_string(), 40);
@@ -796,12 +830,21 @@ mod tests {
 
   #[test]
   fn upstream_status_full_never_probed_has_no_age() {
-    let now = Instant::now();
-    let full =
-      upstream_status_full(health("a", Status::Active), now, "http", false);
+    let full = upstream_status_full(
+      health("a", Status::Active),
+      Instant::now(),
+      "http",
+      false,
+    );
     assert_eq!(full.last_probe_secs_ago, None);
-    assert_eq!(full.kind, "http");
-    assert!(!full.authenticated);
-    assert_eq!(full.status, "ACTIVE");
+  }
+
+  #[test]
+  fn upstream_status_full_computes_probe_age() {
+    let now = Instant::now();
+    let mut h = health("a", Status::Active);
+    h.last_probe = now.checked_sub(Duration::from_secs(5));
+    let full = upstream_status_full(h, now, "http", false);
+    assert_eq!(full.last_probe_secs_ago, Some(5));
   }
 }

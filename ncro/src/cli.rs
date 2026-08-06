@@ -278,14 +278,15 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
   }
 
   let app = ncro_server::app(router, prober, db, ncro_server::AppConfig {
-    upstreams:      cfg.upstreams.clone(),
-    fallback_cache: cfg
+    upstreams:       cfg.upstreams.clone(),
+    fallback_cache:  cfg
       .fallback_cache
       .enabled
       .then_some(cfg.fallback_cache.upstream.clone()),
-    cache_priority: cfg.server.cache_priority,
-    read_timeout:   cfg.server.read_timeout.0,
-    write_timeout:  cfg.server.write_timeout.0,
+    cache_priority:  cfg.server.cache_priority,
+    want_mass_query: cfg.server.want_mass_query,
+    read_timeout:    cfg.server.read_timeout.0,
+    write_timeout:   cfg.server.write_timeout.0,
   })?;
   let listener = match inherited_listener() {
     Some(std_listener) => {

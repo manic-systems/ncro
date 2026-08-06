@@ -818,19 +818,24 @@ impl Default for FallbackCacheConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-  pub listen:         String,
-  pub cache_priority: i32,
-  pub read_timeout:   HumanDuration,
-  pub write_timeout:  HumanDuration,
+  pub listen:          String,
+  pub cache_priority:  i32,
+  /// Value advertised as `WantMassQuery` in `/nix-cache-info`. When `true`,
+  /// Nix may issue bulk `.narinfo` queries against this cache; disable it to
+  /// discourage mass querying of a slow or metered upstream set.
+  pub want_mass_query: bool,
+  pub read_timeout:    HumanDuration,
+  pub write_timeout:   HumanDuration,
 }
 
 impl Default for ServerConfig {
   fn default() -> Self {
     Self {
-      listen:         ":8080".to_string(),
-      cache_priority: 30,
-      read_timeout:   HumanDuration(Duration::from_secs(30)),
-      write_timeout:  HumanDuration(Duration::from_secs(30)),
+      listen:          ":8080".to_string(),
+      cache_priority:  30,
+      want_mass_query: true,
+      read_timeout:    HumanDuration(Duration::from_secs(30)),
+      write_timeout:   HumanDuration(Duration::from_secs(30)),
     }
   }
 }
