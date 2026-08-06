@@ -32,19 +32,27 @@ what ncro aims to be. The optimization goal is extremely domain-specific.
 
 ### Motivation
 
+[architechture document]: ./docs/architecture.md
+
 During a Nix build, binaries are downloaded from configured substituters, also
 known as binary caches. When multiple caches serve the same paths or you have
 multiple caches configured in your Nix setup, there is additional wait time and
 overhead to every build. ncro solves this by acting as an _intelligent local
 proxy_ that measures upstream latency in real time and routes each request to
-the fastest responder. To keep ncro small and lightweight, routing metadata is
-persisted on disk; NAR content is streamed through with zero local storage. This
-keeps the proxy stateless on the data path and eliminates cache-invalidation
-complexity.
+the fastest responder. [^bench] To keep ncro small and lightweight, routing
+metadata is persisted on disk; NAR content is streamed through with zero local
+storage. This keeps the proxy stateless on the data path and eliminates
+cache-invalidation complexity.
 
-[architechture document]: ./docs/architecture.md
+[^bench]: Measured as client-observed narinfo lookup latency across three
+    conditions (direct, ncro cold, ncro warm). The largest win is the warm case,
+    where ncro serves cached narinfo from SQLite with no upstream round-trip; a
+    cold ncro still pays the upstream race. See [Benchmarks](docs/benchmarks.md)
+    for the methodology and what is _not_ measured.
 
-For a deeper look at the system design, see the [architechture document].
+For a deeper look at the system design, see the [architechture document]. For
+details on the "thought process" and some insider notes on the design, consider
+taking a look at the [blog post](https://notashelf.dev/posts/nix-cache-proxy).
 
 ### How It Works
 
