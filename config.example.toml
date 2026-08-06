@@ -1,7 +1,12 @@
 [server]
-listen        = ":8080"
-read_timeout  = "30s"
-write_timeout = "30s"
+listen          = ":8080"
+read_timeout    = "30s"
+write_timeout   = "30s"
+# Advertised to Nix in /nix-cache-info. `cache_priority` sets `Priority` (lower
+# is preferred by Nix on ties); `want_mass_query` sets `WantMassQuery` (allow
+# bulk .narinfo queries).
+cache_priority  = 30
+want_mass_query = true
 
 [[upstreams]]
 priority   = 10
