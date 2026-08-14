@@ -127,6 +127,12 @@ further in the [architechture document].
 - `GET /status`: JSON operator snapshot (version, uptime, cache counters, and
   per-upstream detail)
 
+Successful narinfo and NAR responses include diagnostic provenance headers:
+`X-Ncro-Upstream` is the selected upstream hostname and `X-Ncro-Route` is one of
+`cache-hit`, `race`, `direct`, `retry`, or `fallback`. These headers are for
+operators; Nix still identifies the substituter by ncro's configured URL (such
+as `http://localhost:8080`).
+
 ### Routing Notes
 
 - Route cache decisions are stored in SQLite and reused until their TTL expires
