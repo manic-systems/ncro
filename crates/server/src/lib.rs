@@ -30,6 +30,52 @@ use ncro_router::{Router, RouterError, store_hash_from_canonical_nar_url};
 use ncro_s3::S3ClientPool;
 use serde::Serialize;
 use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
+use url::Url;
+
+#[derive(Clone, Copy)]
+enum RouteKind {
+  CacheHit,
+  Direct,
+  Fallback,
+  Race,
+  Retry,
+}
+
+impl RouteKind {
+  const fn header_value(self) -> &'static str {
+    match self {
+      Self::CacheHit => "cache-hit",
+      Self::Direct => "direct",
+      Self::Fallback => "fallback",
+      Self::Race => "race",
+      Self::Retry => "retry",
+    }
+  }
+}
+
+/// Add diagnostic source metadata without forwarding arbitrary upstream
+/// headers.
+fn with_provenance(
+  mut response: Response,
+  upstream: &str,
+  route: RouteKind,
+) -> Response {
+  let source = Url::parse(upstream)
+    .ok()
+    .and_then(|url| url.host_str().map(str::to_owned))
+    .unwrap_or_else(|| "unknown".to_string());
+  let headers = response.headers_mut();
+  headers.insert(
+    HeaderName::from_static("x-ncro-upstream"),
+    HeaderValue::from_str(&source)
+      .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+  );
+  headers.insert(
+    HeaderName::from_static("x-ncro-route"),
+    HeaderValue::from_static(route.header_value()),
+  );
+  response
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -360,22 +406,35 @@ async fn narinfo(
         .narinfo_requests
         .with_label_values(&["200"])
         .inc();
+      let route = if result.cache_hit {
+        RouteKind::CacheHit
+      } else {
+        RouteKind::Race
+      };
       if let Some(bytes) = result.narinfo_bytes {
-        return (
-          StatusCode::OK,
-          [("content-type", "text/x-nix-narinfo")],
-          Bytes::from(bytes),
-        )
-          .into_response();
+        return with_provenance(
+          (
+            StatusCode::OK,
+            [("content-type", "text/x-nix-narinfo")],
+            Bytes::from(bytes),
+          )
+            .into_response(),
+          &result.url,
+          route,
+        );
       }
-      proxy(
-        state.nar_client(&result.url),
-        req.method().clone(),
-        req.headers(),
-        format!("{}{}", result.url, req.uri().path()),
-        upstream_auth(&state, &result.url),
+      with_provenance(
+        proxy(
+          state.nar_client(&result.url),
+          req.method().clone(),
+          req.headers(),
+          format!("{}{}", result.url, req.uri().path()),
+          upstream_auth(&state, &result.url),
+        )
+        .await,
+        &result.url,
+        route,
       )
-      .await
     },
     Err(RouterError::NotFound) => {
       ncro_metrics::get()
@@ -440,6 +499,7 @@ async fn nar(
       req.headers(),
       &entry.upstream_url,
       upstream_path,
+      RouteKind::CacheHit,
       upstream_auth(&state, &entry.upstream_url),
     )
     .await
@@ -481,6 +541,7 @@ async fn nar(
         req.headers(),
         &h.url,
         &path_and_query,
+        RouteKind::Direct,
         upstream_auth(&state, &h.url),
       )
       .await
@@ -497,6 +558,7 @@ async fn nar(
       req.headers(),
       &fallback.url,
       &path_and_query,
+      RouteKind::Fallback,
       upstream_auth(&state, &fallback.url),
     )
     .await
@@ -533,6 +595,7 @@ async fn retry_by_store_hash(
         headers,
         &h.url,
         &path,
+        RouteKind::Retry,
         upstream_auth(state, &h.url),
       )
       .await
@@ -568,16 +631,18 @@ async fn try_fallback_narinfo(
         .with_label_values(&["200"])
         .inc();
       if let Some(bytes) = result.narinfo_bytes {
-        return Some(
+        return Some(with_provenance(
           (
             StatusCode::OK,
             [("content-type", "text/x-nix-narinfo")],
             Bytes::from(bytes),
           )
             .into_response(),
-        );
+          &result.url,
+          RouteKind::Fallback,
+        ));
       }
-      Some(
+      Some(with_provenance(
         proxy(
           state.nar_client(&result.url),
           req.method().clone(),
@@ -586,7 +651,9 @@ async fn try_fallback_narinfo(
           upstream_auth(state, &result.url),
         )
         .await,
-      )
+        &result.url,
+        RouteKind::Fallback,
+      ))
     },
     Err(RouterError::NotFound) => {
       ncro_metrics::get()
@@ -637,20 +704,25 @@ async fn try_nar_upstream(
   headers: &HeaderMap,
   upstream: &str,
   path: &str,
+  route: RouteKind,
   auth: Option<(String, Option<String>)>,
 ) -> Option<Response> {
   if s3.contains(upstream) {
     let key = path.trim_start_matches('/');
     if method == Method::HEAD {
       let metadata = s3.head_object_metadata(upstream, key).await.ok()??;
-      return Some(response_from_s3_head(metadata));
+      return Some(with_provenance(
+        response_from_s3_head(metadata),
+        upstream,
+        route,
+      ));
     }
     if method != Method::GET {
       return None;
     }
     let range = headers.get("range").and_then(|value| value.to_str().ok());
     let object = s3.get_object(upstream, key, range).await.ok()??;
-    return Some(response_from_s3(object));
+    return Some(with_provenance(response_from_s3(object), upstream, route));
   }
   let resp = upstream_request(
     client,
@@ -664,7 +736,11 @@ async fn try_nar_upstream(
   if !resp.status().is_success() {
     return None;
   }
-  Some(response_from_reqwest(resp))
+  Some(with_provenance(
+    response_from_reqwest(resp),
+    upstream,
+    route,
+  ))
 }
 
 async fn proxy(
@@ -781,9 +857,16 @@ fn response_from_s3_head(metadata: ncro_s3::S3ObjectHead) -> Response {
 mod tests {
   use std::time::{Duration, Instant};
 
+  use axum::{body::Body, http::Response};
   use ncro_health::{Status, UpstreamHealth};
 
-  use super::{cache_info_body, overall_status, upstream_status_full};
+  use super::{
+    RouteKind,
+    cache_info_body,
+    overall_status,
+    upstream_status_full,
+    with_provenance,
+  };
 
   #[test]
   fn cache_info_body_reflects_want_mass_query() {
@@ -795,6 +878,35 @@ mod tests {
       cache_info_body(false, 42),
       "StoreDir: /nix/store\nWantMassQuery: 0\nPriority: 42\n"
     );
+  }
+
+  #[test]
+  fn provenance_uses_hostname_and_preserves_response_headers() {
+    let response = Response::builder()
+      .header("content-type", "text/plain")
+      .body(Body::empty())
+      .unwrap();
+    let response = with_provenance(
+      response,
+      "https://cache.example.test:8443/path?secret=ignored",
+      RouteKind::Race,
+    );
+
+    assert_eq!(response.headers()["content-type"], "text/plain");
+    assert_eq!(response.headers()["x-ncro-upstream"], "cache.example.test");
+    assert_eq!(response.headers()["x-ncro-route"], "race");
+  }
+
+  #[test]
+  fn provenance_hides_invalid_upstream_values() {
+    let response = with_provenance(
+      Response::new(Body::empty()),
+      "not a valid URL\r\nX-Injected: no",
+      RouteKind::Fallback,
+    );
+
+    assert_eq!(response.headers()["x-ncro-upstream"], "unknown");
+    assert_eq!(response.headers()["x-ncro-route"], "fallback");
   }
 
   fn health(url: &str, status: Status) -> UpstreamHealth {
