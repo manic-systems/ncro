@@ -607,8 +607,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       &config_path,
       format!(
         "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
-         \"alice\"\npassword_file = {:?}\n",
-        password_path
+         \"alice\"\npassword_file = {password_path:?}\n",
       ),
     )?;
 
@@ -630,8 +629,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       &config_path,
       format!(
         "[[upstreams]]\nurl = \"https://cache.example.com\"\nusername = \
-         \"alice\"\npassword_file = {:?}\n",
-        password_path
+         \"alice\"\npassword_file = {password_path:?}\n",
       ),
     )?;
 
@@ -660,6 +658,43 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
           .contains("password and password_file are mutually exclusive")
       );
     }
+    Ok(())
+  }
+
+  #[test]
+  fn nar_hedging_defaults_and_upstream_opt_out_parse() -> Result<(), TomlError>
+  {
+    let cfg: Config = toml::from_str(
+      "[[upstreams]]\nurl = \"https://cache.example.com\"\n\
+       [cache.nar_hedging]\nmax_inflight = 3\n",
+    )?;
+
+    assert!(cfg.upstreams[0].allow_hedging);
+    assert!(cfg.cache.nar_hedging.enabled);
+    assert_eq!(cfg.cache.nar_hedging.max_inflight, 3);
+    assert_eq!(cfg.cache.nar_hedging.delay.0, Duration::from_secs(1));
+    Ok(())
+  }
+
+  #[test]
+  fn upstream_can_opt_out_of_nar_hedging() -> Result<(), TomlError> {
+    let cfg: Config = toml::from_str(
+      "[[upstreams]]\nurl = \"https://cache.example.com\"\nallow_hedging = \
+       false\n",
+    )?;
+
+    assert!(!cfg.upstreams[0].allow_hedging);
+    Ok(())
+  }
+
+  #[test]
+  fn nar_hedging_rejects_zero_max_inflight() -> Result<(), TomlError> {
+    let cfg: Config = toml::from_str(
+      "[[upstreams]]\nurl = \"https://cache.example.com\"\n\
+       [cache.nar_hedging]\nmax_inflight = 0\n",
+    )?;
+
+    assert!(cfg.validate().is_err());
     Ok(())
   }
 
@@ -731,7 +766,11 @@ pub struct FilterRule {
   pub pattern: String,
 }
 
-#[derive(Clone, Default, Deserialize)]
+const fn default_allow_hedging() -> bool {
+  true
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct UpstreamConfig {
   /// Base URL of the substituter (http, https, or `s3://`).
@@ -767,10 +806,33 @@ pub struct UpstreamConfig {
   /// Optional per-upstream timeout for NAR file streaming requests.
   /// When unset, the server's global `read_timeout` is used.
   pub nar_timeout:     Option<HumanDuration>,
+  /// Whether this upstream may be started as an additional NAR hedge.
+  #[serde(default = "default_allow_hedging")]
+  pub allow_hedging:   bool,
   /// Parsed S3 configuration derived from `url` when the scheme is `s3://`.
   /// Not set directly in config, but populated automatically at load time.
   #[serde(skip)]
   pub s3:              Option<S3Config>,
+}
+
+impl Default for UpstreamConfig {
+  fn default() -> Self {
+    Self {
+      url:             String::new(),
+      priority:        0,
+      public_key:      String::new(),
+      public_keys:     Vec::new(),
+      username:        String::new(),
+      password:        None,
+      password_file:   None,
+      filters:         Vec::new(),
+      nar_url_mode:    NarUrlMode::default(),
+      narinfo_timeout: None,
+      nar_timeout:     None,
+      allow_hedging:   true,
+      s3:              None,
+    }
+  }
 }
 
 impl fmt::Debug for UpstreamConfig {
@@ -787,6 +849,7 @@ impl fmt::Debug for UpstreamConfig {
       .field("nar_url_mode", &self.nar_url_mode)
       .field("narinfo_timeout", &self.narinfo_timeout)
       .field("nar_timeout", &self.nar_timeout)
+      .field("allow_hedging", &self.allow_hedging)
       .field("s3", &self.s3)
       .finish()
   }
@@ -850,6 +913,7 @@ pub struct CacheConfig {
   pub latency_alpha:            f64,
   pub slow_statement_threshold: HumanDuration,
   pub mass_query:               MassQueryConfig,
+  pub nar_hedging:              NarHedgingConfig,
 }
 
 impl Default for CacheConfig {
@@ -862,6 +926,25 @@ impl Default for CacheConfig {
       latency_alpha:            0.3,
       slow_statement_threshold: HumanDuration(Duration::from_secs(1)),
       mass_query:               MassQueryConfig::default(),
+      nar_hedging:              NarHedgingConfig::default(),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NarHedgingConfig {
+  pub enabled:      bool,
+  pub delay:        HumanDuration,
+  pub max_inflight: u32,
+}
+
+impl Default for NarHedgingConfig {
+  fn default() -> Self {
+    Self {
+      enabled:      true,
+      delay:        HumanDuration(Duration::from_secs(1)),
+      max_inflight: 2,
     }
   }
 }
@@ -1146,6 +1229,16 @@ impl Config {
     if self.cache.mass_query.upstream_cooldown.0.is_zero() {
       return Err(ConfigError::Validation(
         "cache.mass_query.upstream_cooldown must be positive".to_string(),
+      ));
+    }
+    if self.cache.nar_hedging.delay.0.is_zero() {
+      return Err(ConfigError::Validation(
+        "cache.nar_hedging.delay must be positive".to_string(),
+      ));
+    }
+    if self.cache.nar_hedging.max_inflight == 0 {
+      return Err(ConfigError::Validation(
+        "cache.nar_hedging.max_inflight must be >= 1".to_string(),
       ));
     }
     if self.logging.level.trim().is_empty() {
