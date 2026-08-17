@@ -28,7 +28,7 @@ ncro-server    = { path = "./crates/server", version = "2.2.2" }
 # Other deps
 anyhow             = "1.0.102"
 axum               = "0.8.9"
-base64             = "0.22.1"
+base64             = "0.23.1"
 bytes              = "1.12.1"
 chrono             = "0.4.44"
 dashmap            = "6.2.1"
