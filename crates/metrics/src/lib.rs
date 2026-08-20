@@ -21,6 +21,8 @@ pub struct Metrics {
   pub narinfo_singleflight_waiters:          IntCounter,
   pub narinfo_requests:                      IntCounterVec,
   pub nar_requests:                          IntCounter,
+  pub nar_hedges:                            IntCounterVec,
+  pub nar_hedge_failures:                    IntCounterVec,
   pub narinfo_upstream_attempts:             IntCounter,
   pub narinfo_upstream_attempts_per_resolve: HistogramVec,
   pub narinfo_race_wait_seconds:             HistogramVec,
@@ -74,6 +76,19 @@ pub fn get() -> &'static Metrics {
     let nar_requests =
       IntCounter::new("ncro_nar_requests_total", "NAR streaming requests.")
         .expect("valid metric");
+    let nar_hedges = IntCounterVec::new(
+      Opts::new("ncro_nar_hedges_total", "NAR hedge events."),
+      &["event", "upstream"],
+    )
+    .expect("valid metric");
+    let nar_hedge_failures = IntCounterVec::new(
+      Opts::new(
+        "ncro_nar_hedge_failures_total",
+        "Failed NAR hedge attempts.",
+      ),
+      &["kind", "upstream"],
+    )
+    .expect("valid metric");
     let narinfo_upstream_attempts = IntCounter::new(
       "ncro_narinfo_upstream_attempts_total",
       "Total upstream narinfo attempts made during races.",
@@ -124,6 +139,8 @@ pub fn get() -> &'static Metrics {
       Box::new(narinfo_singleflight_waiters.clone()),
       Box::new(narinfo_requests.clone()),
       Box::new(nar_requests.clone()),
+      Box::new(nar_hedges.clone()),
+      Box::new(nar_hedge_failures.clone()),
       Box::new(narinfo_upstream_attempts.clone()),
       Box::new(narinfo_upstream_attempts_per_resolve.clone()),
       Box::new(narinfo_race_wait_seconds.clone()),
@@ -142,6 +159,8 @@ pub fn get() -> &'static Metrics {
       narinfo_singleflight_waiters,
       narinfo_requests,
       nar_requests,
+      nar_hedges,
+      nar_hedge_failures,
       narinfo_upstream_attempts,
       narinfo_upstream_attempts_per_resolve,
       narinfo_race_wait_seconds,
