@@ -304,6 +304,7 @@ impl Router {
     } else {
       map.insert(url, keys);
     }
+    drop(map);
     Ok(())
   }
 
@@ -366,6 +367,7 @@ impl Router {
     } else {
       map.remove(&url);
     }
+    drop(map);
     Ok(())
   }
 
