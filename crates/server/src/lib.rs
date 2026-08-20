@@ -22,23 +22,27 @@ use axum::{
   routing::get,
 };
 use bytes::Bytes;
-use futures_util::TryStreamExt;
-use ncro_config::UpstreamConfig;
+use futures_util::{StreamExt, TryStreamExt, stream};
+use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_router::{Router, RouterError, store_hash_from_canonical_nar_url};
 use ncro_s3::S3ClientPool;
 use serde::Serialize;
+use tokio::{
+  task::JoinSet,
+  time::{Instant as TokioInstant, sleep_until},
+};
 use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
 use url::Url;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RouteKind {
   CacheHit,
   Direct,
+  Hedge,
   Fallback,
   Race,
-  Retry,
 }
 
 impl RouteKind {
@@ -46,9 +50,9 @@ impl RouteKind {
     match self {
       Self::CacheHit => "cache-hit",
       Self::Direct => "direct",
+      Self::Hedge => "hedge",
       Self::Fallback => "fallback",
       Self::Race => "race",
-      Self::Retry => "retry",
     }
   }
 }
@@ -87,6 +91,7 @@ pub struct AppState {
   s3:              S3ClientPool,
   nar_clients:     HashMap<String, reqwest::Client>,
   default_client:  reqwest::Client,
+  nar_hedging:     NarHedgingConfig,
   cache_priority:  i32,
   want_mass_query: bool,
   started:         Instant,
@@ -101,6 +106,7 @@ impl AppState {
 pub struct AppConfig {
   pub upstreams:       Vec<UpstreamConfig>,
   pub fallback_cache:  Option<UpstreamConfig>,
+  pub nar_hedging:     NarHedgingConfig,
   pub cache_priority:  i32,
   pub want_mass_query: bool,
   pub read_timeout:    Duration,
@@ -121,6 +127,7 @@ pub fn app(
   let AppConfig {
     upstreams,
     fallback_cache,
+    nar_hedging,
     cache_priority,
     want_mass_query,
     read_timeout,
@@ -169,6 +176,7 @@ pub fn app(
     s3,
     nar_clients,
     default_client,
+    nar_hedging,
     cache_priority,
     want_mass_query,
     started: Instant::now(),
@@ -464,6 +472,165 @@ async fn narinfo(
   }
 }
 
+#[derive(Clone)]
+struct NarCandidate {
+  upstream: String,
+  path:     String,
+  route:    RouteKind,
+}
+
+fn spawn_nar_attempt(
+  attempts: &mut JoinSet<(NarCandidate, Option<Response>)>,
+  state: Arc<AppState>,
+  method: Method,
+  headers: HeaderMap,
+  candidate: NarCandidate,
+) {
+  attempts.spawn(async move {
+    let response = try_nar_upstream(NarUpstreamRequest {
+      client: state.nar_client(&candidate.upstream),
+      s3: &state.s3,
+      method,
+      headers: &headers,
+      upstream: &candidate.upstream,
+      path: &candidate.path,
+      route: candidate.route,
+      auth: upstream_auth(&state, &candidate.upstream),
+    })
+    .await;
+    (candidate, response)
+  });
+}
+
+async fn hedged_nar(
+  state: Arc<AppState>,
+  method: Method,
+  headers: HeaderMap,
+  initial: NarCandidate,
+  mut candidates: Vec<NarCandidate>,
+) -> Option<Response> {
+  let max_inflight = if state.nar_hedging.enabled {
+    usize::try_from(state.nar_hedging.max_inflight).unwrap_or(1)
+  } else {
+    1
+  };
+  let delay = state.nar_hedging.delay.0;
+  let mut attempts = JoinSet::new();
+  spawn_nar_attempt(
+    &mut attempts,
+    Arc::clone(&state),
+    method.clone(),
+    headers.clone(),
+    initial,
+  );
+  if method == Method::HEAD && state.nar_hedging.enabled {
+    while let Some(candidate) = candidates.pop() {
+      ncro_metrics::get()
+        .nar_hedges
+        .with_label_values(&["started", &candidate.upstream])
+        .inc();
+      spawn_nar_attempt(
+        &mut attempts,
+        Arc::clone(&state),
+        method.clone(),
+        headers.clone(),
+        candidate,
+      );
+    }
+  }
+  let mut next_hedge = TokioInstant::now() + delay;
+
+  loop {
+    if attempts.is_empty() && candidates.is_empty() {
+      return None;
+    }
+    tokio::select! {
+      result = attempts.join_next(), if !attempts.is_empty() => {
+        let Some(Ok((candidate, response))) = result else { continue; };
+        if let Some(response) = response {
+          if candidate.route == RouteKind::Hedge {
+            ncro_metrics::get().nar_hedges.with_label_values(&["won", &candidate.upstream]).inc();
+          }
+          tracing::info!(upstream = candidate.upstream, route = candidate.route.header_value(), "nar attempt won");
+          let cancelled = attempts.len();
+          if cancelled > 0 {
+            ncro_metrics::get().nar_hedges.with_label_values(&["cancelled", &candidate.upstream]).inc_by(u64::try_from(cancelled).unwrap_or(u64::MAX));
+            tracing::info!(upstream = candidate.upstream, cancelled, "nar hedge losers cancelled");
+          }
+          attempts.abort_all();
+          return Some(response);
+        }
+        ncro_metrics::get().nar_hedge_failures.with_label_values(&["unavailable", &candidate.upstream]).inc();
+        tracing::debug!(upstream = candidate.upstream, "nar attempt failed");
+        if let Some(candidate) = candidates.pop() {
+          ncro_metrics::get().nar_hedges.with_label_values(&["started", &candidate.upstream]).inc();
+          tracing::info!(upstream = candidate.upstream, "nar hedge started after failure");
+          spawn_nar_attempt(&mut attempts, Arc::clone(&state), method.clone(), headers.clone(), candidate);
+        }
+      }
+      () = sleep_until(next_hedge), if method != Method::HEAD && state.nar_hedging.enabled && attempts.len() < max_inflight && !candidates.is_empty() => {
+        if let Some(candidate) = candidates.pop() {
+          ncro_metrics::get().nar_hedges.with_label_values(&["started", &candidate.upstream]).inc();
+          tracing::info!(upstream = candidate.upstream, "nar hedge started");
+          spawn_nar_attempt(&mut attempts, Arc::clone(&state), method.clone(), headers.clone(), candidate);
+          next_hedge = TokioInstant::now() + delay;
+        }
+      }
+    }
+  }
+}
+
+fn hedge_allowed(state: &AppState, url: &str) -> bool {
+  state
+    .upstreams
+    .iter()
+    .find(|upstream| upstream.url == url)
+    .is_none_or(|upstream| upstream.allow_hedging)
+}
+
+async fn hedge_candidates(
+  state: &AppState,
+  store_hash: Option<&str>,
+  path: &str,
+  skip: &str,
+  include_hedging_opt_outs: bool,
+) -> Vec<NarCandidate> {
+  let mut by_priority = BTreeMap::<i32, Vec<UpstreamHealth>>::new();
+  for health in state.prober.sorted_by_latency().await {
+    if health.status == Status::Down || health.url == skip {
+      continue;
+    }
+    if !include_hedging_opt_outs && !hedge_allowed(state, &health.url) {
+      continue;
+    }
+    by_priority.entry(health.priority).or_default().push(health);
+  }
+  let mut candidates = Vec::new();
+  for group in by_priority.into_values() {
+    for health in group {
+      let candidate_path = if let Some(store_hash) = store_hash {
+        let Ok(candidate_path) = state
+          .router
+          .upstream_nar_path(&health.url, store_hash)
+          .await
+        else {
+          continue;
+        };
+        candidate_path
+      } else {
+        path.to_string()
+      };
+      candidates.push(NarCandidate {
+        upstream: health.url,
+        path:     candidate_path,
+        route:    RouteKind::Hedge,
+      });
+    }
+  }
+  candidates.reverse();
+  candidates
+}
+
 async fn nar(
   State(state): State<Arc<AppState>>,
   req: Request<Body>,
@@ -480,6 +647,7 @@ async fn nar(
     .map_or_else(|| req.uri().path(), PathAndQuery::as_str)
     .to_string();
 
+  let mut normal_attempted = false;
   let routed_upstream = 'routed: {
     let Ok(Some(entry)) = state.db.get_route_by_nar_url(&nar_url).await else {
       break 'routed None;
@@ -492,15 +660,25 @@ async fn nar(
     } else {
       &entry.upstream_nar_url
     };
-    if let Some(resp) = try_nar_upstream(
-      state.nar_client(&entry.upstream_url),
-      &state.s3,
-      req.method().clone(),
-      req.headers(),
+    let candidates = hedge_candidates(
+      &state,
+      store_hash_from_canonical_nar_url(&nar_url),
+      &path_and_query,
       &entry.upstream_url,
-      upstream_path,
-      RouteKind::CacheHit,
-      upstream_auth(&state, &entry.upstream_url),
+      false,
+    )
+    .await;
+    normal_attempted = true;
+    if let Some(resp) = hedged_nar(
+      Arc::clone(&state),
+      req.method().clone(),
+      req.headers().clone(),
+      NarCandidate {
+        upstream: entry.upstream_url.clone(),
+        path:     upstream_path.clone(),
+        route:    RouteKind::CacheHit,
+      },
+      candidates,
     )
     .await
     {
@@ -509,40 +687,24 @@ async fn nar(
     Some(entry.upstream_url)
   };
 
-  // Only a canonical path carries the store hash the other upstreams need.
-  if let Some(store_hash) = store_hash_from_canonical_nar_url(&nar_url)
-    && let Some(resp) = retry_by_store_hash(
+  if !normal_attempted {
+    let mut candidates = hedge_candidates(
       &state,
-      store_hash,
-      req.method(),
-      req.headers(),
-      routed_upstream.as_deref(),
+      store_hash_from_canonical_nar_url(&nar_url),
+      &path_and_query,
+      "",
+      true,
     )
-    .await
-  {
-    return resp;
-  }
-
-  // Try upstreams grouped by priority as a fallback (lower = preferred), within
-  // each group sorted by EMA latency.
-  let mut by_priority = BTreeMap::<i32, Vec<UpstreamHealth>>::new();
-  for h in state.prober.sorted_by_latency().await {
-    if h.status == Status::Down {
-      continue;
-    }
-    by_priority.entry(h.priority).or_default().push(h);
-  }
-  for (_priority, group) in by_priority {
-    for h in group {
-      if let Some(resp) = try_nar_upstream(
-        state.nar_client(&h.url),
-        &state.s3,
+    .await;
+    if let Some(mut initial) = candidates.pop() {
+      initial.route = RouteKind::Direct;
+      candidates.retain(|candidate| hedge_allowed(&state, &candidate.upstream));
+      if let Some(resp) = hedged_nar(
+        Arc::clone(&state),
         req.method().clone(),
-        req.headers(),
-        &h.url,
-        &path_and_query,
-        RouteKind::Direct,
-        upstream_auth(&state, &h.url),
+        req.headers().clone(),
+        initial,
+        candidates,
       )
       .await
       {
@@ -550,66 +712,24 @@ async fn nar(
       }
     }
   }
+
+  let _ = routed_upstream;
   if let Some(fallback) = &state.fallback_cache
-    && let Some(resp) = try_nar_upstream(
-      state.nar_client(&fallback.url),
-      &state.s3,
-      req.method().clone(),
-      req.headers(),
-      &fallback.url,
-      &path_and_query,
-      RouteKind::Fallback,
-      upstream_auth(&state, &fallback.url),
-    )
+    && let Some(resp) = try_nar_upstream(NarUpstreamRequest {
+      client:   state.nar_client(&fallback.url),
+      s3:       &state.s3,
+      method:   req.method().clone(),
+      headers:  req.headers(),
+      upstream: &fallback.url,
+      path:     &path_and_query,
+      route:    RouteKind::Fallback,
+      auth:     upstream_auth(&state, &fallback.url),
+    })
     .await
   {
     return resp;
   }
   StatusCode::NOT_FOUND.into_response()
-}
-
-async fn retry_by_store_hash(
-  state: &AppState,
-  store_hash: &str,
-  method: &Method,
-  headers: &HeaderMap,
-  skip: Option<&str>,
-) -> Option<Response> {
-  let mut by_priority = BTreeMap::<i32, Vec<UpstreamHealth>>::new();
-  for h in state.prober.sorted_by_latency().await {
-    if h.status == Status::Down || Some(h.url.as_str()) == skip {
-      continue;
-    }
-    by_priority.entry(h.priority).or_default().push(h);
-  }
-  for (_priority, group) in by_priority {
-    for h in group {
-      let Ok(path) = state.router.upstream_nar_path(&h.url, store_hash).await
-      else {
-        continue;
-      };
-      if let Some(resp) = try_nar_upstream(
-        state.nar_client(&h.url),
-        &state.s3,
-        method.clone(),
-        headers,
-        &h.url,
-        &path,
-        RouteKind::Retry,
-        upstream_auth(state, &h.url),
-      )
-      .await
-      {
-        tracing::warn!(
-          store = store_hash,
-          upstream = h.url,
-          "nar re-routed after primary upstream failed"
-        );
-        return Some(resp);
-      }
-    }
-  }
-  None
 }
 
 async fn try_fallback_narinfo(
@@ -697,16 +817,28 @@ async fn upstream_urls(state: &AppState) -> Vec<String> {
   }
 }
 
-async fn try_nar_upstream(
-  client: &reqwest::Client,
-  s3: &S3ClientPool,
-  method: Method,
-  headers: &HeaderMap,
-  upstream: &str,
-  path: &str,
-  route: RouteKind,
-  auth: Option<(String, Option<String>)>,
-) -> Option<Response> {
+struct NarUpstreamRequest<'a> {
+  client:   &'a reqwest::Client,
+  s3:       &'a S3ClientPool,
+  method:   Method,
+  headers:  &'a HeaderMap,
+  upstream: &'a str,
+  path:     &'a str,
+  route:    RouteKind,
+  auth:     Option<(String, Option<String>)>,
+}
+
+async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
+  let NarUpstreamRequest {
+    client,
+    s3,
+    method,
+    headers,
+    upstream,
+    path,
+    route,
+    auth,
+  } = req;
   if s3.contains(upstream) {
     let key = path.trim_start_matches('/');
     if method == Method::HEAD {
@@ -722,7 +854,8 @@ async fn try_nar_upstream(
     }
     let range = headers.get("range").and_then(|value| value.to_str().ok());
     let object = s3.get_object(upstream, key, range).await.ok()??;
-    return Some(with_provenance(response_from_s3(object), upstream, route));
+    let response = response_from_s3_first_byte(object).await?;
+    return Some(with_provenance(response, upstream, route));
   }
   let resp = upstream_request(
     client,
@@ -736,11 +869,8 @@ async fn try_nar_upstream(
   if !resp.status().is_success() {
     return None;
   }
-  Some(with_provenance(
-    response_from_reqwest(resp),
-    upstream,
-    route,
-  ))
+  let response = response_from_reqwest_first_byte(resp).await?;
+  Some(with_provenance(response, upstream, route))
 }
 
 async fn proxy(
@@ -778,11 +908,11 @@ async fn upstream_request(
   req.send().await
 }
 
-fn response_from_reqwest(resp: reqwest::Response) -> Response {
-  let status = StatusCode::from_u16(resp.status().as_u16())
-    .unwrap_or(StatusCode::BAD_GATEWAY);
-  let headers = resp.headers().clone();
-  let stream = resp.bytes_stream().map_err(io::Error::other);
+fn response_from_headers(
+  status: StatusCode,
+  headers: &HeaderMap,
+  body: Body,
+) -> Response {
   let mut out = Response::builder().status(status);
   for name in [
     "accept-ranges",
@@ -805,13 +935,37 @@ fn response_from_reqwest(resp: reqwest::Response) -> Response {
     }
   }
   out
-    .body(Body::from_stream(stream))
+    .body(body)
     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn response_from_s3(object: ncro_s3::S3Object) -> Response {
-  let mut out = Response::builder()
-    .status(StatusCode::from_u16(object.status).unwrap_or(StatusCode::OK));
+fn response_from_reqwest(resp: reqwest::Response) -> Response {
+  let status = StatusCode::from_u16(resp.status().as_u16())
+    .unwrap_or(StatusCode::BAD_GATEWAY);
+  let headers = resp.headers().clone();
+  let stream = resp.bytes_stream().map_err(io::Error::other);
+  response_from_headers(status, &headers, Body::from_stream(stream))
+}
+
+async fn response_from_reqwest_first_byte(
+  resp: reqwest::Response,
+) -> Option<Response> {
+  let status = StatusCode::from_u16(resp.status().as_u16()).ok()?;
+  let headers = resp.headers().clone();
+  let mut stream = Box::pin(resp.bytes_stream().map_err(io::Error::other));
+  let first = stream.try_next().await.ok()??;
+  let body =
+    Body::from_stream(stream::once(async move { Ok(first) }).chain(stream));
+  Some(response_from_headers(status, &headers, body))
+}
+
+async fn response_from_s3_first_byte(
+  object: ncro_s3::S3Object,
+) -> Option<Response> {
+  let mut stream = Box::pin(S3ClientPool::body_stream(object.body));
+  let first = stream.try_next().await.ok()??;
+  let mut out =
+    Response::builder().status(StatusCode::from_u16(object.status).ok()?);
   for (name, value) in [
     ("accept-ranges", object.accept_ranges),
     ("content-type", object.content_type),
@@ -828,8 +982,10 @@ fn response_from_s3(object: ncro_s3::S3Object) -> Response {
     }
   }
   out
-    .body(Body::from_stream(S3ClientPool::body_stream(object.body)))
-    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    .body(Body::from_stream(
+      stream::once(async move { Ok(first) }).chain(stream),
+    ))
+    .ok()
 }
 
 fn response_from_s3_head(metadata: ncro_s3::S3ObjectHead) -> Response {
@@ -857,7 +1013,10 @@ fn response_from_s3_head(metadata: ncro_s3::S3ObjectHead) -> Response {
 mod tests {
   use std::time::{Duration, Instant};
 
-  use axum::{body::Body, http::Response};
+  use axum::{
+    body::Body,
+    http::{HeaderValue, Response},
+  };
   use ncro_health::{Status, UpstreamHealth};
 
   use super::{
@@ -882,10 +1041,10 @@ mod tests {
 
   #[test]
   fn provenance_uses_hostname_and_preserves_response_headers() {
-    let response = Response::builder()
-      .header("content-type", "text/plain")
-      .body(Body::empty())
-      .unwrap();
+    let mut response = Response::new(Body::empty());
+    response
+      .headers_mut()
+      .insert("content-type", HeaderValue::from_static("text/plain"));
     let response = with_provenance(
       response,
       "https://cache.example.test:8443/path?secret=ignored",
@@ -895,6 +1054,17 @@ mod tests {
     assert_eq!(response.headers()["content-type"], "text/plain");
     assert_eq!(response.headers()["x-ncro-upstream"], "cache.example.test");
     assert_eq!(response.headers()["x-ncro-route"], "race");
+  }
+
+  #[test]
+  fn provenance_marks_hedge_winners() {
+    let response = with_provenance(
+      Response::new(Body::empty()),
+      "https://cache.example.test",
+      RouteKind::Hedge,
+    );
+
+    assert_eq!(response.headers()["x-ncro-route"], "hedge");
   }
 
   #[test]

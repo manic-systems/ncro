@@ -2264,6 +2264,7 @@ dependencies = [
  "ncro-s3",
  "reqwest",
  "serde",
+ "tokio",
  "tower-http 0.7.0",
  "tracing",
  "url",
