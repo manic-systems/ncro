@@ -1,5 +1,7 @@
 # Configuration Reference
 
+[`config.example.toml`]: ../config.example.toml
+
 ncro reads TOML from the file passed with `--config`. In a configuration file,
 `[[upstreams]]` must contain at least one entry; every other section and setting
 is optional and uses the defaults below. With no configuration file, ncro
@@ -7,7 +9,8 @@ listens on `:8080` and uses `https://cache.nixos.org` as its only upstream.
 
 Start with one upstream, point Nix at ncro, then add routing, authentication, or
 network features only when they solve a concrete deployment need. See
-[`config.example.toml`](../config.example.toml) for a complete annotated file.
+[`config.example.toml`] for a complete, annotated file that you may use as
+reference.
 
 ## Minimal configuration
 
@@ -23,10 +26,12 @@ priority = 10
 db_path = "/var/lib/ncro/routes.db"
 ```
 
+[installation guide]: ./install.md
+
 At least one `[[upstreams]]` entry is required. Configure the corresponding
 public keys in Nix's `trusted-public-keys`; the NixOS module can add configured
-upstream keys automatically. The [installation guide](install.md) shows both
-NixOS and non-NixOS setups.
+upstream keys automatically. The [installation guide] shows both NixOS and
+non-NixOS setups.
 
 ## Configuration loading and environment overrides
 
@@ -44,6 +49,8 @@ these non-empty environment variables after reading that file:
 `[server]` controls ncro's listener, client-facing timeouts, and the cache
 capabilities advertised at `/nix-cache-info`.
 
+<!--markdownlint-disable MD013-->
+
 | Key               | Default   | Meaning                                                                                           |
 | ----------------- | --------- | ------------------------------------------------------------------------------------------------- |
 | `listen`          | `":8080"` | TCP address to bind.                                                                              |
@@ -51,6 +58,8 @@ capabilities advertised at `/nix-cache-info`.
 | `write_timeout`   | `"30s"`   | Maximum time allowed to write a response body to a client.                                        |
 | `cache_priority`  | `30`      | Positive `Priority` advertised to Nix; lower values are preferred by Nix when it compares caches. |
 | `want_mass_query` | `true`    | Advertise `WantMassQuery: 1`. Set false to discourage Nix from making bulk narinfo queries.       |
+
+<!--markdownlint-enable MD013-->
 
 Durations use the human-readable syntax used throughout this document, such as
 `"5s"`, `"10m"`, or `"1h"`.
@@ -72,19 +81,24 @@ narinfo_timeout = "10s"
 nar_timeout = "60s"
 ```
 
-| Key               | Default               | Meaning                                                                                                                 |
-| ----------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `url`             | required              | Base HTTP(S) cache URL or a Nix-style `s3://` URL.                                                                      |
-| `priority`        | `0`                   | Latency-tie preference; lower is preferred.                                                                             |
-| `public_key`      | empty                 | One accepted Nix narinfo signing key. Empty disables signature verification unless `public_keys` is set.                |
-| `public_keys`     | `[]`                  | Additional accepted signing keys. Use this for pull-through caches that can return narinfos signed by multiple origins. |
-| `username`        | empty                 | HTTP Basic Auth username. An empty username disables configured Basic Auth.                                             |
-| `password`        | unset                 | HTTP Basic Auth password. Mutually exclusive with `password_file`.                                                      |
-| `password_file`   | unset                 | File containing the HTTP Basic Auth password. One trailing newline is removed.                                          |
-| `narinfo_timeout` | `"5s"`                | Timeout for this upstream's narinfo HEAD race and GET fetches.                                                          |
-| `nar_timeout`     | `server.read_timeout` | Read timeout while streaming NAR data from this upstream.                                                               |
-| `nar_url_mode`    | `"to_self"`           | How the narinfo `URL:` field is returned; described below.                                                              |
-| `filters`         | `[]`                  | Narinfo path filters, described below.                                                                                  |
+<!--markdownlint-disable MD013-->
+
+| Key               | Default               | Meaning                                                                                                                                           |
+| ----------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`             | required              | Base HTTP(S) cache URL or a Nix-style `s3://` URL.                                                                                                |
+| `priority`        | `0`                   | Latency-tie preference; lower is preferred.                                                                                                       |
+| `public_key`      | empty                 | One accepted Nix narinfo signing key. Empty disables signature verification unless `public_keys` is set.                                          |
+| `public_keys`     | `[]`                  | Additional accepted signing keys. Use this for pull-through caches that can return narinfos signed by multiple origins.                           |
+| `username`        | empty                 | HTTP Basic Auth username. An empty username disables configured Basic Auth.                                                                       |
+| `password`        | unset                 | HTTP Basic Auth password. Mutually exclusive with `password_file`.                                                                                |
+| `password_file`   | unset                 | File containing the HTTP Basic Auth password. One trailing newline is removed.                                                                    |
+| `narinfo_timeout` | `"5s"`                | Timeout for this upstream's narinfo HEAD race and GET fetches.                                                                                    |
+| `nar_timeout`     | `server.read_timeout` | Read timeout while streaming NAR data from this upstream.                                                                                         |
+| `allow_hedging`   | `true`                | Permit this upstream to be launched as an additional NAR hedge. Set false for metered or residential sources; it may still be the initial source. |
+| `nar_url_mode`    | `"to_self"`           | How the narinfo `URL:` field is returned; described below.                                                                                        |
+| `filters`         | `[]`                  | Narinfo path filters, described below.                                                                                                            |
+
+<!--markdownlint-enable MD013-->
 
 `url` must be valid. `password` and `password_file` cannot both be set. When a
 key is configured, it must be valid Nix `name:base64` syntax.
@@ -93,11 +107,15 @@ key is configured, it must be valid Nix `name:base64` syntax.
 
 `nar_url_mode` changes the `URL:` line returned in a narinfo:
 
+<!--markdownlint-disable MD013-->
+
 | Value           | Behavior                                                                                                     |
 | --------------- | ------------------------------------------------------------------------------------------------------------ |
 | `"to_self"`     | Default. Rewrite the URL to ncro's canonical `nar/<store-hash>` path, so NAR traffic continues through ncro. |
 | `"to_upstream"` | Rewrite it to an absolute URL at the selected upstream; NAR traffic bypasses ncro.                           |
 | `"keep"`        | Return the upstream's URL unchanged.                                                                         |
+
+<!--markdownlint-enable MD013-->
 
 ### Filters
 
@@ -156,6 +174,8 @@ Credentials come from the standard AWS provider chain, including environment
 variables, shared AWS config/credential files, an explicit profile, and instance
 or task identity. `username` and `password` do not apply to S3.
 
+<!--markdownlint-disable MD013-->
+
 | Query parameter    | Default     | Meaning                                                                                          |
 | ------------------ | ----------- | ------------------------------------------------------------------------------------------------ |
 | `endpoint`         | unset       | Custom S3-compatible host.                                                                       |
@@ -164,10 +184,14 @@ or task identity. `username` and `password` do not apply to S3.
 | `profile`          | unset       | AWS shared-config profile.                                                                       |
 | `addressing-style` | `auto`      | `auto`, `path`, or `virtual`. Auto uses path style for custom endpoints and dotted bucket names. |
 
+<!--markdownlint-enable MD013-->
+
 ## Route cache and request concurrency
 
 `[cache]` stores routing metadata in SQLite; ncro never stores NAR bodies on
 disk.
+
+<!--markdownlint-disable MD013-->
 
 | Key                        | Default                     | Meaning                                                                                             |
 | -------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -178,7 +202,11 @@ disk.
 | `latency_alpha`            | `0.3`                       | EMA smoothing factor for probe latency, strictly between 0 and 1. Higher values react more quickly. |
 | `slow_statement_threshold` | `"1s"`                      | SQLite statement duration at which ncro logs a slow-statement warning.                              |
 
+<!--markdownlint-enable MD013-->
+
 `[cache.mass_query]` limits the work created by concurrent narinfo lookups:
+
+<!--markdownlint-disable MD013-->
 
 | Key                         | Default | Meaning                                                                                        |
 | --------------------------- | ------- | ---------------------------------------------------------------------------------------------- |
@@ -186,6 +214,30 @@ disk.
 | `per_upstream_max_inflight` | `8`     | Maximum in-flight narinfo requests per upstream. Must be at least 1.                           |
 | `in_memory_negative_ttl`    | `"5s"`  | Short in-memory suppression window for repeated misses. Must be positive.                      |
 | `upstream_cooldown`         | `"15s"` | How long a transient upstream network error excludes it from a narinfo race. Must be positive. |
+
+<!--markdownlint-enable MD013-->
+
+### NAR hedging
+
+`[cache.nar_hedging]` overlaps NAR requests when the initial source has not
+delivered successful headers and a first body chunk. It is enabled by default. A
+winner is streamed immediately after that first chunk and all loser requests are
+cancelled. `HEAD` NAR requests race all eligible normal upstreams immediately.
+The fallback cache is never a hedge candidate.
+
+<!--markdownlint-disable MD013-->
+
+| Key            | Default | Meaning                                                                                          |
+| -------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `enabled`      | `true`  | Enable delayed NAR hedging.                                                                      |
+| `delay`        | `"1s"`  | Delay before each additional candidate is started. Must be positive.                             |
+| `max_inflight` | `2`     | Maximum overlapping normal-source NAR attempts. `1` disables overlap; values must be at least 1. |
+
+<!--markdownlint-enable MD013-->
+
+Additional candidates use global priority groups and EMA latency within each
+group. `allow_hedging = false` excludes an upstream only from those additional
+candidates. Hedge winners do not replace the narinfo route stored in SQLite.
 
 ## Fallback cache
 
@@ -211,6 +263,8 @@ routing.
 `[discovery]` discovers local cache servers over mDNS and registers them as
 dynamic upstreams. It is disabled by default.
 
+<!--markdownlint-disable MD013-->
+
 | Key              | Default             | Meaning                                                                                       |
 | ---------------- | ------------------- | --------------------------------------------------------------------------------------------- |
 | `enabled`        | `false`             | Enable mDNS discovery.                                                                        |
@@ -219,6 +273,8 @@ dynamic upstreams. It is disabled by default.
 | `discovery_time` | `"5s"`              | How long each discovery cycle listens. Must be positive when enabled.                         |
 | `priority`       | `20`                | Priority assigned to discovered upstreams.                                                    |
 | `address_family` | `"any"`             | `any`, `ipv4`, or `ipv6`. `any` registers all routable addresses so the router can race them. |
+
+<!--markdownlint-enable MD013-->
 
 ## Mesh
 
@@ -237,6 +293,8 @@ addr = "100.64.1.2:7946"
 public_key = "a1b2c3..." # 32-byte ed25519 key, hex encoded
 ```
 
+<!--markdownlint-disable MD013-->
+
 | Key               | Default          | Meaning                                                                                |
 | ----------------- | ---------------- | -------------------------------------------------------------------------------------- |
 | `enabled`         | `false`          | Enable mesh gossip. At least one peer is required when enabled.                        |
@@ -245,6 +303,8 @@ public_key = "a1b2c3..." # 32-byte ed25519 key, hex encoded
 | `gossip_interval` | `"30s"`          | Interval between route announcements.                                                  |
 | `peers`           | `[]`             | Peer entries, each with required `addr` and optional hex-encoded 32-byte `public_key`. |
 
+<!--markdownlint-enable MD013-->
+
 Generate a persistent key with
 `ncro --generate-mesh-key /var/lib/ncro/node.key`.
 
@@ -252,18 +312,26 @@ Generate a persistent key with
 
 `[logging]` controls tracing output:
 
+<!--markdownlint-disable MD013-->
+
 | Key          | Default  | Meaning                                                                                                         |
 | ------------ | -------- | --------------------------------------------------------------------------------------------------------------- |
 | `level`      | `"info"` | A tracing `EnvFilter` directive, for example `"debug"` or `"ncro=debug,tower_http=warn"`. It must not be empty. |
 | `format`     | `"json"` | `json` or `text`.                                                                                               |
 | `timestamps` | `true`   | Include timestamps in ncro's log output. Disable under journald if its timestamps are sufficient.               |
 
+<!--markdownlint-enable MD013-->
+
 Successful narinfo and NAR responses also include diagnostic headers:
 
-| Header            | Meaning                                                                      |
-| ----------------- | ---------------------------------------------------------------------------- |
-| `X-Ncro-Upstream` | Hostname of the selected upstream.                                           |
-| `X-Ncro-Route`    | How ncro selected it: `cache-hit`, `race`, `direct`, `retry`, or `fallback`. |
+<!--markdownlint-disable MD013-->
+
+| Header            | Meaning                                                                                       |
+| ----------------- | --------------------------------------------------------------------------------------------- |
+| `X-Ncro-Upstream` | Hostname of the selected upstream.                                                            |
+| `X-Ncro-Route`    | How ncro selected the upstream. One of `cache-hit`, `race`, `direct`, `hedge`, or `fallback`. |
+
+<!--markdownlint-enable MD013-->
 
 These headers do not change the substituter URL Nix displays; it continues to
 show ncro's configured URL. They disclose the upstream hostname to clients, so
