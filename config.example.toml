@@ -29,6 +29,7 @@ url      = "https://nix-community.cachix.org"
 # nar_url_mode    = "keep" # keep | to_self | to_upstream
 # narinfo_timeout = "10s"  # overrides the router's race timeout for narinfo
 # nar_timeout     = "60s"  # overrides the server's read_timeout for NAR streams
+# allow_hedging   = false  # do not launch this upstream as an additional NAR hedge
 # username        = "ncro"
 # password_file   = "/run/secrets/ncro-upstream-password"
 
@@ -57,6 +58,13 @@ max_entries              = 100000
 negative_ttl             = "10m"
 slow_statement_threshold = "5s"
 ttl                      = "1h"
+
+[cache.nar_hedging]
+# Start another eligible source after this delay if no source has delivered a
+# successful response and first body byte. `max_inflight = 1` disables overlap.
+delay        = "1s"
+enabled      = true
+max_inflight = 2
 
 [cache.mass_query]
 in_memory_negative_ttl    = "5s"
