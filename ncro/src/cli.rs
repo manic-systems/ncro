@@ -283,6 +283,7 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
       .fallback_cache
       .enabled
       .then_some(cfg.fallback_cache.upstream.clone()),
+    nar_hedging:     cfg.cache.nar_hedging.clone(),
     cache_priority:  cfg.server.cache_priority,
     want_mass_query: cfg.server.want_mass_query,
     read_timeout:    cfg.server.read_timeout.0,
@@ -317,11 +318,11 @@ fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
   match (format, timestamps) {
     (LogFormat::Json, true) => fmt().json().with_env_filter(filter).init(),
     (LogFormat::Json, false) => {
-      fmt().json().without_time().with_env_filter(filter).init()
+      fmt().json().without_time().with_env_filter(filter).init();
     },
     (LogFormat::Text, true) => fmt().with_env_filter(filter).init(),
     (LogFormat::Text, false) => {
-      fmt().without_time().with_env_filter(filter).init()
+      fmt().without_time().with_env_filter(filter).init();
     },
   }
 }
