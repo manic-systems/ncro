@@ -28,7 +28,7 @@ ncro-server    = { path = "./crates/server", version = "2.2.2" }
 # Other deps
 anyhow             = "1.0.102"
 axum               = "0.8.9"
-base64             = "0.22.1"
+base64             = "0.23.1"
 bytes              = "1.12.1"
 chrono             = "0.4.44"
 dashmap            = "6.2.1"
@@ -37,7 +37,7 @@ futures-util       = "0.3.32"
 hex                = "0.4.3"
 humantime-serde    = "1.1.1"
 log                = "0.4.29"
-mdns-sd            = "0.20.0"
+mdns-sd            = "0.21.0"
 moka               = { version = "0.12.15", features = [ "future" ] }
 pound              = "0.1.6"
 prometheus         = "0.14.0"
