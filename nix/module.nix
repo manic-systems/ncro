@@ -79,6 +79,11 @@
       Restart = "on-failure";
       RestartSec = "5s";
 
+      # NAR proxying is not concurrency-gated: every in-flight NAR holds an
+      # inbound and an upstream socket for the duration of the transfer, so a
+      # single busy nix client can exceed systemd's 1024 soft limit.
+      LimitNOFILE = 65536;
+
       NoNewPrivileges = true;
       PrivateTmp = true;
       PrivateDevices = true;
@@ -313,6 +318,11 @@ in {
             StateDirectory = "ncro";
             Restart = "on-failure";
             RestartSec = "5s";
+
+            # NAR proxying is not concurrency-gated: every in-flight NAR holds an
+            # inbound and an upstream socket for the duration of the transfer, so a
+            # single busy nix client can exceed systemd's 1024 soft limit.
+            LimitNOFILE = 65536;
 
             # Hardening
             NoNewPrivileges = true;
