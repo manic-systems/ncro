@@ -948,16 +948,29 @@ impl Router {
   /// A canonical path doesn't carry the upstream's layout, so retrying a
   /// different upstream has to re-read its narinfo.
   ///
+  /// The upstream's filters are enforced here so NAR fetches honour the same
+  /// allow/deny rules as narinfo resolution; a denied path is reported as
+  /// [`RouterError::NotFound`].
+  ///
   /// # Errors
   ///
-  /// Returns [`RouterError::NotFound`] if the upstream does not have the path,
-  /// or propagates fetch, parse, and signature errors.
+  /// Returns [`RouterError::NotFound`] if the upstream does not have the path
+  /// or the path is rejected by the upstream's filters, or propagates fetch,
+  /// parse, and signature errors.
   pub async fn upstream_nar_path(
     &self,
     upstream: &str,
     store_hash: &str,
   ) -> Result<String, RouterError> {
     let (_, parsed) = self.fetch_narinfo(upstream, store_hash).await?;
+    if !self.upstream_allows_narinfo(upstream, &parsed).await {
+      tracing::debug!(
+        upstream,
+        store_path = &parsed.store_path,
+        "nar path rejected by upstream filter"
+      );
+      return Err(RouterError::NotFound);
+    }
     Ok(format!("/{}", relative_nar_url(&parsed.url)))
   }
 
@@ -1223,6 +1236,7 @@ mod tests {
     InflightGuard,
     NarInfo,
     Router,
+    RouterError,
     RouterTuning,
     canonical_nar_url,
     filter_rule_matches,
@@ -1545,6 +1559,40 @@ mod tests {
       .unwrap();
 
     assert_eq!(result.url, accepted);
+  }
+
+  #[tokio::test]
+  async fn upstream_nar_path_rejected_by_filter_reports_not_found() {
+    let upstream = spawn_narinfo_server(200, "unrelated-1.0").await;
+    let router = make_router(Duration::from_mins(1)).await;
+    router
+      .register_upstream_filters(upstream.clone(), vec![FilterRule {
+        action:  FilterAction::Allow,
+        field:   FilterField::Name,
+        pattern: "zedless*".to_string(),
+      }])
+      .await;
+
+    let result = router.upstream_nar_path(&upstream, "abc123").await;
+
+    assert!(matches!(result, Err(RouterError::NotFound)));
+  }
+
+  #[tokio::test]
+  async fn upstream_nar_path_allowed_by_filter_returns_path() {
+    let upstream = spawn_narinfo_server(200, "zedless-0.1.0").await;
+    let router = make_router(Duration::from_mins(1)).await;
+    router
+      .register_upstream_filters(upstream.clone(), vec![FilterRule {
+        action:  FilterAction::Allow,
+        field:   FilterField::Name,
+        pattern: "zedless*".to_string(),
+      }])
+      .await;
+
+    let path = router.upstream_nar_path(&upstream, "abc123").await.unwrap();
+
+    assert_eq!(path, "/nar/test.nar.xz");
   }
 
   #[tokio::test]
