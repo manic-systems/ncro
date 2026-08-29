@@ -344,13 +344,13 @@ in
     testScript = ''
       import json
 
-      def ncro_health(node):
-          out = node.succeed("curl -sf http://localhost:8080/health")
+      def ncro_status(node):
+          out = node.succeed("curl -sf http://localhost:8080/status")
           return json.loads(out)
 
-      def ncro_health_get_fallback(node, url_pattern):
+      def ncro_status_get_fallback(node, url_pattern):
           # some caches reject HEAD, 0 fails here means fallback worked and reset count.
-          h = ncro_health(node)
+          h = ncro_status(node)
           for u in h["upstreams"]:
               if url_pattern in u["url"]:
                   assert u["consecutive_fails"] == 0, \
@@ -512,10 +512,10 @@ in
               f"host ncro: cache hit metric not found in: {metrics[:300]!r}"
 
       with subtest("bincache2 probe succeeds with HEAD -> GET fallback"):
-          ncro_health_get_fallback(host, "bincache2")
+          ncro_status_get_fallback(host, "bincache2")
 
-      with subtest("secondary health endpoint lists host as upstream"):
-          h = ncro_health(secondary)
+      with subtest("secondary status endpoint lists host as upstream"):
+          h = ncro_status(secondary)
           upstream_urls = [u["url"] for u in h.get("upstreams", [])]
           assert any("host" in u for u in upstream_urls), \
               f"host not in secondary upstreams: {upstream_urls}"

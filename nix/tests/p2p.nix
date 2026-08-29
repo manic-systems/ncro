@@ -276,19 +276,19 @@ in
       import time
       import json
 
-      def ncro_health(node):
-          """Return the parsed /health JSON from ncro on the given node."""
-          out = node.succeed("curl -sf http://localhost:8080/health")
+      def ncro_status(node):
+          """Return the parsed /status JSON from ncro on the given node."""
+          out = node.succeed("curl -sf http://localhost:8080/status")
           return json.loads(out)
 
       def ncro_upstream_urls(node):
-          """Return the list of upstream URLs reported by ncro /health."""
-          h = ncro_health(node)
+          """Return the list of upstream URLs reported by ncro /status."""
+          h = ncro_status(node)
           return [u["url"] for u in h.get("upstreams", [])]
 
       def wait_for_upstreams(node, min_count, timeout=60):
           """
-          Poll /health until at least min_count upstreams are listed or
+          Poll /status until at least min_count upstreams are listed or
           timeout expires.  Raises on timeout.
           """
           deadline = time.time() + timeout
@@ -336,16 +336,16 @@ in
               assert "/nix/store" in out, \
                   f"{node.name}: /nix-cache-info has wrong StoreDir: {out!r}"
 
-          # /health must return JSON with a 'status' field and a non-empty
+          # /status must return JSON with a 'status' field and a non-empty
           # upstreams list where each entry carries url and status.
           for node in (node1, node2, node3):
-              h = ncro_health(node)
+              h = ncro_status(node)
               assert "status" in h, \
-                  f"{node.name}: /health missing 'status': {h!r}"
+                  f"{node.name}: /status missing 'status': {h!r}"
               assert "upstreams" in h, \
-                  f"{node.name}: /health missing 'upstreams': {h!r}"
+                  f"{node.name}: /status missing 'upstreams': {h!r}"
               assert len(h["upstreams"]) > 0, \
-                  f"{node.name}: /health upstreams list is empty"
+                  f"{node.name}: /status upstreams list is empty"
               for up in h["upstreams"]:
                   assert "url" in up and "status" in up, \
                       f"{node.name}: upstream entry missing fields: {up!r}"
@@ -368,7 +368,7 @@ in
       with subtest("wait for mDNS discovery to converge"):
           # discovery_time=5s; avahi needs a few seconds to propagate mDNS records
           # across the virtual network before ncro can discover them.
-          # We poll /health rather than sleeping a fixed amount.
+          # We poll /status rather than sleeping a fixed amount.
 
           # node2 should discover node1 and node3 (both run nix-serve).
           # The static cache.nixos.org upstream plus 2 discovered = >=3 total.
@@ -478,7 +478,7 @@ in
               "journalctl -u ncro --no-pager | grep -q 'removing stale peer'"
           )
 
-          # /health should now report fewer upstreams (node1's instance removed).
+          # /status should now report fewer upstreams (node1's instance removed).
           node2_upstreams_after = ncro_upstream_urls(node2)
           print(f"node2 upstreams after node1 avahi stopped: {node2_upstreams_after}")
 

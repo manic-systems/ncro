@@ -288,8 +288,8 @@ in
     testScript = ''
       import json
 
-      def ncro_health(node):
-          out = node.succeed("curl -sf http://localhost:8080/health")
+      def ncro_status(node):
+          out = node.succeed("curl -sf http://localhost:8080/status")
           return json.loads(out)
 
       def store_hash(path):
@@ -355,14 +355,14 @@ in
           assert "StorePath" in out, \
               f"auth backend did not serve narinfo with credentials: {out!r}"
 
-      with subtest("ncro health lists both upstreams"):
-          h = ncro_health(proxy)
-          assert "upstreams" in h, f"/health missing upstreams: {h!r}"
+      with subtest("ncro status lists both upstreams"):
+          h = ncro_status(proxy)
+          assert "upstreams" in h, f"/status missing upstreams: {h!r}"
           urls = [u["url"] for u in h["upstreams"]]
           assert any("backend:3900" in u for u in urls), \
-              f"S3 upstream missing from /health: {urls}"
+              f"S3 upstream missing from /status: {urls}"
           assert any("backend:8081" in u for u in urls), \
-              f"auth upstream missing from /health: {urls}"
+              f"auth upstream missing from /status: {urls}"
 
       with subtest("ncro proxies narinfo from S3 upstream"):
           cache_public_key = backend.succeed("cat /etc/nix/cache-key.pub").strip()
