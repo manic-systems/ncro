@@ -129,7 +129,7 @@ further in the [architechture document].
 
 Successful narinfo and NAR responses include diagnostic provenance headers:
 `X-Ncro-Upstream` is the selected upstream hostname and `X-Ncro-Route` is one of
-`cache-hit`, `race`, `direct`, `retry`, or `fallback`. These headers are for
+`cache-hit`, `race`, `direct`, `hedge`, or `fallback`. These headers are for
 operators; Nix still identifies the substituter by ncro's configured URL (such
 as `http://localhost:8080`).
 
@@ -148,6 +148,10 @@ as `http://localhost:8080`).
 - On a cache miss, ncro races all configured upstreams in parallel and returns
   the first successful response. Unhealthy upstreams (detected by consecutive
   probe failures) are excluded from the race until they recover.
+- NAR downloads start with the selected upstream and hedge progressively when it
+  has not delivered a first byte. Hedging defaults to one second and two
+  concurrent attempts; set `allow_hedging = false` for a source that must not be
+  launched as an additional hedge.
 - Per-upstream filters are applied after ncro fetches the full narinfo from a
   candidate winner. Rejected upstreams are not cached as winners and ncro keeps
   looking for another acceptable upstream.
@@ -595,15 +599,17 @@ Prometheus metrics are available at `/metrics`.
 
 <!--markdownlint-disable MD013-->
 
-| Metric                                    | Type      | Description                              |
-| ----------------------------------------- | --------- | ---------------------------------------- |
-| `ncro_narinfo_cache_hits_total`           | counter   | Narinfo requests served from route cache |
-| `ncro_narinfo_cache_misses_total`         | counter   | Narinfo requests requiring upstream race |
-| `ncro_narinfo_requests_total{status}`     | counter   | Narinfo requests by status (200/error)   |
-| `ncro_nar_requests_total`                 | counter   | NAR streaming requests                   |
-| `ncro_upstream_race_wins_total{upstream}` | counter   | Race wins per upstream                   |
-| `ncro_upstream_latency_seconds{upstream}` | histogram | Race latency per upstream                |
-| `ncro_route_entries`                      | gauge     | Current route entries in SQLite          |
+| Metric                                         | Type      | Description                                   |
+| ---------------------------------------------- | --------- | --------------------------------------------- |
+| `ncro_narinfo_cache_hits_total`                | counter   | Narinfo requests served from route cache      |
+| `ncro_narinfo_cache_misses_total`              | counter   | Narinfo requests requiring upstream race      |
+| `ncro_narinfo_requests_total{status}`          | counter   | Narinfo requests by status (200/error)        |
+| `ncro_nar_requests_total`                      | counter   | NAR streaming requests                        |
+| `ncro_nar_hedges_total{event,upstream}`        | counter   | NAR hedge start, win, and cancellation events |
+| `ncro_nar_hedge_failures_total{kind,upstream}` | counter   | Failed NAR attempts during hedging            |
+| `ncro_upstream_race_wins_total{upstream}`      | counter   | Race wins per upstream                        |
+| `ncro_upstream_latency_seconds{upstream}`      | histogram | Race latency per upstream                     |
+| `ncro_route_entries`                           | gauge     | Current route entries in SQLite               |
 
 <!--markdownlint-enable MD013-->
 
