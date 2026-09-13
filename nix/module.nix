@@ -6,7 +6,7 @@
 }: let
   inherit (lib.modules) mkIf;
   inherit (lib.options) mkOption mkEnableOption literalExpression;
-  inherit (lib.types) attrsOf bool package nullOr path submodule;
+  inherit (lib.types) attrsOf bool package nullOr path port submodule;
   inherit (lib.lists) optional optionals;
   inherit (lib.attrsets) optionalAttrs;
 
@@ -14,19 +14,33 @@
   tomlType = tomlFormat.type;
 
   cfg = config.services.ncro;
-  configFile = tomlFormat.generate "ncro.toml" cfg.settings;
+  defaultServerPort = 8080;
+  defaultMeshPort = 7946;
+  configFile = tomlFormat.generate "ncro.toml" effectiveSettings;
 
   # Normalize a ncro listen address (`:port` shorthand) to the
   # `host:port` format expected by systemd's ListenStream.
-  toListenStream = addr: let
-    raw =
-      if addr == ""
-      then ":8080"
-      else addr;
+  normalizeAddr = addr:
+    if lib.hasPrefix ":" addr
+    then "0.0.0.0${addr}"
+    else addr;
+
+  addrParts = addr: let
+    matches = builtins.match "(.*):([0-9]+)" addr;
   in
-    if lib.hasPrefix ":" raw
-    then "0.0.0.0${raw}"
-    else raw;
+    if matches == null
+    then throw "ncro address ${addr} must end in a numeric port"
+    else {
+      host = builtins.elemAt matches 0;
+      port = lib.toInt (builtins.elemAt matches 1);
+    };
+
+  portOfAddr = addr: (addrParts addr).port;
+
+  isLoopbackAddr = addr: let
+    host = (addrParts addr).host;
+  in
+    host == "localhost" || host == "::1" || host == "[::1]" || lib.hasPrefix "127." host;
 
   publicKeysFor = upstream:
     optional ((upstream.public_key or "") != "") upstream.public_key
@@ -57,7 +71,7 @@
     ];
 
   instanceConfigFile = name: instance:
-    tomlFormat.generate "ncro-${name}.toml" instance.settings;
+    tomlFormat.generate "ncro-${name}.toml" (effectiveInstanceSettings instance);
 
   instanceWrapper = pkgs.writeShellScript "ncro-instance" ''
     if [ -s "$CREDENTIALS_DIRECTORY/netrc" ]; then
@@ -106,20 +120,80 @@
     };
   };
 
+  listenAddrFor = fallbackPort: settings:
+    if (settings.server.listen or "") != ""
+    then settings.server.listen
+    else ":${toString fallbackPort}";
+
+  meshAddrFor = fallbackPort: settings:
+    if (settings.mesh.bind_addr or "") != ""
+    then settings.mesh.bind_addr
+    else "0.0.0.0:${toString fallbackPort}";
+
+  effectiveSettingsFor = serverPort: meshPort: settings:
+    lib.recursiveUpdate settings {
+      server.listen = listenAddrFor serverPort settings;
+      mesh.bind_addr = meshAddrFor meshPort settings;
+    };
+
+  effectiveSettings = effectiveSettingsFor cfg.port cfg.meshPort cfg.settings;
+  effectiveInstanceSettings = instance:
+    effectiveSettingsFor
+    (lib.defaultTo defaultServerPort instance.port)
+    (lib.defaultTo defaultMeshPort instance.meshPort)
+    instance.settings;
+
   instanceSocket = name: instance: {
     wantedBy = ["sockets.target"];
-    socketConfig.ListenStream = toListenStream instance.settings.server.listen;
+    socketConfig.ListenStream = normalizeAddr (effectiveInstanceSettings instance).server.listen;
   };
 
+  activeListeners =
+    if cfg.instances == {}
+    then [
+      {
+        settings = effectiveSettings;
+        openFirewall = cfg.openFirewall;
+      }
+    ]
+    else
+      lib.mapAttrsToList (_: instance: {
+        settings = effectiveInstanceSettings instance;
+        openFirewall = cfg.openFirewall || instance.openFirewall;
+      })
+      cfg.instances;
+
+  firewallListeners = builtins.filter (listener: listener.openFirewall) activeListeners;
+
+  firewallTCPPorts = lib.unique (
+    builtins.map (listener: portOfAddr listener.settings.server.listen)
+    (builtins.filter (listener: !isLoopbackAddr listener.settings.server.listen) firewallListeners)
+  );
+
+  firewallUDPPorts = lib.unique (
+    builtins.map (listener: portOfAddr listener.settings.mesh.bind_addr)
+    (builtins.filter (
+        listener:
+          (listener.settings.mesh.enabled or false)
+          && !isLoopbackAddr listener.settings.mesh.bind_addr
+      )
+      firewallListeners)
+  );
+
   instanceListenAddresses =
-    builtins.map
-    (instance: instance.settings.server.listen)
-    (builtins.attrValues cfg.instances);
+    lib.mapAttrsToList
+    (_: instance: normalizeAddr (effectiveInstanceSettings instance).server.listen)
+    cfg.instances;
+
+  instanceMeshAddresses =
+    builtins.map (settings: normalizeAddr settings.mesh.bind_addr)
+    (builtins.filter (settings: settings.mesh.enabled or false)
+      (lib.mapAttrsToList (_: effectiveInstanceSettings) cfg.instances));
 
   upstreamPublicKeys = lib.unique (
-    upstreamPublicKeysFor cfg.settings
+    upstreamPublicKeysFor effectiveSettings
     ++ lib.flatten (builtins.map
-      (instance: upstreamPublicKeysFor instance.settings)
+      (instance: upstreamPublicKeysFor (effectiveInstanceSettings instance))
       (builtins.attrValues cfg.instances))
   );
 
@@ -170,7 +244,38 @@ in {
 
         A {manpage}`systemd.socket(5)` unit `ncro.socket` is created automatically.
         The listen address is taken from {option}`services.ncro.settings.server.listen`
-        if set, defaulting to `:8080`.
+        if set, otherwise from {option}`services.ncro.port`.
+      '';
+    };
+
+    port = mkOption {
+      type = port;
+      default = defaultServerPort;
+      description = ''
+        TCP port for the ncro HTTP listener. Reach for
+        {option}`services.ncro.settings.server.listen` when you need to pin the
+        bind address too, since it overrides this option.
+      '';
+    };
+
+    meshPort = mkOption {
+      type = port;
+      default = defaultMeshPort;
+      description = ''
+        UDP port for mesh gossip. Reach for
+        {option}`services.ncro.settings.mesh.bind_addr` when you need to pin
+        the bind address too, since it overrides this option.
+      '';
+    };
+
+    openFirewall = mkOption {
+      type = bool;
+      default = false;
+      description = ''
+        Open the firewall for whichever ports the listeners actually landed
+        on, across every named instance as well. Mesh gossip is included only
+        when mesh is enabled, and a listener bound to loopback is skipped
+        since nothing outside the machine can reach one anyway.
       '';
     };
 
@@ -229,8 +334,41 @@ in {
     instances = mkOption {
       type = attrsOf (submodule ({...}: {
         options = {
+          port = mkOption {
+            type = nullOr port;
+            default = null;
+            example = 8081;
+            description = ''
+              TCP port for this instance, which is enough on its own to give
+              the instance a listen address. Setting `settings.server.listen`
+              overrides it.
+            '';
+          };
+
+          meshPort = mkOption {
+            type = nullOr port;
+            default = null;
+            example = 7947;
+            description = ''
+              UDP port for this instance's mesh gossip. Setting
+              `settings.mesh.bind_addr` overrides it. Instances that enable
+              mesh each need a port of their own.
+            '';
+          };
+
+          openFirewall = mkOption {
+            type = bool;
+            default = false;
+            description = ''
+              Open the firewall for this instance alone, on the same terms as
+              the toplevel {option}`services.ncro.openFirewall`, which covers
+              every instance at once.
+            '';
+          };
+
           settings = mkOption {
             type = tomlType;
+            default = {};
             description = "Configuration for this ncro instance.";
           };
 
@@ -253,7 +391,9 @@ in {
         as `ncro@<name>.service`, with its own
         state directory, SQLite route cache, and optionally socket unit.
 
-        Every instance must set `settings.server.listen` to a unique address.
+        Every instance must set `port` or `settings.server.listen` to a unique
+        address, and mesh-enabled instances must likewise use unique
+        `meshPort` or `settings.mesh.bind_addr` values.
       '';
       example.project = {
         settings = {
@@ -270,8 +410,8 @@ in {
 
     assertions =
       (lib.mapAttrsToList (name: instance: {
-          assertion = instance.settings ? server && instance.settings.server ? listen;
-          message = "services.ncro.instances.${name}.settings.server.listen must be set";
+          assertion = instance.port != null || (instance.settings.server.listen or "") != "";
+          message = "services.ncro.instances.${name} needs either port or settings.server.listen";
         })
         cfg.instances)
       ++ (lib.mapAttrsToList (name: _: {
@@ -282,7 +422,11 @@ in {
       ++ [
         {
           assertion = builtins.length instanceListenAddresses == builtins.length (lib.unique instanceListenAddresses);
-          message = "services.ncro.instances must use unique settings.server.listen addresses";
+          message = "services.ncro.instances must use unique listen addresses (port or settings.server.listen)";
+        }
+        {
+          assertion = builtins.length instanceMeshAddresses == builtins.length (lib.unique instanceMeshAddresses);
+          message = "services.ncro.instances with mesh enabled must use unique mesh addresses (meshPort or settings.mesh.bind_addr)";
         }
       ];
 
@@ -290,8 +434,7 @@ in {
       {
         ncro = mkIf (cfg.instances == {} && cfg.socketActivation) {
           wantedBy = ["sockets.target"];
-          socketConfig.ListenStream =
-            toListenStream (cfg.settings.server.listen or "");
+          socketConfig.ListenStream = normalizeAddr effectiveSettings.server.listen;
         };
       }
       // lib.mapAttrs' (
@@ -356,6 +499,11 @@ in {
           // optionalAttrs (cfg.netrcFile != null) {LoadCredential = ["netrc:${cfg.netrcFile}"];};
       };
       "ncro@" = mkIf (cfg.instances != {}) instanceService;
+    };
+
+    networking.firewall = mkIf (firewallTCPPorts != [] || firewallUDPPorts != []) {
+      allowedTCPPorts = firewallTCPPorts;
+      allowedUDPPorts = firewallUDPPorts;
     };
 
     environment.etc = instanceEtc;

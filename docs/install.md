@@ -130,6 +130,8 @@ change it.
 {
   services.ncro = {
     enable = true;
+    port = 8081;
+    openFirewall = true;
     settings = {
       upstreams = [
         {
@@ -141,9 +143,18 @@ change it.
     };
   };
 
-  nix.settings.substituters = [ "http://localhost:8080" ];
+  nix.settings.substituters = [ "http://localhost:8081" ];
 }
 ```
+
+`port` and `meshPort` are the short way to move ncro off its defaults of 8080
+and 7946. Reach for `settings.server.listen` or `settings.mesh.bind_addr` when
+you need to pin the bind address too, since those carry an address as well as a
+port and override the port options.
+
+`openFirewall` opens whichever ports the listeners actually landed on. It adds
+the mesh port only when mesh is enabled, and skips any listener bound to
+loopback, since nothing outside the machine can reach one anyway.
 
 By default, the module appends every non-empty
 `services.ncro.settings.upstreams.*.public_key` value to
@@ -155,16 +166,18 @@ to true.
 
 To serve different caches from one machine, declare named instances. The module
 starts the `ncro@.service` template as `ncro@<name>.service` and gives it an
-isolated `/var/lib/ncro-<name>` state directory for each one. Each instance must
-use a unique listen address:
+isolated `/var/lib/ncro-<name>` state directory for each one. Every instance
+needs a listen address no other instance uses, given either as `port` or as
+`settings.server.listen`, and the same goes for the mesh port once more than one
+instance enables mesh:
 
 ```nix
 services.ncro = {
   enable = true;
   instances = {
-    public.settings = {
-      server.listen = "127.0.0.1:8081";
-      upstreams = [{ url = "https://cache.nixos.org"; }];
+    public = {
+      port = 8081;
+      settings.upstreams = [{ url = "https://cache.nixos.org"; }];
     };
 
     internal.settings = {
@@ -175,8 +188,10 @@ services.ncro = {
 };
 ```
 
-With any named instances, the compatibility `ncro.service` is omitted. Set
-`socketActivation = true` on an instance to create its matching socket unit.
+Declaring any named instance drops the compatibility `ncro.service`. Each
+instance carries its own `port`, `meshPort`, and `openFirewall`, while the
+top-level `openFirewall` covers all of them at once. Set `socketActivation` on
+an instance to give it a matching socket unit.
 
 ### Discovery
 
