@@ -46,6 +46,8 @@ pub enum NarInfoError {
   InvalidPublicKeyBase64 { input: String, source: DecodeError },
   #[error("invalid public key size {got}, want 32")]
   InvalidPublicKeySize { got: usize },
+  #[error("invalid public key {input:?}: invalid Ed25519 encoding")]
+  InvalidPublicKeyEncoding { input: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -115,7 +117,8 @@ fn normalize_nar_hash(s: &str) -> String {
 /// # Errors
 ///
 /// Returns [`NarInfoError`] if the input lacks a `name:base64` separator,
-/// the name is empty, the base64 is invalid, or the key is not 32 bytes.
+/// the name is empty, the base64 is invalid, the key is not 32 bytes, or the
+/// bytes do not encode a valid Ed25519 public key.
 pub fn parse_public_key(
   input: &str,
 ) -> Result<(String, VerifyingKey), NarInfoError> {
@@ -138,8 +141,11 @@ pub fn parse_public_key(
   let bytes: [u8; 32] = raw.try_into().map_err(|raw: Vec<u8>| {
     NarInfoError::InvalidPublicKeySize { got: raw.len() }
   })?;
-  let key = VerifyingKey::from_bytes(&bytes)
-    .map_err(|_| NarInfoError::InvalidPublicKeySize { got: bytes.len() })?;
+  let key = VerifyingKey::from_bytes(&bytes).map_err(|_| {
+    NarInfoError::InvalidPublicKeyEncoding {
+      input: input.to_string(),
+    }
+  })?;
   Ok((name.to_string(), key))
 }
 
