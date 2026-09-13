@@ -32,7 +32,7 @@ use ncro_s3::S3ClientPool;
 use serde::Serialize;
 use tokio::{
   task::JoinSet,
-  time::{Instant as TokioInstant, sleep_until},
+  time::{Instant as TokioInstant, sleep_until, timeout},
 };
 use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
 use url::Url;
@@ -84,23 +84,29 @@ fn with_provenance(
 
 #[derive(Clone)]
 pub struct AppState {
-  router:          Router,
-  prober:          Prober,
-  db:              Db,
-  upstreams:       Vec<UpstreamConfig>,
-  fallback_cache:  Option<UpstreamConfig>,
-  s3:              S3ClientPool,
-  nar_clients:     HashMap<String, reqwest::Client>,
-  default_client:  reqwest::Client,
-  nar_hedging:     NarHedgingConfig,
-  cache_priority:  i32,
-  want_mass_query: bool,
-  started:         Instant,
+  router:              Router,
+  prober:              Prober,
+  db:                  Db,
+  upstreams:           Vec<UpstreamConfig>,
+  fallback_cache:      Option<UpstreamConfig>,
+  s3:                  S3ClientPool,
+  nar_client:          reqwest::Client,
+  narinfo_client:      reqwest::Client,
+  nar_timeouts:        HashMap<String, Duration>,
+  default_nar_timeout: Duration,
+  nar_hedging:         NarHedgingConfig,
+  cache_priority:      i32,
+  want_mass_query:     bool,
+  started:             Instant,
 }
 
 impl AppState {
-  fn nar_client(&self, url: &str) -> &reqwest::Client {
-    self.nar_clients.get(url).unwrap_or(&self.default_client)
+  fn nar_timeout(&self, url: &str) -> Duration {
+    self
+      .nar_timeouts
+      .get(url)
+      .copied()
+      .unwrap_or(self.default_nar_timeout)
   }
 }
 
@@ -146,25 +152,14 @@ pub fn app(
     s3.register(upstream.url.clone(), config.clone());
   }
 
-  let mut nar_clients = HashMap::new();
-  for upstream in &upstreams {
+  let mut nar_timeouts = HashMap::new();
+  for upstream in upstreams.iter().chain(fallback_cache.iter()) {
     let timeout = upstream.nar_timeout.as_ref().map_or(read_timeout, |t| t.0);
-    nar_clients.insert(
-      upstream.url.clone(),
-      reqwest::Client::builder().read_timeout(timeout).build()?,
-    );
-  }
-  if let Some(upstream) = &fallback_cache
-    && !nar_clients.contains_key(&upstream.url)
-  {
-    let timeout = upstream.nar_timeout.as_ref().map_or(read_timeout, |t| t.0);
-    nar_clients.insert(
-      upstream.url.clone(),
-      reqwest::Client::builder().read_timeout(timeout).build()?,
-    );
+    nar_timeouts.entry(upstream.url.clone()).or_insert(timeout);
   }
 
-  let default_client = reqwest::Client::builder()
+  let nar_client = reqwest::Client::builder().build()?;
+  let narinfo_client = reqwest::Client::builder()
     .read_timeout(read_timeout)
     .build()?;
 
@@ -175,8 +170,10 @@ pub fn app(
     upstreams,
     fallback_cache,
     s3,
-    nar_clients,
-    default_client,
+    nar_client,
+    narinfo_client,
+    nar_timeouts,
+    default_nar_timeout: read_timeout,
     nar_hedging,
     cache_priority,
     want_mass_query,
@@ -434,7 +431,7 @@ async fn narinfo(
       }
       with_provenance(
         proxy(
-          state.nar_client(&result.url),
+          &state.narinfo_client,
           req.method().clone(),
           req.headers(),
           format!("{}{}", result.url, req.uri().path()),
@@ -488,17 +485,23 @@ fn spawn_nar_attempt(
   candidate: NarCandidate,
 ) {
   attempts.spawn(async move {
-    let response = try_nar_upstream(NarUpstreamRequest {
-      client: state.nar_client(&candidate.upstream),
-      s3: &state.s3,
-      method,
-      headers: &headers,
-      upstream: &candidate.upstream,
-      path: &candidate.path,
-      route: candidate.route,
-      auth: upstream_auth(&state, &candidate.upstream),
-    })
-    .await;
+    let response_timeout = state.nar_timeout(&candidate.upstream);
+    let response = timeout(
+      response_timeout,
+      try_nar_upstream(NarUpstreamRequest {
+        client: &state.nar_client,
+        s3: &state.s3,
+        method,
+        headers: &headers,
+        upstream: &candidate.upstream,
+        path: &candidate.path,
+        route: candidate.route,
+        auth: upstream_auth(&state, &candidate.upstream),
+      }),
+    )
+    .await
+    .ok()
+    .flatten();
     (candidate, response)
   });
 }
@@ -725,16 +728,19 @@ async fn nar(
 
   let _ = routed_upstream;
   if let Some(fallback) = &state.fallback_cache
-    && let Some(resp) = try_nar_upstream(NarUpstreamRequest {
-      client:   state.nar_client(&fallback.url),
-      s3:       &state.s3,
-      method:   req.method().clone(),
-      headers:  req.headers(),
-      upstream: &fallback.url,
-      path:     &path_and_query,
-      route:    RouteKind::Fallback,
-      auth:     upstream_auth(&state, &fallback.url),
-    })
+    && let Ok(Some(resp)) = timeout(
+      state.nar_timeout(&fallback.url),
+      try_nar_upstream(NarUpstreamRequest {
+        client:   &state.nar_client,
+        s3:       &state.s3,
+        method:   req.method().clone(),
+        headers:  req.headers(),
+        upstream: &fallback.url,
+        path:     &path_and_query,
+        route:    RouteKind::Fallback,
+        auth:     upstream_auth(&state, &fallback.url),
+      }),
+    )
     .await
   {
     return resp;
@@ -774,7 +780,7 @@ async fn try_fallback_narinfo(
       }
       Some(with_provenance(
         proxy(
-          state.nar_client(&result.url),
+          &state.narinfo_client,
           req.method().clone(),
           req.headers(),
           format!("{}{}", result.url, req.uri().path()),
@@ -869,7 +875,7 @@ async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
   }
   let resp = upstream_request(
     client,
-    method,
+    method.clone(),
     headers,
     format!("{upstream}{path}"),
     auth,
@@ -878,6 +884,11 @@ async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
   .ok()?;
   if !resp.status().is_success() {
     return None;
+  }
+  if method == Method::HEAD {
+    let status = StatusCode::from_u16(resp.status().as_u16()).ok()?;
+    let response = response_from_headers(status, resp.headers(), Body::empty());
+    return Some(with_provenance(response, upstream, route));
   }
   let response = response_from_reqwest_first_byte(resp).await?;
   Some(with_provenance(response, upstream, route))

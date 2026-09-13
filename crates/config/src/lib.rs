@@ -803,7 +803,7 @@ pub struct UpstreamConfig {
   /// Optional per-upstream timeout for narinfo HEAD races and GET fetches.
   /// When unset, the router's global race timeout is used.
   pub narinfo_timeout: Option<HumanDuration>,
-  /// Optional per-upstream timeout for NAR file streaming requests.
+  /// Optional per-upstream timeout for NAR response headers and first byte.
   /// When unset, the server's global `read_timeout` is used.
   pub nar_timeout:     Option<HumanDuration>,
   /// Whether this upstream may be started as an additional NAR hedge.
