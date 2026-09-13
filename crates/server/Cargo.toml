@@ -15,6 +15,7 @@ ncro-config.workspace  = true
 ncro-db.workspace      = true
 ncro-health.workspace  = true
 ncro-metrics.workspace = true
+ncro-narinfo.workspace = true
 ncro-router.workspace  = true
 ncro-s3.workspace      = true
 reqwest                = { workspace = true, features = [ "rustls", "stream" ] }

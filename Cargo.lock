@@ -2281,6 +2281,7 @@ dependencies = [
  "ncro-db",
  "ncro-health",
  "ncro-metrics",
+ "ncro-narinfo",
  "ncro-router",
  "ncro-s3",
  "reqwest",

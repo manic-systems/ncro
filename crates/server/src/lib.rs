@@ -26,6 +26,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
+use ncro_narinfo::NarInfo;
 use ncro_router::{Router, RouterError, store_hash_from_canonical_nar_url};
 use ncro_s3::S3ClientPool;
 use serde::Serialize;
@@ -594,6 +595,7 @@ async fn hedge_candidates(
   path: &str,
   skip: &str,
   include_hedging_opt_outs: bool,
+  expected_narinfo: Option<&NarInfo>,
 ) -> Vec<NarCandidate> {
   let mut by_priority = BTreeMap::<i32, Vec<UpstreamHealth>>::new();
   for health in state.prober.sorted_by_latency().await {
@@ -611,7 +613,7 @@ async fn hedge_candidates(
       let candidate_path = if let Some(store_hash) = store_hash {
         let Ok(candidate_path) = state
           .router
-          .upstream_nar_path(&health.url, store_hash)
+          .upstream_nar_path(&health.url, store_hash, expected_narinfo)
           .await
         else {
           continue;
@@ -660,14 +662,21 @@ async fn nar(
     } else {
       &entry.upstream_nar_url
     };
-    let candidates = hedge_candidates(
-      &state,
-      store_hash_from_canonical_nar_url(&nar_url),
-      &path_and_query,
-      &entry.upstream_url,
-      false,
-    )
-    .await;
+    let candidates = if let Some(Ok(expected_narinfo)) =
+      entry.narinfo_bytes.as_deref().map(NarInfo::parse)
+    {
+      hedge_candidates(
+        &state,
+        store_hash_from_canonical_nar_url(&nar_url),
+        &path_and_query,
+        &entry.upstream_url,
+        false,
+        Some(&expected_narinfo),
+      )
+      .await
+    } else {
+      Vec::new()
+    };
     normal_attempted = true;
     if let Some(resp) = hedged_nar(
       Arc::clone(&state),
@@ -694,6 +703,7 @@ async fn nar(
       &path_and_query,
       "",
       true,
+      None,
     )
     .await;
     if let Some(mut initial) = candidates.pop() {

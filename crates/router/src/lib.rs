@@ -961,6 +961,7 @@ impl Router {
     &self,
     upstream: &str,
     store_hash: &str,
+    expected_narinfo: Option<&NarInfo>,
   ) -> Result<String, RouterError> {
     let (_, parsed) = self.fetch_narinfo(upstream, store_hash).await?;
     if !self.upstream_allows_narinfo(upstream, &parsed).await {
@@ -968,6 +969,21 @@ impl Router {
         upstream,
         store_path = &parsed.store_path,
         "nar path rejected by upstream filter"
+      );
+      return Err(RouterError::NotFound);
+    }
+    if let Some(expected) = expected_narinfo
+      && (parsed.store_path != expected.store_path
+        || parsed.compression != expected.compression
+        || parsed.file_hash != expected.file_hash
+        || parsed.file_size != expected.file_size
+        || parsed.nar_hash != expected.nar_hash
+        || parsed.nar_size != expected.nar_size)
+    {
+      tracing::debug!(
+        upstream,
+        store_hash,
+        "nar metadata differs from routed narinfo"
       );
       return Err(RouterError::NotFound);
     }
@@ -1573,7 +1589,7 @@ mod tests {
       }])
       .await;
 
-    let result = router.upstream_nar_path(&upstream, "abc123").await;
+    let result = router.upstream_nar_path(&upstream, "abc123", None).await;
 
     assert!(matches!(result, Err(RouterError::NotFound)));
   }
@@ -1590,7 +1606,10 @@ mod tests {
       }])
       .await;
 
-    let path = router.upstream_nar_path(&upstream, "abc123").await.unwrap();
+    let path = router
+      .upstream_nar_path(&upstream, "abc123", None)
+      .await
+      .unwrap();
 
     assert_eq!(path, "/nar/test.nar.xz");
   }
