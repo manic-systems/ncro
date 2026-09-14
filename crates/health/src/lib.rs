@@ -270,12 +270,32 @@ impl Prober {
     let auth = self.inner.auth.read().await.get(&url).cloned();
     let start = Instant::now();
     let ok = if self.inner.s3.contains(&url) {
-      self
-        .inner
-        .s3
-        .head_object(&url, "nix-cache-info")
-        .await
-        .unwrap_or(false)
+      match self.inner.s3.head_object(&url, "nix-cache-info").await {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(head_error) => {
+          tracing::debug!(
+            upstream = %url,
+            error = %head_error,
+            "S3 HEAD probe failed, trying GET"
+          );
+          match self.inner.s3.get_object(&url, "nix-cache-info", None).await {
+            Ok(Some(object)) => {
+              drop(object.body);
+              true
+            },
+            Ok(None) => false,
+            Err(get_error) => {
+              tracing::debug!(
+                upstream = %url,
+                error = %get_error,
+                "S3 GET probe failed"
+              );
+              false
+            },
+          }
+        },
+      }
     } else {
       let url_path = format!("{url}/nix-cache-info");
       let mut head_req = self.inner.client.head(&url_path);

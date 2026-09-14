@@ -2198,6 +2198,7 @@ dependencies = [
  "ncro-s3",
  "reqwest",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

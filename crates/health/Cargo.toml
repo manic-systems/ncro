@@ -12,6 +12,7 @@ repository.workspace  = true
 ncro-config.workspace = true
 ncro-s3.workspace     = true
 reqwest               = { workspace = true, features = [ "rustls" ] }
+tracing.workspace     = true
 tokio                 = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
 
 [lints]
