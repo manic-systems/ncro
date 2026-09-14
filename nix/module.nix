@@ -4,11 +4,14 @@
   lib,
   ...
 }: let
+  inherit (builtins) isAttrs attrValues attrNames;
   inherit (lib.modules) mkIf;
   inherit (lib.options) mkOption mkEnableOption literalExpression;
   inherit (lib.types) attrsOf bool package nullOr path port submodule;
-  inherit (lib.lists) optional optionals;
-  inherit (lib.attrsets) optionalAttrs;
+  inherit (lib.lists) optional optionals filter elemAt map flatten unique;
+  inherit (lib.attrsets) optionalAttrs mapAttrsToList recursiveUpdate mapAttrs' nameValuePair filterAttrs;
+  inherit (lib.strings) match toInt;
+  inherit (lib.trivial) defaultTo;
 
   tomlFormat = pkgs.formats.toml {};
   tomlType = tomlFormat.type;
@@ -26,19 +29,19 @@
     else addr;
 
   addrParts = addr: let
-    matches = builtins.match "(.*):([0-9]+)" addr;
+    matches = match "(.*):([0-9]+)" addr;
   in
     if matches == null
     then throw "ncro address ${addr} must end in a numeric port"
     else {
-      host = builtins.elemAt matches 0;
-      port = lib.toInt (builtins.elemAt matches 1);
+      host = elemAt matches 0;
+      port = toInt (elemAt matches 1);
     };
 
   portOfAddr = addr: (addrParts addr).port;
 
   isLoopbackAddr = addr: let
-    host = (addrParts addr).host;
+    inherit ((addrParts addr)) host;
   in
     host == "localhost" || host == "::1" || host == "[::1]" || lib.hasPrefix "127." host;
 
@@ -61,13 +64,13 @@
       else [];
   in
     lib.pipe ((settings.upstreams or []) ++ [fallbackPublicKeys]) [
-      (builtins.map (upstream:
-        if builtins.isAttrs upstream
+      (map (upstream:
+        if isAttrs upstream
         then publicKeysFor upstream
         else upstream))
-      lib.flatten
-      (builtins.filter (key: key != ""))
-      lib.unique
+      flatten
+      (filter (key: key != ""))
+      unique
     ];
 
   instanceConfigFile = name: instance:
@@ -131,7 +134,7 @@
     else "0.0.0.0:${toString fallbackPort}";
 
   effectiveSettingsFor = serverPort: meshPort: settings:
-    lib.recursiveUpdate settings {
+    recursiveUpdate settings {
       server.listen = listenAddrFor serverPort settings;
       mesh.bind_addr = meshAddrFor meshPort settings;
     };
@@ -139,11 +142,11 @@
   effectiveSettings = effectiveSettingsFor cfg.port cfg.meshPort cfg.settings;
   effectiveInstanceSettings = instance:
     effectiveSettingsFor
-    (lib.defaultTo defaultServerPort instance.port)
-    (lib.defaultTo defaultMeshPort instance.meshPort)
+    (defaultTo defaultServerPort instance.port)
+    (defaultTo defaultMeshPort instance.meshPort)
     instance.settings;
 
-  instanceSocket = name: instance: {
+  instanceSocket = _: instance: {
     wantedBy = ["sockets.target"];
     socketConfig.ListenStream = normalizeAddr (effectiveInstanceSettings instance).server.listen;
   };
@@ -157,22 +160,22 @@
       }
     ]
     else
-      lib.mapAttrsToList (_: instance: {
+      mapAttrsToList (_: instance: {
         settings = effectiveInstanceSettings instance;
         openFirewall = cfg.openFirewall || instance.openFirewall;
       })
       cfg.instances;
 
-  firewallListeners = builtins.filter (listener: listener.openFirewall) activeListeners;
+  firewallListeners = filter (listener: listener.openFirewall) activeListeners;
 
-  firewallTCPPorts = lib.unique (
-    builtins.map (listener: portOfAddr listener.settings.server.listen)
-    (builtins.filter (listener: !isLoopbackAddr listener.settings.server.listen) firewallListeners)
+  firewallTCPPorts = unique (
+    map (listener: portOfAddr listener.settings.server.listen)
+    (filter (listener: !isLoopbackAddr listener.settings.server.listen) firewallListeners)
   );
 
   firewallUDPPorts = lib.unique (
-    builtins.map (listener: portOfAddr listener.settings.mesh.bind_addr)
-    (builtins.filter (
+    map (listener: portOfAddr listener.settings.mesh.bind_addr)
+    (filter (
         listener:
           (listener.settings.mesh.enabled or false)
           && !isLoopbackAddr listener.settings.mesh.bind_addr
@@ -186,26 +189,26 @@
     cfg.instances;
 
   instanceMeshAddresses =
-    builtins.map (settings: normalizeAddr settings.mesh.bind_addr)
-    (builtins.filter (settings: settings.mesh.enabled or false)
-      (lib.mapAttrsToList (_: effectiveInstanceSettings) cfg.instances));
+    map (settings: normalizeAddr settings.mesh.bind_addr)
+    (filter (settings: settings.mesh.enabled or false)
+      (mapAttrsToList (_: effectiveInstanceSettings) cfg.instances));
 
-  upstreamPublicKeys = lib.unique (
+  upstreamPublicKeys = unique (
     upstreamPublicKeysFor effectiveSettings
-    ++ lib.flatten (builtins.map
+    ++ flatten (builtins.map
       (instance: upstreamPublicKeysFor (effectiveInstanceSettings instance))
-      (builtins.attrValues cfg.instances))
+      (attrValues cfg.instances))
   );
 
   instanceEtc =
-    lib.mapAttrs' (
+    mapAttrs' (
       name: instance:
-        lib.nameValuePair "ncro/${name}.toml" {source = instanceConfigFile name instance;}
+        nameValuePair "ncro/${name}.toml" {source = instanceConfigFile name instance;}
     )
     cfg.instances
-    // lib.mapAttrs' (
+    // mapAttrs' (
       name: instance:
-        lib.nameValuePair "ncro/${name}.netrc" {
+        nameValuePair "ncro/${name}.netrc" {
           source =
             if instance.netrcFile != null
             then instance.netrcFile
@@ -430,87 +433,88 @@ in {
         }
       ];
 
-    systemd.sockets =
-      {
-        ncro = mkIf (cfg.instances == {} && cfg.socketActivation) {
-          wantedBy = ["sockets.target"];
-          socketConfig.ListenStream = normalizeAddr effectiveSettings.server.listen;
-        };
-      }
-      // lib.mapAttrs' (
-        name: instance:
-          lib.nameValuePair "ncro@${name}" (instanceSocket name instance)
-      ) (lib.filterAttrs (_: instance: instance.socketActivation) cfg.instances);
-
-    systemd.services = {
-      ncro = mkIf (cfg.instances == {}) {
-        description = "Nix Cache Route Optimizer";
-        wantedBy = ["multi-user.target"];
-        after =
-          if cfg.socketActivation
-          then ["ncro.socket"]
-          else ["network.target"];
-        requires = optionals cfg.socketActivation ["ncro.socket"];
-        environment = optionalAttrs (cfg.netrcFile != null) {
-          NETRC = "%d/netrc";
-        };
-        serviceConfig =
-          {
-            ExecStart = "${lib.getExe' cfg.package "ncro"} --config ${configFile}";
-            DynamicUser = true;
-            StateDirectory = "ncro";
-            Restart = "on-failure";
-            RestartSec = "5s";
-
-            # NAR proxying is not concurrency-gated: every in-flight NAR holds an
-            # inbound and an upstream socket for the duration of the transfer, so a
-            # single busy nix client can exceed systemd's 1024 soft limit.
-            LimitNOFILE = 65536;
-
-            # Hardening
-            NoNewPrivileges = true;
-            PrivateTmp = true;
-            PrivateDevices = true;
-            ProtectSystem = "strict";
-            ProtectHome = true;
-            ProtectProc = "invisible";
-            ProtectHostname = true;
-            ProtectClock = true;
-            ProtectControlGroups = true;
-            ProtectKernelLogs = true;
-            ProtectKernelTunables = true;
-            RestrictRealtime = true;
-            CapabilityBoundingSet = "";
-            RestrictAddressFamilies =
-              [
-                "AF_INET"
-                "AF_INET6"
-                "AF_NETLINK" # required by mdns-sd and system resolver
-              ]
-              # sd_notify uses a Unix datagram socket to signal readiness.
-              ++ optionals cfg.socketActivation ["AF_UNIX"];
-            RestrictNamespaces = true;
-            LockPersonality = true;
-            MemoryDenyWriteExecute = true;
-            SystemCallFilter = ["@system-service"];
-            SystemCallArchitectures = "native";
-          }
-          // optionalAttrs cfg.socketActivation {Type = "notify";}
-          // optionalAttrs (cfg.netrcFile != null) {LoadCredential = ["netrc:${cfg.netrcFile}"];};
-      };
-      "ncro@" = mkIf (cfg.instances != {}) instanceService;
-    };
-
     networking.firewall = mkIf (firewallTCPPorts != [] || firewallUDPPorts != []) {
       allowedTCPPorts = firewallTCPPorts;
       allowedUDPPorts = firewallUDPPorts;
     };
 
     environment.etc = instanceEtc;
+    systemd = {
+      sockets =
+        {
+          ncro = mkIf (cfg.instances == {} && cfg.socketActivation) {
+            wantedBy = ["sockets.target"];
+            socketConfig.ListenStream = normalizeAddr effectiveSettings.server.listen;
+          };
+        }
+        // lib.mapAttrs' (
+          name: instance:
+            lib.nameValuePair "ncro@${name}" (instanceSocket name instance)
+        ) (lib.filterAttrs (_: instance: instance.socketActivation) cfg.instances);
 
-    systemd.targets.multi-user.wants =
-      builtins.map
-      (name: "ncro@${name}.service")
-      (builtins.attrNames (lib.filterAttrs (_: instance: !instance.socketActivation) cfg.instances));
+      services = {
+        ncro = mkIf (cfg.instances == {}) {
+          description = "Nix Cache Route Optimizer";
+          wantedBy = ["multi-user.target"];
+          after =
+            if cfg.socketActivation
+            then ["ncro.socket"]
+            else ["network.target"];
+          requires = optionals cfg.socketActivation ["ncro.socket"];
+          environment = optionalAttrs (cfg.netrcFile != null) {
+            NETRC = "%d/netrc";
+          };
+          serviceConfig =
+            {
+              ExecStart = "${lib.getExe' cfg.package "ncro"} --config ${configFile}";
+              DynamicUser = true;
+              StateDirectory = "ncro";
+              Restart = "on-failure";
+              RestartSec = "5s";
+
+              # NAR proxying is not concurrency-gated: every in-flight NAR holds an
+              # inbound and an upstream socket for the duration of the transfer, so a
+              # single busy nix client can exceed systemd's 1024 soft limit.
+              LimitNOFILE = 65536;
+
+              # Hardening
+              NoNewPrivileges = true;
+              PrivateTmp = true;
+              PrivateDevices = true;
+              ProtectSystem = "strict";
+              ProtectHome = true;
+              ProtectProc = "invisible";
+              ProtectHostname = true;
+              ProtectClock = true;
+              ProtectControlGroups = true;
+              ProtectKernelLogs = true;
+              ProtectKernelTunables = true;
+              RestrictRealtime = true;
+              CapabilityBoundingSet = "";
+              RestrictAddressFamilies =
+                [
+                  "AF_INET"
+                  "AF_INET6"
+                  "AF_NETLINK" # required by mdns-sd and system resolver
+                ]
+                # sd_notify uses a Unix datagram socket to signal readiness.
+                ++ optionals cfg.socketActivation ["AF_UNIX"];
+              RestrictNamespaces = true;
+              LockPersonality = true;
+              MemoryDenyWriteExecute = true;
+              SystemCallFilter = ["@system-service"];
+              SystemCallArchitectures = "native";
+            }
+            // optionalAttrs cfg.socketActivation {Type = "notify";}
+            // optionalAttrs (cfg.netrcFile != null) {LoadCredential = ["netrc:${cfg.netrcFile}"];};
+        };
+        "ncro@" = mkIf (cfg.instances != {}) instanceService;
+      };
+
+      targets.multi-user.wants =
+        map
+        (name: "ncro@${name}.service")
+        (attrNames (filterAttrs (_: instance: !instance.socketActivation) cfg.instances));
+    };
   };
 }
