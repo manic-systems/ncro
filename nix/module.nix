@@ -16,10 +16,23 @@
   tomlFormat = pkgs.formats.toml {};
   tomlType = tomlFormat.type;
 
+  checkable = pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform;
+
+  generateConfig = name: settings: let
+    file = tomlFormat.generate name settings;
+  in
+    if checkable
+    then
+      pkgs.runCommand name {} ''
+        ${lib.getExe' cfg.package "ncro"} --config ${file} --check
+        cp ${file} $out
+      ''
+    else file;
+
   cfg = config.services.ncro;
   defaultServerPort = 8080;
   defaultMeshPort = 7946;
-  configFile = tomlFormat.generate "ncro.toml" effectiveSettings;
+  configFile = generateConfig "ncro.toml" effectiveSettings;
 
   # Normalize a ncro listen address (`:port` shorthand) to the
   # `host:port` format expected by systemd's ListenStream.
@@ -74,7 +87,7 @@
     ];
 
   instanceConfigFile = name: instance:
-    tomlFormat.generate "ncro-${name}.toml" (effectiveInstanceSettings instance);
+    generateConfig "ncro-${name}.toml" (effectiveInstanceSettings instance);
 
   instanceWrapper = pkgs.writeShellScript "ncro-instance" ''
     if [ -s "$CREDENTIALS_DIRECTORY/netrc" ]; then
@@ -306,8 +319,10 @@ in {
       description = ''
         ncro configuration as an attribute set.
 
-        Keys and structure match the TOML config file format; all defaults are
-        handled by the ncro binary.
+        Keys are the TOML field names, and anything left out keeps ncro's
+        own default. The generated file is checked with `ncro --check` at
+        build time, so a misspelt key or an out-of-range value fails the
+        build rather than the running service.
       '';
       example = {
         logging.level = "info";

@@ -86,10 +86,15 @@ pub struct Args {
   /// Create or read a mesh private key and print its public key.
   #[pound(long)]
   pub generate_mesh_key: Option<String>,
+
+  /// Validate the config file and exit.
+  #[pound(long)]
+  pub check: bool,
 }
 
 enum Command {
   Serve { config: Option<String> },
+  Check { config: String },
   GenerateMeshKey { path: String },
 }
 
@@ -97,24 +102,37 @@ impl TryFrom<Args> for Command {
   type Error = anyhow::Error;
 
   fn try_from(args: Args) -> Result<Self, Self::Error> {
-    match (args.config, args.generate_mesh_key) {
-      (Some(_), Some(_)) => {
+    let config = args.config.filter(|path| !path.is_empty());
+
+    if let Some(path) = args.generate_mesh_key {
+      if config.is_some() || args.check {
         anyhow::bail!(
-          "--config and --generate-mesh-key cannot be used together"
-        )
-      },
-      (None, Some(path)) if path.is_empty() => {
-        anyhow::bail!("--generate-mesh-key requires a non-empty path")
-      },
-      (None, Some(path)) => Ok(Self::GenerateMeshKey { path }),
-      (config, None) => Ok(Self::Serve { config }),
+          "--generate-mesh-key cannot be combined with --config or --check"
+        );
+      }
+      if path.is_empty() {
+        anyhow::bail!("--generate-mesh-key requires a non-empty path");
+      }
+      return Ok(Self::GenerateMeshKey { path });
     }
+
+    if args.check {
+      let config =
+        config.ok_or_else(|| anyhow::anyhow!("--check requires --config"))?;
+      return Ok(Self::Check { config });
+    }
+
+    Ok(Self::Serve { config })
   }
 }
 
 pub async fn run() -> anyhow::Result<()> {
   match Command::try_from(Args::parse())? {
     Command::Serve { config } => serve(config.as_deref()).await,
+    Command::Check { config } => {
+      Config::check(&config)?;
+      Ok(())
+    },
     Command::GenerateMeshKey { path } => {
       let node = ncro_mesh::Node::new(&path).await?;
       writeln!(io::stdout().lock(), "{}", hex::encode(node.public_key()))?;
