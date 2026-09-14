@@ -156,6 +156,13 @@ port and override the port options.
 the mesh port only when mesh is enabled, and skips any listener bound to
 loopback, since nothing outside the machine can reach one anyway.
 
+Settings use the TOML field names, so `cache_priority` rather than
+`cachePriority`, and `public_key` alongside `public_keys`. Nix evaluation fails
+on an unknown field or a value of the wrong type, which catches a typo at build
+time instead of when ncro starts. The same check covers named instances.
+Anything left unset, or set to `null`, is dropped from the generated TOML so
+ncro applies its own default.
+
 By default, the module appends every non-empty
 `services.ncro.settings.upstreams.*.public_key` value to
 `nix.settings.trusted-public-keys`. If you're managing those keys separately,

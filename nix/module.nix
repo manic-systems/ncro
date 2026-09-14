@@ -4,17 +4,24 @@
   lib,
   ...
 }: let
-  inherit (builtins) isAttrs attrValues attrNames;
+  inherit (builtins) isAttrs isList attrValues attrNames;
   inherit (lib.modules) mkIf;
   inherit (lib.options) mkOption mkEnableOption literalExpression;
   inherit (lib.types) attrsOf bool package nullOr path port submodule;
   inherit (lib.lists) optional optionals filter elemAt map flatten unique;
-  inherit (lib.attrsets) optionalAttrs mapAttrsToList recursiveUpdate mapAttrs' nameValuePair filterAttrs;
+  inherit (lib.attrsets) optionalAttrs mapAttrs mapAttrsToList recursiveUpdate mapAttrs' nameValuePair filterAttrs;
   inherit (lib.strings) match toInt;
   inherit (lib.trivial) defaultTo;
 
   tomlFormat = pkgs.formats.toml {};
-  tomlType = tomlFormat.type;
+  settingsType = submodule (import ./settings.nix {inherit lib;});
+
+  removeNulls = value:
+    if isAttrs value
+    then mapAttrs (_: removeNulls) (filterAttrs (_: entry: entry != null) value)
+    else if isList value
+    then map removeNulls value
+    else value;
 
   cfg = config.services.ncro;
   defaultServerPort = 8080;
@@ -301,13 +308,17 @@ in {
     };
 
     settings = mkOption {
-      type = tomlType;
+      type = settingsType;
+      apply = removeNulls;
       default = {};
       description = ''
         ncro configuration as an attribute set.
 
-        Keys and structure match the TOML config file format; all defaults are
-        handled by the ncro binary.
+        Keys are the TOML field names, so `cache_priority` rather than
+        `cachePriority`. Nix evaluation fails on an unknown field or a value
+        of the wrong type, which catches a typo at build time instead of when
+        ncro starts. Anything left unset, or set to `null`, is dropped from
+        the generated TOML so ncro applies its own default.
       '';
       example = {
         logging.level = "info";
@@ -370,7 +381,8 @@ in {
           };
 
           settings = mkOption {
-            type = tomlType;
+            type = settingsType;
+            apply = removeNulls;
             default = {};
             description = "Configuration for this ncro instance.";
           };
