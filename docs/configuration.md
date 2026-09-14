@@ -44,6 +44,10 @@ these non-empty environment variables after reading that file:
 | `NCRO_DB_PATH`   | `cache.db_path` |
 | `NCRO_LOG_LEVEL` | `logging.level` |
 
+Unknown keys are an error. `ncro --config <file> --check` parses and validates
+a file and exits, without reading passwords or applying the overrides above, so
+it can run inside a build sandbox.
+
 ## Server
 
 `[server]` controls ncro's listener, client-facing timeouts, and the cache

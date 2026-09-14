@@ -156,6 +156,12 @@ port and override the port options.
 the mesh port only when mesh is enabled, and skips any listener bound to
 loopback, since nothing outside the machine can reach one anyway.
 
+Settings use the TOML field names, and anything left out keeps ncro's own
+default. Every generated file, including each named instance's, is checked with
+`ncro --check` at build time, so a misspelt key or an out-of-range value fails
+the build rather than the running service. The check is skipped when
+cross-compiling.
+
 By default, the module appends every non-empty
 `services.ncro.settings.upstreams.*.public_key` value to
 `nix.settings.trusted-public-keys`. If you're managing those keys separately,
