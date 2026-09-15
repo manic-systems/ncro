@@ -545,6 +545,19 @@ priority = 20
 address_family = "ipv4" # restrict to IPv4-only caches
 ```
 
+> [!NOTE]
+> The Perl `nix-serve` backend running through Starman can send response bodies
+> on `HEAD` requests. Leftover bytes can make ncro's next request on the same
+> connection fail, causing intermittent narinfo errors. This affects both
+> configured and discovered upstreams. On the NixOS host running `nix-serve`,
+> enable Plack's `Head` middleware to suppress those bodies.
+>
+> ```nix
+> services.nix-serve.extraParams = "-e 'enable \"Head\"'";
+> ```
+>
+> For manual launches, pass `-e 'enable "Head"'` to `nix-serve`.
+
 ## Mesh Mode
 
 When `mesh.enabled = true`, ncro creates an ed25519 identity, binds a UDP socket

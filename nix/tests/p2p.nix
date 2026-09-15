@@ -87,6 +87,7 @@
     environment.systemPackages = [pkgs.curl];
 
     services.avahi = commonAvahi;
+    services.nix-serve.extraParams = "-e 'enable \"Head\"'";
     services.ncro = {
       enable = true;
       settings = commonNcroSettings;
