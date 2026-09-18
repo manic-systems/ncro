@@ -11,7 +11,8 @@ repository.workspace  = true
 [dependencies]
 ncro-config.workspace = true
 ncro-s3.workspace     = true
-reqwest               = { workspace = true, features = [ "rustls" ] }
+reqwest               = { workspace = true, features = [ "rustls-no-provider" ] }
+rustls.workspace      = true
 tracing.workspace     = true
 tokio                 = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
 

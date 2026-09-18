@@ -21,6 +21,7 @@ use ncro_db::{Db, DbError, RouteEntry};
 use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
 use ncro_s3::{S3ClientPool, S3Error};
+use rustls::crypto::ring;
 use thiserror::Error;
 use tokio::{
   sync::{Mutex, RwLock, Semaphore},
@@ -212,6 +213,8 @@ impl Router {
     negative_ttl: Duration,
     tuning: RouterTuning,
   ) -> Result<Self, reqwest::Error> {
+    let _ = ring::default_provider().install_default();
+
     Ok(Self {
       inner: Arc::new(RouterInner {
         db,

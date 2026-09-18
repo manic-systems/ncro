@@ -26,6 +26,7 @@ const fn backoff_interval(base: Duration, consecutive_fails: u32) -> Duration {
 
 use ncro_config::UpstreamConfig;
 use ncro_s3::S3ClientPool;
+use rustls::crypto::ring;
 use tokio::{
   sync::{RwLock, watch},
   time as tokio_time,
@@ -100,6 +101,8 @@ impl Prober {
   ///
   /// Returns an error if the HTTP client cannot be constructed.
   pub fn new(alpha: f64) -> Result<Self, reqwest::Error> {
+    let _ = ring::default_provider().install_default();
+
     Ok(Self {
       inner: Arc::new(ProberInner {
         alpha,

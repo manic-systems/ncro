@@ -8,13 +8,14 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-aws-config.workspace   = true
-aws-sdk-s3.workspace   = true
-bytes.workspace        = true
-dashmap.workspace      = true
-futures-util.workspace = true
-ncro-config.workspace  = true
-thiserror.workspace    = true
+aws-config.workspace             = true
+aws-sdk-s3.workspace             = true
+aws-smithy-http-client.workspace = true
+bytes.workspace                  = true
+dashmap.workspace                = true
+futures-util.workspace           = true
+ncro-config.workspace            = true
+thiserror.workspace              = true
 
 [lints]
 workspace = true

@@ -18,7 +18,8 @@ ncro-metrics.workspace = true
 ncro-narinfo.workspace = true
 ncro-router.workspace  = true
 ncro-s3.workspace      = true
-reqwest                = { workspace = true, features = [ "rustls", "stream" ] }
+reqwest                = { workspace = true, features = [ "rustls-no-provider", "stream" ] }
+rustls.workspace       = true
 serde                  = { workspace = true, features = [ "derive" ] }
 tokio.workspace        = true
 tower-http.workspace   = true
