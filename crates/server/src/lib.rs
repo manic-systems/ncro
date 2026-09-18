@@ -34,6 +34,7 @@ use ncro_router::{
   store_hash_from_canonical_nar_url,
 };
 use ncro_s3::S3ClientPool;
+use rustls::crypto::ring;
 use serde::Serialize;
 use tokio::{
   task::JoinSet,
@@ -163,6 +164,7 @@ pub fn app(
     nar_timeouts.entry(upstream.url.clone()).or_insert(timeout);
   }
 
+  let _ = ring::default_provider().install_default();
   let nar_client = reqwest::Client::builder().build()?;
   let narinfo_client = reqwest::Client::builder()
     .read_timeout(read_timeout)

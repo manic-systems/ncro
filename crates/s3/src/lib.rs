@@ -6,6 +6,10 @@ use aws_sdk_s3::{
   config::{Builder, Region},
   primitives::ByteStream,
 };
+use aws_smithy_http_client::{
+  Builder as HttpClientBuilder,
+  tls::{Provider as TlsProvider, rustls_provider::CryptoMode},
+};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{Stream, stream};
@@ -192,7 +196,12 @@ impl S3ClientPool {
       return client.clone();
     }
 
+    let http_client = HttpClientBuilder::new()
+      .tls_provider(TlsProvider::Rustls(CryptoMode::Ring))
+      .build_https();
+
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
+      .http_client(http_client)
       .region(Region::new(config.region.clone()));
     if let Some(profile) = &config.profile {
       loader = loader.profile_name(profile);
