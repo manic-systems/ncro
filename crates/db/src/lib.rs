@@ -297,15 +297,14 @@ impl Db {
   /// # Errors
   ///
   /// Returns [`DbError`] on `SQLite` write failure.
-  pub async fn save_health(
-    &self,
-    url: &str,
-    ema: f64,
-    consecutive_fails: i64,
-    total_queries: i64,
-  ) -> Result<(), DbError> {
+  pub async fn save_health(&self, rows: &[HealthRow]) -> Result<(), DbError> {
+    if rows.is_empty() {
+      return Ok(());
+    }
     let _guard = self.write_lock.lock().await;
-    sqlx::query(
+    let mut tx = self.pool.begin().await?;
+    for row in rows {
+      sqlx::query(
             r"INSERT INTO upstream_health (url, ema_latency, consecutive_fails, total_queries)
                VALUES (?, ?, ?, ?)
                ON CONFLICT(url) DO UPDATE SET
@@ -313,12 +312,14 @@ impl Db {
                  consecutive_fails = excluded.consecutive_fails,
                  total_queries = excluded.total_queries",
         )
-        .bind(url)
-        .bind(ema)
-        .bind(consecutive_fails)
-        .bind(total_queries)
-        .execute(&self.pool)
+        .bind(&row.url)
+        .bind(row.ema_latency)
+        .bind(row.consecutive_fails)
+        .bind(row.total_queries)
+        .execute(&mut *tx)
         .await?;
+    }
+    tx.commit().await?;
     Ok(())
   }
 
@@ -642,8 +643,13 @@ mod tests {
           db.set_route(&entry).await?;
           db.set_negative(&format!("missing{i}"), Duration::from_mins(1))
             .await?;
-          db.save_health(&format!("https://cache{i}.example"), 1.0, 0, 1)
-            .await?;
+          db.save_health(&[HealthRow {
+            url:               format!("https://cache{i}.example"),
+            ema_latency:       1.0,
+            consecutive_fails: 0,
+            total_queries:     1,
+          }])
+          .await?;
           Ok::<_, DbError>(())
         })
       })

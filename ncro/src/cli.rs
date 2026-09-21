@@ -1,7 +1,9 @@
 use std::{
+  collections::HashMap,
   env,
   ffi::OsString,
   io::{self, Write as _},
+  mem,
   net::TcpListener as StdTcpListener,
   os::unix::{ffi::OsStringExt, io::FromRawFd, net::UnixDatagram},
   path::Path,
@@ -10,12 +12,17 @@ use std::{
 };
 
 use ncro_config::{Config, LogFormat};
-use ncro_db::Db;
+use ncro_db::{Db, HealthRow};
 use ncro_discovery::Discovery;
 use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
 use pound::Parse;
-use tokio::{net::TcpListener, signal, sync::watch, time};
+use tokio::{
+  net::TcpListener,
+  signal,
+  sync::{mpsc, watch},
+  time,
+};
 use tracing::subscriber::set_default;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -162,19 +169,14 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
       )
       .await;
   }
-  let db_for_health = db.clone();
+  let (health_tx, mut health_rx) = mpsc::unbounded_channel();
   prober
     .set_health_persistence(move |url, ema, fails, queries| {
-      let db = db_for_health.clone();
-      tokio::spawn(async move {
-        let _ = db
-          .save_health(
-            &url,
-            ema,
-            i64::from(fails),
-            i64::try_from(queries).unwrap_or(i64::MAX),
-          )
-          .await;
+      let _ = health_tx.send(HealthRow {
+        url,
+        ema_latency: ema,
+        consecutive_fails: i64::from(fails),
+        total_queries: i64::try_from(queries).unwrap_or(i64::MAX),
       });
     })
     .await;
@@ -216,6 +218,32 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
     probe_prober
       .run_probe_loop(Duration::from_secs(30), probe_stop)
       .await;
+  });
+
+  let db_for_health = db.clone();
+  let mut health_stop = stop_rx.clone();
+  let health_worker = tokio::spawn(async move {
+    let mut ticker = time::interval(Duration::from_secs(5));
+    let mut pending: HashMap<String, HealthRow> = HashMap::new();
+    loop {
+      tokio::select! {
+          _ = health_stop.changed() => {
+              while let Ok(row) = health_rx.try_recv() {
+                  pending.insert(row.url.clone(), row);
+              }
+              for _ in 0..3 {
+                  if flush_health(&db_for_health, &mut pending).await {
+                      return;
+                  }
+                  time::sleep(Duration::from_secs(1)).await;
+              }
+              tracing::warn!("dropping {} unsaved health rows at shutdown", pending.len());
+              return;
+          },
+          Some(row) = health_rx.recv() => { pending.insert(row.url.clone(), row); },
+          _ = ticker.tick() => { flush_health(&db_for_health, &mut pending).await; },
+      }
+    }
   });
 
   let db_for_expiry = db.clone();
@@ -308,8 +336,24 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
   });
   let result = server.await;
   let _ = stop_tx.send(true);
+  let _ = health_worker.await;
   result?;
   Ok(())
+}
+
+async fn flush_health(
+  db: &Db,
+  pending: &mut HashMap<String, HealthRow>,
+) -> bool {
+  let rows = mem::take(pending).into_values().collect::<Vec<_>>();
+  match db.save_health(&rows).await {
+    Ok(()) => true,
+    Err(err) => {
+      tracing::warn!("health snapshot not persisted, will retry: {err}");
+      pending.extend(rows.into_iter().map(|row| (row.url.clone(), row)));
+      false
+    },
+  }
 }
 
 fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
