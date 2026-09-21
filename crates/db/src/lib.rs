@@ -18,6 +18,7 @@ use sqlx::{
     SqliteJournalMode,
     SqlitePoolOptions,
     SqliteRow,
+    SqliteSynchronous,
   },
 };
 use thiserror::Error;
@@ -98,6 +99,7 @@ impl Db {
         .create_if_missing(true)
     }
     .journal_mode(SqliteJournalMode::Wal)
+    .synchronous(SqliteSynchronous::Normal)
     .busy_timeout(Duration::from_secs(5))
     .log_slow_statements(log::LevelFilter::Warn, slow_statement_threshold);
 
