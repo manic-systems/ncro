@@ -185,7 +185,9 @@ Deployment instructions are in [installation document].
 
 ## Configuration
 
-Default config is embedded; create a TOML file to override any field.
+The defaults are built in, so a TOML file only needs the fields you want to
+change. Note that `ncro --config <file> --check` can catch typos or invalid keys
+without starting the server.
 
 ```toml
 [server]

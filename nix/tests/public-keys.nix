@@ -16,6 +16,12 @@ pkgs.testers.runNixOSTest {
       # The test only needs the module-generated config and nix.conf. Avoid
       # building or starting the real proxy.
       package = pkgs.writeShellScriptBin "ncro" ''
+        for arg in "$@"; do
+          if [ "$arg" = "--check" ]; then
+            exit 0
+          fi
+        done
+
         exec ${pkgs.coreutils}/bin/sleep infinity
       '';
       settings = {

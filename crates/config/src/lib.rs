@@ -1,7 +1,7 @@
 use std::{env, fmt, fs, io, iter, time::Duration};
 
 use netrc::Netrc;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de};
 use thiserror::Error;
 use toml::de::Error as TomlError;
 use tracing_subscriber::EnvFilter;
@@ -759,7 +759,7 @@ pub enum NarUrlMode {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FilterRule {
   pub action:  FilterAction,
   pub field:   FilterField,
@@ -771,7 +771,7 @@ const fn default_allow_hedging() -> bool {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpstreamConfig {
   /// Base URL of the substituter (http, https, or `s3://`).
   pub url:             String,
@@ -855,12 +855,35 @@ impl fmt::Debug for UpstreamConfig {
   }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct FallbackCacheConfig {
   pub enabled:  bool,
-  #[serde(flatten)]
   pub upstream: UpstreamConfig,
+}
+
+impl<'de> Deserialize<'de> for FallbackCacheConfig {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let mut table = toml::Table::deserialize(deserializer)?;
+    let enabled = match table.remove("enabled") {
+      Some(value) => bool::deserialize(value).map_err(de::Error::custom)?,
+      None => false,
+    };
+
+    let defaults = Self::default().upstream;
+    if !table.contains_key("url") {
+      table.insert("url".to_string(), defaults.url.into());
+      table
+        .entry("public_key")
+        .or_insert_with(|| defaults.public_key.into());
+    }
+
+    let upstream =
+      UpstreamConfig::deserialize(table).map_err(de::Error::custom)?;
+    Ok(Self { enabled, upstream })
+  }
 }
 
 impl Default for FallbackCacheConfig {
@@ -879,7 +902,7 @@ impl Default for FallbackCacheConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
   pub listen:          String,
   pub cache_priority:  i32,
@@ -904,7 +927,7 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
   pub db_path:                  String,
   pub max_entries:              i64,
@@ -932,7 +955,7 @@ impl Default for CacheConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NarHedgingConfig {
   pub enabled:      bool,
   pub delay:        HumanDuration,
@@ -950,7 +973,7 @@ impl Default for NarHedgingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MassQueryConfig {
   pub max_concurrent_races:      u32,
   pub per_upstream_max_inflight: u32,
@@ -970,14 +993,14 @@ impl Default for MassQueryConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PeerConfig {
   pub addr:       String,
   pub public_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MeshConfig {
   pub enabled:          bool,
   pub bind_addr:        String,
@@ -1016,7 +1039,7 @@ pub enum AddressFamily {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DiscoveryConfig {
   pub enabled:        bool,
   pub service_name:   String,
@@ -1040,7 +1063,7 @@ impl Default for DiscoveryConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
   pub level:      String,
   pub format:     LogFormat,
@@ -1066,7 +1089,7 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
   pub server:         ServerConfig,
   pub upstreams:      Vec<UpstreamConfig>,
@@ -1102,11 +1125,9 @@ impl Config {
   /// Returns [`ConfigError::Read`] if the config file cannot be read, or
   /// [`ConfigError::Parse`] if the TOML is malformed.
   pub fn load(path: Option<&str>) -> Result<Self, ConfigError> {
-    let mut cfg = if let Some(path) = path.filter(|p| !p.is_empty()) {
-      let data = fs::read_to_string(path)?;
-      toml::from_str::<Self>(&data)?
-    } else {
-      Self::default()
+    let mut cfg = match path {
+      Some(path) => Self::parse(path)?,
+      None => Self::default(),
     };
 
     if let Ok(v) = env::var("NCRO_LISTEN")
@@ -1123,16 +1144,6 @@ impl Config {
       && !v.is_empty()
     {
       cfg.logging.level = v;
-    }
-
-    for upstream in &mut cfg.upstreams {
-      if upstream.url.starts_with("s3://") {
-        upstream.s3 = Some(parse_s3_url(&upstream.url)?);
-      }
-    }
-    if cfg.fallback_cache.upstream.url.starts_with("s3://") {
-      cfg.fallback_cache.upstream.s3 =
-        Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
     }
 
     for (i, upstream) in cfg.upstreams.iter_mut().enumerate() {
@@ -1153,6 +1164,32 @@ impl Config {
           .chain(iter::once(&mut cfg.fallback_cache.upstream)),
         &nrc,
       );
+    }
+
+    Ok(cfg)
+  }
+
+  /// Parses and validates `path` without credentials or env overrides.
+  ///
+  /// # Errors
+  ///
+  /// Same as [`Config::load`] and [`Config::validate`].
+  pub fn check(path: &str) -> Result<(), ConfigError> {
+    Self::parse(path)?.validate()
+  }
+
+  fn parse(path: &str) -> Result<Self, ConfigError> {
+    let data = fs::read_to_string(path)?;
+    let mut cfg = toml::from_str::<Self>(&data)?;
+
+    for upstream in &mut cfg.upstreams {
+      if upstream.url.starts_with("s3://") {
+        upstream.s3 = Some(parse_s3_url(&upstream.url)?);
+      }
+    }
+    if cfg.fallback_cache.upstream.url.starts_with("s3://") {
+      cfg.fallback_cache.upstream.s3 =
+        Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
     }
 
     Ok(cfg)
