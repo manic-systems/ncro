@@ -27,7 +27,12 @@ use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_narinfo::NarInfo;
-use ncro_router::{Router, RouterError, store_hash_from_canonical_nar_url};
+use ncro_router::{
+  Router,
+  RouterError,
+  compression_for_nar_url,
+  store_hash_from_canonical_nar_url,
+};
 use ncro_s3::S3ClientPool;
 use serde::Serialize;
 use tokio::{
@@ -610,13 +615,19 @@ async fn hedge_candidates(
     }
     by_priority.entry(health.priority).or_default().push(health);
   }
+  let expected_compression = compression_for_nar_url(path);
   let mut candidates = Vec::new();
   for group in by_priority.into_values() {
     for health in group {
       let candidate_path = if let Some(store_hash) = store_hash {
         let Ok(candidate_path) = state
           .router
-          .upstream_nar_path(&health.url, store_hash, expected_narinfo)
+          .upstream_nar_path(
+            &health.url,
+            store_hash,
+            expected_narinfo,
+            expected_compression,
+          )
           .await
         else {
           continue;

@@ -954,14 +954,16 @@ impl Router {
   ///
   /// # Errors
   ///
-  /// Returns [`RouterError::NotFound`] if the upstream does not have the path
-  /// or the path is rejected by the upstream's filters, or propagates fetch,
-  /// parse, and signature errors.
+  /// Returns [`RouterError::NotFound`] if the upstream does not have the path,
+  /// the path is rejected by the upstream's filters, or the upstream stores
+  /// the NAR in a compression other than `expected_compression`, or
+  /// propagates fetch, parse, and signature errors.
   pub async fn upstream_nar_path(
     &self,
     upstream: &str,
     store_hash: &str,
     expected_narinfo: Option<&NarInfo>,
+    expected_compression: Option<&str>,
   ) -> Result<String, RouterError> {
     let (_, parsed) = self.fetch_narinfo(upstream, store_hash).await?;
     if !self.upstream_allows_narinfo(upstream, &parsed).await {
@@ -969,6 +971,18 @@ impl Router {
         upstream,
         store_path = &parsed.store_path,
         "nar path rejected by upstream filter"
+      );
+      return Err(RouterError::NotFound);
+    }
+    if let Some(expected) = expected_compression
+      && parsed.compression != expected
+    {
+      tracing::debug!(
+        upstream,
+        store_hash,
+        compression = parsed.compression,
+        expected,
+        "nar compression differs from the requested extension"
       );
       return Err(RouterError::NotFound);
     }
@@ -1141,6 +1155,20 @@ fn nar_extension(url: &str) -> &str {
   let path = path.split_once('?').map_or(path, |(path, _)| path);
   let file = path.rsplit('/').next().unwrap_or(path);
   file.rfind(".nar").map_or("", |idx| &file[idx..])
+}
+
+/// The narinfo `Compression:` value a NAR URL's extension promises.
+#[must_use]
+pub fn compression_for_nar_url(url: &str) -> Option<&'static str> {
+  match nar_extension(url) {
+    ".nar" => Some("none"),
+    ".nar.xz" => Some("xz"),
+    ".nar.bz2" => Some("bzip2"),
+    ".nar.gz" => Some("gzip"),
+    ".nar.zst" => Some("zstd"),
+    ".nar.br" => Some("br"),
+    _ => None,
+  }
 }
 
 /// Recover the store hash from a [`canonical_nar_url`] path.
@@ -1589,7 +1617,9 @@ mod tests {
       }])
       .await;
 
-    let result = router.upstream_nar_path(&upstream, "abc123", None).await;
+    let result = router
+      .upstream_nar_path(&upstream, "abc123", None, None)
+      .await;
 
     assert!(matches!(result, Err(RouterError::NotFound)));
   }
@@ -1607,7 +1637,7 @@ mod tests {
       .await;
 
     let path = router
-      .upstream_nar_path(&upstream, "abc123", None)
+      .upstream_nar_path(&upstream, "abc123", None, None)
       .await
       .unwrap();
 
