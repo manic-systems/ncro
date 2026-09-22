@@ -471,6 +471,7 @@ impl Router {
       };
       ncro_metrics::get().narinfo_cache_hits.inc();
       let mut result = (*cached).clone();
+      result.cache_hit = true;
       if result.narinfo_bytes.is_none() {
         result.narinfo_bytes = self
           .response_narinfo_bytes(
