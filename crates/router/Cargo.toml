@@ -10,7 +10,6 @@ repository.workspace  = true
 [dependencies]
 chrono.workspace       = true
 dashmap.workspace      = true
-futures-util.workspace = true
 moka.workspace         = true
 ncro-config.workspace  = true
 ncro-db.workspace      = true
