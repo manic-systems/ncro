@@ -1,4 +1,4 @@
-use std::{fmt::Display, io};
+use std::{fmt::Display, io, sync::Arc};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{
@@ -47,8 +47,8 @@ pub struct S3ObjectHead {
 
 #[derive(Clone, Default)]
 pub struct S3ClientPool {
-  configs: DashMap<String, S3Config>,
-  clients: DashMap<String, Client>,
+  configs: Arc<DashMap<String, S3Config>>,
+  clients: Arc<DashMap<String, Client>>,
 }
 
 impl S3ClientPool {
