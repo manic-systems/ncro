@@ -284,6 +284,12 @@ in {
 
     package = mkOption {
       type = package;
+      default = throw ''
+        services.ncro.package has no default outside the ncro flake, since ncro
+        only builds against nixos-unstable. Set it to a package built from that,
+        e.g. inputs.ncro.packages.''${pkgs.stdenv.hostPlatform.system}.ncro.
+      '';
+      defaultText = literalExpression "inputs.ncro.packages.$${pkgs.stdenv.hostPlatform.system}.ncro";
       example = literalExpression "inputs.ncro.packages.$${pkgs.stdenv.hostPlatform.system}.ncro";
       description = "The ncro package to use.";
     };
