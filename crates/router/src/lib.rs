@@ -7,7 +7,6 @@ use std::{
 
 use chrono::Utc;
 use dashmap::{DashMap, mapref::entry::Entry};
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use moka::future::Cache as MokaCache;
 use ncro_config::{
   FilterAction,
@@ -26,6 +25,7 @@ use rustls::crypto::ring;
 use thiserror::Error;
 use tokio::{
   sync::{Mutex, RwLock, Semaphore},
+  task::JoinSet,
   time,
 };
 
@@ -712,7 +712,7 @@ impl Router {
   ) -> (Result<RaceResult, RaceGroupError>, u32) {
     let auth_snapshot = self.inner.upstream_auth.read().await.clone();
     let clients_snapshot = self.inner.upstream_clients.read().await.clone();
-    let mut handles = FuturesUnordered::new();
+    let mut handles = JoinSet::new();
     for upstream in group {
       let upstream = upstream.clone();
       let store_hash = store_hash.to_string();
@@ -723,7 +723,7 @@ impl Router {
       let s3 = self.inner.s3.clone();
       let gate = self.upstream_gate(&upstream, hop);
       let auth = auth_snapshot.get(&upstream).cloned();
-      handles.push(tokio::spawn(async move {
+      handles.spawn(async move {
         let Ok(_permit) = gate.acquire_owned().await else {
           return RaceAttempt::NetworkError { upstream };
         };
@@ -761,7 +761,7 @@ impl Router {
             Err(_) => RaceAttempt::NetworkError { upstream }, // network error
           }
         }
-      }));
+      });
     }
 
     let mut net_errs = 0usize;
@@ -776,7 +776,7 @@ impl Router {
       }
       tokio::select! {
           () = &mut deadline => break None,
-          joined = handles.next() => {
+          joined = handles.join_next() => {
               match joined {
                   Some(Ok(RaceAttempt::Winner(res))) => {
                       attempts += 1;

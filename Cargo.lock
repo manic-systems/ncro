@@ -2096,7 +2096,6 @@ dependencies = [
  "chrono",
  "dashmap",
  "ed25519-dalek",
- "futures-util",
  "moka",
  "ncro-config",
  "ncro-db",
