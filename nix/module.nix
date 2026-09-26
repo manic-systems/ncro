@@ -284,7 +284,8 @@ in {
 
     package = mkOption {
       type = package;
-      example = literalExpression "inputs.ncro.packages.$${pkgs.stdenv.hostPlatform.system}.ncro";
+      default = pkgs.callPackage ./package.nix {};
+      defaultText = literalExpression "inputs.ncro.packages.$${pkgs.stdenv.hostPlatform.system}.ncro"; # Set from flake.nix
       description = "The ncro package to use.";
     };
 
