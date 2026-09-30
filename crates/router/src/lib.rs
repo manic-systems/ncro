@@ -1211,7 +1211,10 @@ fn filter_rule_matches(rule: &FilterRule, narinfo: &NarInfo) -> bool {
 const fn commit_error_is_retryable(err: &RouterError) -> bool {
   matches!(
     err,
-    RouterError::NotFound | RouterError::FetchNarinfo(_) | RouterError::S3(_)
+    RouterError::NotFound
+      | RouterError::SignatureVerificationFailed
+      | RouterError::FetchNarinfo(_)
+      | RouterError::S3(_)
   )
 }
 
