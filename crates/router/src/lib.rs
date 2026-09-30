@@ -1213,6 +1213,7 @@ const fn commit_error_is_retryable(err: &RouterError) -> bool {
     err,
     RouterError::NotFound
       | RouterError::SignatureVerificationFailed
+      | RouterError::ParseNarinfo(_)
       | RouterError::FetchNarinfo(_)
       | RouterError::S3(_)
   )
