@@ -21,6 +21,7 @@ use ncro_db::{Db, DbError, RouteEntry};
 use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
 use ncro_s3::{S3ClientPool, S3Error};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rustls::crypto::ring;
 use thiserror::Error;
 use tokio::{
@@ -114,6 +115,37 @@ pub struct ResolveResult {
   pub narinfo_bytes: Option<Vec<u8>>,
 }
 
+/// Carries a narinfo request's [`Hop`] between ncro instances.
+pub const HOP_HEADER: HeaderName = HeaderName::from_static("x-ncro-hop");
+
+/// How many ncro instances a narinfo lookup has passed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Hop {
+  Client,
+  Peer,
+  PeerOfPeer,
+}
+
+impl Hop {
+  #[must_use]
+  pub fn from_headers(headers: &HeaderMap) -> Self {
+    match headers.get(HOP_HEADER) {
+      None => Self::Client,
+      Some(value) if *value == "1" => Self::Peer,
+      Some(_) => Self::PeerOfPeer,
+    }
+  }
+
+  /// The [`HOP_HEADER`] value for requests this lookup sends upstream.
+  #[must_use]
+  pub const fn outgoing(self) -> HeaderValue {
+    match self {
+      Self::Client => HeaderValue::from_static("1"),
+      Self::Peer | Self::PeerOfPeer => HeaderValue::from_static("2"),
+    }
+  }
+}
+
 #[derive(Clone)]
 pub struct Router {
   inner: Arc<RouterInner>,
@@ -145,7 +177,7 @@ struct RouterInner {
   miss_lru:                 MokaCache<String, ()>,
   race_semaphore:           Arc<Semaphore>,
   per_upstream_limit:       u32,
-  upstream_semaphores:      DashMap<String, Arc<Semaphore>>,
+  upstream_semaphores:      DashMap<(String, Hop), Arc<Semaphore>>,
   upstream_cooldown:        DashMap<String, Instant>,
   upstream_cooldown_window: Duration,
 }
@@ -385,9 +417,10 @@ impl Router {
     &self,
     store_hash: &str,
     upstream: &str,
+    hop: Hop,
   ) -> Result<ResolveResult, RouterError> {
     let start = Instant::now();
-    let (body, _) = self.fetch_narinfo(upstream, store_hash).await?;
+    let (body, _) = self.fetch_narinfo(upstream, store_hash, hop).await?;
     let narinfo_bytes = self
       .response_narinfo_bytes(upstream, store_hash, body.as_deref())
       .await;
@@ -411,34 +444,47 @@ impl Router {
     &self,
     store_hash: &str,
     candidates: &[String],
+    hop: Hop,
   ) -> Result<ResolveResult, RouterError> {
-    if let Some(result) = self.resolve_cached(store_hash).await? {
+    if let Some(result) = self.resolve_cached(store_hash, hop).await? {
       return Ok(result);
+    }
+    if hop == Hop::PeerOfPeer {
+      return Err(RouterError::NotFound);
     }
     ncro_metrics::get().narinfo_cache_misses.inc();
 
-    let lock = match self.inner.inflight.entry(store_hash.to_string()) {
-      Entry::Occupied(entry) => {
-        ncro_metrics::get().narinfo_singleflight_waiters.inc();
-        Arc::clone(entry.get())
-      },
-      Entry::Vacant(entry) => {
-        let inserted = entry.insert(Arc::new(Mutex::new(())));
-        Arc::clone(&inserted)
-      },
+    let lock = (hop == Hop::Client).then(|| {
+      match self.inner.inflight.entry(store_hash.to_string()) {
+        Entry::Occupied(entry) => {
+          ncro_metrics::get().narinfo_singleflight_waiters.inc();
+          Arc::clone(entry.get())
+        },
+        Entry::Vacant(entry) => {
+          let inserted = entry.insert(Arc::new(Mutex::new(())));
+          Arc::clone(&inserted)
+        },
+      }
+    });
+    let _guard = match &lock {
+      Some(lock) => Some(lock.lock().await),
+      None => None,
     };
-    let _guard = lock.lock().await;
-    let _cleanup = InflightGuard {
-      map: &self.inner.inflight,
-      key: store_hash.to_string(),
-      arc: Arc::clone(&lock),
-    };
-    if let Some(result) = self.resolve_cached(store_hash).await? {
+    let _cleanup = lock.as_ref().map(|lock| {
+      InflightGuard {
+        map: &self.inner.inflight,
+        key: store_hash.to_string(),
+        arc: Arc::clone(lock),
+      }
+    });
+    if lock.is_some()
+      && let Some(result) = self.resolve_cached(store_hash, hop).await?
+    {
       return Ok(result);
     }
 
-    let result = self.race(store_hash, candidates).await;
-    if matches!(result, Err(RouterError::NotFound)) {
+    let result = self.race(store_hash, candidates, hop).await;
+    if hop == Hop::Client && matches!(result, Err(RouterError::NotFound)) {
       self.inner.miss_lru.insert(store_hash.to_string(), ()).await;
       let _ = self
         .inner
@@ -452,6 +498,7 @@ impl Router {
   async fn resolve_cached(
     &self,
     store_hash: &str,
+    hop: Hop,
   ) -> Result<Option<ResolveResult>, RouterError> {
     if self.inner.miss_lru.get(store_hash).await.is_some() {
       ncro_metrics::get().narinfo_memory_negative_hits.inc();
@@ -460,12 +507,13 @@ impl Router {
     if self.inner.db.is_negative(store_hash).await? {
       return Err(RouterError::NotFound);
     }
-    self.valid_cached_route(store_hash).await
+    self.valid_cached_route(store_hash, hop).await
   }
 
   async fn valid_cached_route(
     &self,
     store_hash: &str,
+    hop: Hop,
   ) -> Result<Option<ResolveResult>, RouterError> {
     if let Some(cached) = self.inner.lru.get(store_hash).await {
       let CachedFilterCheck::Accepted(narinfo_bytes) = self
@@ -473,6 +521,7 @@ impl Router {
           &cached.url,
           store_hash,
           cached.narinfo_bytes.as_deref(),
+          hop,
         )
         .await
       else {
@@ -513,6 +562,7 @@ impl Router {
         &entry.upstream_url,
         store_hash,
         entry.narinfo_bytes.as_deref(),
+        hop,
       )
       .await
     else {
@@ -545,19 +595,25 @@ impl Router {
     &self,
     store_hash: &str,
     candidates: &[String],
+    hop: Hop,
   ) -> Result<ResolveResult, RouterError> {
     if candidates.is_empty() {
       return Err(RouterError::NoCandidates(store_hash.to_string()));
     }
-    let wait_start = Instant::now();
-    let _race_permit = Arc::clone(&self.inner.race_semaphore)
-      .acquire_owned()
-      .await
-      .map_err(|_| RouterError::UpstreamUnavailable)?;
-    ncro_metrics::get()
-      .narinfo_race_wait_seconds
-      .with_label_values(&["global"])
-      .observe(wait_start.elapsed().as_secs_f64());
+    let _race_permit = if hop == Hop::Client {
+      let wait_start = Instant::now();
+      let permit = Arc::clone(&self.inner.race_semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|_| RouterError::UpstreamUnavailable)?;
+      ncro_metrics::get()
+        .narinfo_race_wait_seconds
+        .with_label_values(&["global"])
+        .observe(wait_start.elapsed().as_secs_f64());
+      Some(permit)
+    } else {
+      None
+    };
 
     let filtered = self.cooldown_filtered_candidates(candidates);
     let effective_candidates = if filtered.is_empty() {
@@ -586,12 +642,12 @@ impl Router {
       let mut group_candidates = group;
       while !group_candidates.is_empty() {
         let (group_result, attempts) =
-          self.race_group(store_hash, &group_candidates).await;
+          self.race_group(store_hash, &group_candidates, hop).await;
         attempts_total += attempts;
         match group_result {
           Ok(winner) => {
             let winner_url = winner.url.clone();
-            match self.commit_winner(winner, store_hash).await {
+            match self.commit_winner(winner, store_hash, hop).await {
               Ok(CommitOutcome::Accepted(result)) => {
                 ncro_metrics::get()
                   .narinfo_upstream_attempts_per_resolve
@@ -652,6 +708,7 @@ impl Router {
     &self,
     store_hash: &str,
     group: &[String],
+    hop: Hop,
   ) -> (Result<RaceResult, RaceGroupError>, u32) {
     let auth_snapshot = self.inner.upstream_auth.read().await.clone();
     let clients_snapshot = self.inner.upstream_clients.read().await.clone();
@@ -664,7 +721,7 @@ impl Router {
         .cloned()
         .unwrap_or_else(|| self.inner.client.clone());
       let s3 = self.inner.s3.clone();
-      let gate = self.upstream_gate(&upstream);
+      let gate = self.upstream_gate(&upstream, hop);
       let auth = auth_snapshot.get(&upstream).cloned();
       handles.push(tokio::spawn(async move {
         let Ok(_permit) = gate.acquire_owned().await else {
@@ -686,7 +743,9 @@ impl Router {
             Err(_) => RaceAttempt::NetworkError { upstream },
           }
         } else {
-          let mut req = client.head(format!("{upstream}/{store_hash}.narinfo"));
+          let mut req = client
+            .head(format!("{upstream}/{store_hash}.narinfo"))
+            .header(HOP_HEADER, hop.outgoing());
           if let Some((user, pass)) = auth {
             req = req.basic_auth(user, pass);
           }
@@ -786,8 +845,14 @@ impl Router {
     );
   }
 
-  fn upstream_gate(&self, upstream: &str) -> Arc<Semaphore> {
-    match self.inner.upstream_semaphores.entry(upstream.to_string()) {
+  /// Peer races get their own gates, since a client race holds its gate
+  /// permit while waiting on a peer whose race may need the reverse gate.
+  fn upstream_gate(&self, upstream: &str, hop: Hop) -> Arc<Semaphore> {
+    match self
+      .inner
+      .upstream_semaphores
+      .entry((upstream.to_string(), hop))
+    {
       Entry::Occupied(entry) => Arc::clone(entry.get()),
       Entry::Vacant(entry) => {
         Arc::clone(&entry.insert(Arc::new(Semaphore::new(
@@ -806,8 +871,10 @@ impl Router {
     &self,
     winner: RaceResult,
     store_hash: &str,
+    hop: Hop,
   ) -> Result<CommitOutcome, RouterError> {
-    let (body, parsed) = self.fetch_narinfo(&winner.url, store_hash).await?;
+    let (body, parsed) =
+      self.fetch_narinfo(&winner.url, store_hash, hop).await?;
     if !self.upstream_allows_narinfo(&winner.url, &parsed).await {
       tracing::debug!(
         upstream = &winner.url,
@@ -929,6 +996,7 @@ impl Router {
     upstream: &str,
     store_hash: &str,
     narinfo_bytes: Option<&[u8]>,
+    hop: Hop,
   ) -> CachedFilterCheck {
     if !self
       .inner
@@ -946,7 +1014,8 @@ impl Router {
       return CachedFilterCheck::Accepted(Some(bytes.to_vec()));
     }
 
-    if let Ok((body, parsed)) = self.fetch_narinfo(upstream, store_hash).await
+    if let Ok((body, parsed)) =
+      self.fetch_narinfo(upstream, store_hash, hop).await
       && self.upstream_allows_narinfo(upstream, &parsed).await
     {
       return CachedFilterCheck::Accepted(body);
@@ -976,7 +1045,9 @@ impl Router {
     expected_narinfo: Option<&NarInfo>,
     expected_compression: Option<&str>,
   ) -> Result<String, RouterError> {
-    let (_, parsed) = self.fetch_narinfo(upstream, store_hash).await?;
+    let (_, parsed) = self
+      .fetch_narinfo(upstream, store_hash, Hop::Client)
+      .await?;
     if !self.upstream_allows_narinfo(upstream, &parsed).await {
       tracing::debug!(
         upstream,
@@ -1019,6 +1090,7 @@ impl Router {
     &self,
     upstream: &str,
     store_hash: &str,
+    hop: Hop,
   ) -> Result<(Option<Vec<u8>>, NarInfo), RouterError> {
     let body = if self.inner.s3.contains(upstream) {
       self
@@ -1037,7 +1109,9 @@ impl Router {
         .get(upstream)
         .cloned()
         .unwrap_or_else(|| self.inner.client.clone());
-      let mut req = client.get(format!("{upstream}/{store_hash}.narinfo"));
+      let mut req = client
+        .get(format!("{upstream}/{store_hash}.narinfo"))
+        .header(HOP_HEADER, hop.outgoing());
       if let Some((user, pass)) = auth {
         req = req.basic_auth(user, pass);
       }
@@ -1292,6 +1366,7 @@ mod tests {
     FilterAction,
     FilterField,
     FilterRule,
+    Hop,
     InflightGuard,
     NarInfo,
     Router,
@@ -1552,7 +1627,7 @@ mod tests {
     .await;
 
     let result = router
-      .resolve("abc123", &[failing.clone(), working.clone()])
+      .resolve("abc123", &[failing.clone(), working.clone()], Hop::Client)
       .await
       .unwrap();
 
@@ -1579,7 +1654,7 @@ mod tests {
     .await;
 
     let result = router
-      .resolve("abc123", &[failing.clone(), working.clone()])
+      .resolve("abc123", &[failing.clone(), working.clone()], Hop::Client)
       .await
       .unwrap();
 
@@ -1613,7 +1688,7 @@ mod tests {
       .await;
 
     let result = router
-      .resolve("abc123", &[rejected, accepted.clone()])
+      .resolve("abc123", &[rejected, accepted.clone()], Hop::Client)
       .await
       .unwrap();
 
@@ -1671,7 +1746,10 @@ mod tests {
       }])
       .await;
 
-    let result = router.resolve_fallback("abc123", &fallback).await.unwrap();
+    let result = router
+      .resolve_fallback("abc123", &fallback, Hop::Client)
+      .await
+      .unwrap();
 
     assert_eq!(result.url, fallback);
     assert!(!result.cache_hit);
@@ -1698,7 +1776,7 @@ mod tests {
     .await;
 
     let cached = router
-      .resolve("abc123", slice::from_ref(&previously_accepted))
+      .resolve("abc123", slice::from_ref(&previously_accepted), Hop::Client)
       .await
       .unwrap();
     assert_eq!(cached.url, previously_accepted);
@@ -1714,7 +1792,11 @@ mod tests {
       .await;
 
     let result = router
-      .resolve("abc123", &[previously_accepted, accepted.clone()])
+      .resolve(
+        "abc123",
+        &[previously_accepted, accepted.clone()],
+        Hop::Client,
+      )
       .await
       .unwrap();
 
@@ -1761,7 +1843,7 @@ mod tests {
       }])
       .await;
 
-    let result = router.resolve("abc123", &[]).await.unwrap();
+    let result = router.resolve("abc123", &[], Hop::Client).await.unwrap();
 
     assert_eq!(result.url, upstream);
     assert!(result.cache_hit);
@@ -1826,7 +1908,7 @@ mod tests {
       .await;
 
     let result = router
-      .resolve("abc123", slice::from_ref(&working))
+      .resolve("abc123", slice::from_ref(&working), Hop::Client)
       .await
       .unwrap();
 
@@ -1897,23 +1979,23 @@ mod tests {
   async fn upstream_gate_is_stable_per_key() {
     let router = make_router(Duration::from_mins(1)).await;
     let url = "https://cache.example.com";
-    let gate1 = router.upstream_gate(url);
-    let gate2 = router.upstream_gate(url);
+    let gate1 = router.upstream_gate(url, Hop::Client);
+    let gate2 = router.upstream_gate(url, Hop::Client);
     assert!(Arc::ptr_eq(&gate1, &gate2));
   }
 
   #[tokio::test]
   async fn upstream_gate_is_distinct_per_upstream() {
     let router = make_router(Duration::from_mins(1)).await;
-    let gate_a = router.upstream_gate("https://a.example.com");
-    let gate_b = router.upstream_gate("https://b.example.com");
+    let gate_a = router.upstream_gate("https://a.example.com", Hop::Client);
+    let gate_b = router.upstream_gate("https://b.example.com", Hop::Client);
     assert!(!Arc::ptr_eq(&gate_a, &gate_b));
   }
 
   #[tokio::test]
   async fn upstream_gate_semaphore_capacity_matches_tuning() {
     let router = make_router(Duration::from_mins(1)).await;
-    let gate = router.upstream_gate("https://cache.example.com");
+    let gate = router.upstream_gate("https://cache.example.com", Hop::Client);
     assert_eq!(gate.available_permits(), 2);
   }
 }

@@ -28,6 +28,8 @@ use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_narinfo::NarInfo;
 use ncro_router::{
+  HOP_HEADER,
+  Hop,
   Router,
   RouterError,
   compression_for_nar_url,
@@ -405,8 +407,9 @@ async fn narinfo(
   let Some(hash) = hash_narinfo.strip_suffix(".narinfo") else {
     return StatusCode::NOT_FOUND.into_response();
   };
+  let hop = Hop::from_headers(req.headers());
   let candidates = upstream_urls(&state).await;
-  match state.router.resolve(hash, &candidates).await {
+  match state.router.resolve(hash, &candidates, hop).await {
     Ok(result) => {
       tracing::info!(
         hash = hash,
@@ -443,6 +446,7 @@ async fn narinfo(
           req.headers(),
           format!("{}{}", result.url, req.uri().path()),
           upstream_auth(&state, &result.url),
+          hop,
         )
         .await,
         &result.url,
@@ -767,7 +771,12 @@ async fn try_fallback_narinfo(
   req: Request<Body>,
 ) -> Option<Response> {
   let fallback = state.fallback_cache.as_ref()?;
-  match state.router.resolve_fallback(hash, &fallback.url).await {
+  let hop = Hop::from_headers(req.headers());
+  match state
+    .router
+    .resolve_fallback(hash, &fallback.url, hop)
+    .await
+  {
     Ok(result) => {
       tracing::warn!(
         hash,
@@ -798,6 +807,7 @@ async fn try_fallback_narinfo(
           req.headers(),
           format!("{}{}", result.url, req.uri().path()),
           upstream_auth(state, &result.url),
+          hop,
         )
         .await,
         &result.url,
@@ -892,6 +902,7 @@ async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
     headers,
     format!("{upstream}{path}"),
     auth,
+    None,
   )
   .await
   .ok()?;
@@ -913,8 +924,9 @@ async fn proxy(
   headers: &HeaderMap,
   url: String,
   auth: Option<(String, Option<String>)>,
+  hop: Hop,
 ) -> Response {
-  match upstream_request(client, method, headers, url, auth).await {
+  match upstream_request(client, method, headers, url, auth, Some(hop)).await {
     Ok(resp) => response_from_reqwest(resp),
     Err(err) => {
       tracing::warn!(error = %err, "upstream request failed");
@@ -929,10 +941,14 @@ async fn upstream_request(
   headers: &HeaderMap,
   url: String,
   auth: Option<(String, Option<String>)>,
+  hop: Option<Hop>,
 ) -> reqwest::Result<reqwest::Response> {
   let mut req = client.request(method, url);
   if let Some((user, pass)) = auth {
     req = req.basic_auth(user, pass);
+  }
+  if let Some(hop) = hop {
+    req = req.header(HOP_HEADER, hop.outgoing());
   }
   for name in ["accept", "accept-encoding", "range"] {
     if let Some(value) = headers.get(name) {
