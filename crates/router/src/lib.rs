@@ -412,14 +412,7 @@ impl Router {
     store_hash: &str,
     candidates: &[String],
   ) -> Result<ResolveResult, RouterError> {
-    if self.inner.miss_lru.get(store_hash).await.is_some() {
-      ncro_metrics::get().narinfo_memory_negative_hits.inc();
-      return Err(RouterError::NotFound);
-    }
-    if self.inner.db.is_negative(store_hash).await? {
-      return Err(RouterError::NotFound);
-    }
-    if let Some(result) = self.valid_cached_route(store_hash).await? {
+    if let Some(result) = self.resolve_cached(store_hash).await? {
       return Ok(result);
     }
     ncro_metrics::get().narinfo_cache_misses.inc();
@@ -440,7 +433,7 @@ impl Router {
       key: store_hash.to_string(),
       arc: Arc::clone(&lock),
     };
-    if let Some(result) = self.valid_cached_route(store_hash).await? {
+    if let Some(result) = self.resolve_cached(store_hash).await? {
       return Ok(result);
     }
 
@@ -454,6 +447,20 @@ impl Router {
         .await;
     }
     result
+  }
+
+  async fn resolve_cached(
+    &self,
+    store_hash: &str,
+  ) -> Result<Option<ResolveResult>, RouterError> {
+    if self.inner.miss_lru.get(store_hash).await.is_some() {
+      ncro_metrics::get().narinfo_memory_negative_hits.inc();
+      return Err(RouterError::NotFound);
+    }
+    if self.inner.db.is_negative(store_hash).await? {
+      return Err(RouterError::NotFound);
+    }
+    self.valid_cached_route(store_hash).await
   }
 
   async fn valid_cached_route(
