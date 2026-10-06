@@ -39,13 +39,39 @@ pub enum S3AddressingStyle {
   Virtual,
 }
 
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  Default,
+  PartialEq,
+  Eq,
+  serde::Serialize,
+  serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum S3Scheme {
+  Http,
+  #[default]
+  Https,
+}
+
+impl fmt::Display for S3Scheme {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Http => "http",
+      Self::Https => "https",
+    })
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct S3Config {
   pub bucket:           String,
   /// Optional key prefix. S3 keys are looked up as `{prefix}/{key}` when set.
   pub key_prefix:       Option<String>,
   pub endpoint:         Option<String>,
-  pub scheme:           String,
+  pub scheme:           S3Scheme,
   pub region:           String,
   pub profile:          Option<String>,
   pub addressing_style: S3AddressingStyle,
@@ -102,7 +128,7 @@ fn parse_s3_url(raw: &str) -> Result<S3Config, ConfigError> {
   let key_prefix = (!key_prefix.is_empty()).then_some(key_prefix);
 
   let mut endpoint: Option<String> = None;
-  let mut scheme = "https".to_string();
+  let mut scheme = S3Scheme::default();
   let mut region = "us-east-1".to_string();
   let mut profile: Option<String> = None;
   let mut addressing_style = S3AddressingStyle::Auto;
@@ -110,7 +136,17 @@ fn parse_s3_url(raw: &str) -> Result<S3Config, ConfigError> {
   for (key, value) in parsed.query_pairs() {
     match key.as_ref() {
       "endpoint" => endpoint = Some(value.into_owned()),
-      "scheme" => scheme = value.into_owned(),
+      "scheme" => {
+        scheme = match value.as_ref() {
+          "http" => S3Scheme::Http,
+          "https" => S3Scheme::Https,
+          other => {
+            return Err(ConfigError::Validation(format!(
+              "s3 upstream {raw:?}: unsupported scheme {other:?}"
+            )));
+          },
+        };
+      },
       "region" => region = value.into_owned(),
       "profile" => profile = Some(value.into_owned()),
       "addressing-style" => {
@@ -1327,7 +1363,7 @@ impl Config {
         "server.write_timeout must be positive".to_string(),
       ));
     }
-    if self.cache.latency_alpha <= 0.0 || self.cache.latency_alpha >= 1.0 {
+    if !(self.cache.latency_alpha > 0.0 && self.cache.latency_alpha < 1.0) {
       return Err(ConfigError::Validation(format!(
         "cache.latency_alpha must be between 0 and 1 exclusive, got {}",
         self.cache.latency_alpha
@@ -1393,6 +1429,11 @@ impl Config {
     if self.mesh.enabled && self.mesh.peers.is_empty() {
       return Err(ConfigError::Validation(
         "mesh.enabled is true but no peers configured".to_string(),
+      ));
+    }
+    if self.mesh.gossip_interval.0.is_zero() {
+      return Err(ConfigError::Validation(
+        "mesh.gossip_interval must be positive".to_string(),
       ));
     }
     for (i, peer) in self.mesh.peers.iter().enumerate() {
