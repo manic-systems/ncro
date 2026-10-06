@@ -197,7 +197,10 @@ enum CommitOutcome {
 }
 
 enum CachedFilterCheck {
-  Accepted(Option<Vec<u8>>),
+  /// The cached narinfo, if any, still passes the upstream's filters.
+  Cached,
+  /// A freshly fetched narinfo passed where the cached one did not.
+  Fetched(Vec<u8>),
   Rejected,
 }
 
@@ -519,7 +522,7 @@ impl Router {
     hop: Hop,
   ) -> Result<Option<ResolveResult>, RouterError> {
     if let Some(cached) = self.inner.lru.get(store_hash).await {
-      let CachedFilterCheck::Accepted(narinfo_bytes) = self
+      let fetched = match self
         .cached_route_filter_check(
           &cached.url,
           store_hash,
@@ -527,20 +530,20 @@ impl Router {
           hop,
         )
         .await
-      else {
-        self.inner.lru.invalidate(store_hash).await;
-        return Ok(None);
+      {
+        CachedFilterCheck::Cached => None,
+        CachedFilterCheck::Fetched(bytes) => Some(bytes),
+        CachedFilterCheck::Rejected => {
+          self.inner.lru.invalidate(store_hash).await;
+          return Ok(None);
+        },
       };
       ncro_metrics::get().narinfo_cache_hits.inc();
       let mut result = (*cached).clone();
       result.cache_hit = true;
-      if result.narinfo_bytes.is_none() {
+      if let Some(bytes) = fetched {
         result.narinfo_bytes = self
-          .response_narinfo_bytes(
-            &cached.url,
-            store_hash,
-            narinfo_bytes.as_deref(),
-          )
+          .response_narinfo_bytes(&cached.url, store_hash, Some(&bytes))
           .await;
         self
           .inner
@@ -560,7 +563,7 @@ impl Router {
     if health.as_ref().is_some_and(|h| h.status == Status::Down) {
       return Ok(None);
     }
-    let CachedFilterCheck::Accepted(narinfo_bytes) = self
+    match self
       .cached_route_filter_check(
         &entry.upstream_url,
         store_hash,
@@ -568,12 +571,13 @@ impl Router {
         hop,
       )
       .await
-    else {
-      return Ok(None);
-    };
-    if entry.narinfo_bytes.is_none() && narinfo_bytes.is_some() {
-      entry.narinfo_bytes = narinfo_bytes;
-      self.inner.db.set_route(&entry).await?;
+    {
+      CachedFilterCheck::Cached => {},
+      CachedFilterCheck::Fetched(bytes) => {
+        entry.narinfo_bytes = Some(bytes);
+        self.inner.db.set_route(&entry).await?;
+      },
+      CachedFilterCheck::Rejected => return Ok(None),
     }
     ncro_metrics::get().narinfo_cache_hits.inc();
     let narinfo_bytes = self
@@ -1007,20 +1011,20 @@ impl Router {
       .await
       .contains_key(upstream)
     {
-      return CachedFilterCheck::Accepted(narinfo_bytes.map(<[u8]>::to_vec));
+      return CachedFilterCheck::Cached;
     }
     if let Some(bytes) = narinfo_bytes
       && let Ok(narinfo) = NarInfo::parse(bytes)
       && self.upstream_allows_narinfo(upstream, &narinfo).await
     {
-      return CachedFilterCheck::Accepted(Some(bytes.to_vec()));
+      return CachedFilterCheck::Cached;
     }
 
-    if let Ok((body, parsed)) =
+    if let Ok((Some(body), parsed)) =
       self.fetch_narinfo(upstream, store_hash, hop).await
       && self.upstream_allows_narinfo(upstream, &parsed).await
     {
-      return CachedFilterCheck::Accepted(body);
+      return CachedFilterCheck::Fetched(body);
     }
     CachedFilterCheck::Rejected
   }
