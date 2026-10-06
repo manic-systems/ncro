@@ -832,13 +832,12 @@ impl Router {
   }
 
   fn in_cooldown(&self, url: &str) -> bool {
-    if let Some(until) = self.inner.upstream_cooldown.get(url)
-      && *until > Instant::now()
-    {
-      return true;
-    }
-    self.inner.upstream_cooldown.remove(url);
-    false
+    let now = Instant::now();
+    self
+      .inner
+      .upstream_cooldown
+      .remove_if(url, |_, until| *until <= now);
+    self.inner.upstream_cooldown.contains_key(url)
   }
 
   fn mark_cooldown(&self, url: &str) {
