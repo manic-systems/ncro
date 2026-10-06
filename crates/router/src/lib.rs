@@ -20,7 +20,10 @@ use ncro_db::{Db, DbError, RouteEntry};
 use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, is_store_hash, parse_public_key};
 use ncro_s3::{S3ClientPool, S3Error};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{
+  StatusCode,
+  header::{HeaderMap, HeaderName, HeaderValue},
+};
 use rustls::crypto::ring;
 use thiserror::Error;
 use tokio::{
@@ -757,8 +760,8 @@ impl Router {
                 latency_ms: start.elapsed().as_secs_f64() * 1000.0,
               })
             },
-            Ok(_) => RaceAttempt::NotFound, // 404 / non-success = not found
-            Err(_) => RaceAttempt::NetworkError { upstream }, // network error
+            Ok(resp) if is_miss_status(resp.status()) => RaceAttempt::NotFound,
+            Ok(_) | Err(_) => RaceAttempt::NetworkError { upstream },
           }
         }
       });
@@ -1116,10 +1119,10 @@ impl Router {
         req = req.basic_auth(user, pass);
       }
       let resp = req.send().await?;
-      if !resp.status().is_success() {
+      if is_miss_status(resp.status()) {
         return Err(RouterError::NotFound);
       }
-      resp.bytes().await?.to_vec()
+      resp.error_for_status()?.bytes().await?.to_vec()
     };
     let parsed = NarInfo::parse(body.as_slice())?;
     if let Some(public_keys) =
@@ -1291,6 +1294,14 @@ fn filter_rule_matches(rule: &FilterRule, narinfo: &NarInfo) -> bool {
   }
 }
 
+/// The statuses Nix's HTTP binary cache store also treats as a missing file.
+const fn is_miss_status(status: StatusCode) -> bool {
+  matches!(
+    status,
+    StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE
+  )
+}
+
 const fn commit_error_is_retryable(err: &RouterError) -> bool {
   matches!(
     err,
@@ -1445,9 +1456,9 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
             return;
           }
-          let _ = stream
-            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
-            .await;
+          let response =
+            format!("HTTP/1.1 {get_status} Error\r\nContent-Length: 0\r\n\r\n");
+          let _ = stream.write_all(response.as_bytes()).await;
         });
       }
     });
@@ -1609,7 +1620,7 @@ mod tests {
 
   #[tokio::test]
   async fn resolve_retries_after_winner_get_returns_not_found() {
-    let failing = spawn_narinfo_server(500, "wrong").await;
+    let failing = spawn_narinfo_server(404, "wrong").await;
     let working = spawn_narinfo_server(200, "zedless-0.1.0").await;
     let router = make_router_with_upstreams(Duration::from_mins(1), &[
       UpstreamConfig {
