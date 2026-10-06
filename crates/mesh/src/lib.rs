@@ -184,7 +184,13 @@ pub async fn listen_and_serve(
       tokio::select! {
           _ = stop.changed() => return,
           recv = socket.recv_from(&mut buf) => {
-              let Ok((n, src)) = recv else { return; };
+              let (n, src) = match recv {
+                  Ok(received) => received,
+                  Err(err) => {
+                      tracing::warn!(error = %err, "mesh: receive failed");
+                      continue;
+                  }
+              };
               match decode_packet(&buf[..n]) {
                   Ok((pubkey, sig, body, msg)) => {
                       if !allowed_keys.iter().any(|k| k.as_slice() == pubkey) {
