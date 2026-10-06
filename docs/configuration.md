@@ -305,7 +305,7 @@ public_key = "a1b2c3..." # 32-byte ed25519 key, hex encoded
 | `bind_addr`       | `"0.0.0.0:7946"` | UDP address on which to receive gossip.                                                |
 | `private_key`     | empty            | Path to an ed25519 private key. Empty uses an ephemeral identity.                      |
 | `gossip_interval` | `"30s"`          | Interval between route announcements.                                                  |
-| `peers`           | `[]`             | Peer entries, each with required `addr` and optional hex-encoded 32-byte `public_key`. |
+| `peers`           | `[]`             | Peer entries, each with required `addr` and hex-encoded 32-byte `public_key`.          |
 
 <!--markdownlint-enable MD013-->
 
