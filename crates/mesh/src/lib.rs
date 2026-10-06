@@ -210,7 +210,10 @@ pub async fn listen_and_serve(
 
 async fn merge_routes(db: &Db, incoming: Vec<RouteEntry>) {
   let now = Utc::now();
-  for route in incoming.into_iter().filter(|route| route.ttl > now) {
+  let usable = |route: &RouteEntry| {
+    route.ttl > now && route.latency_ema.is_finite() && route.latency_ema >= 0.0
+  };
+  for route in incoming.into_iter().filter(usable) {
     let should_set = match db.get_route(&route.store_path).await {
       Ok(Some(existing)) if route.latency_ema > existing.latency_ema => false,
       Ok(Some(existing))
