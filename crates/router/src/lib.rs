@@ -18,7 +18,7 @@ use ncro_config::{
 };
 use ncro_db::{Db, DbError, RouteEntry};
 use ncro_health::{Prober, Status};
-use ncro_narinfo::{NarInfo, NarInfoError, parse_public_key};
+use ncro_narinfo::{NarInfo, NarInfoError, is_store_hash, parse_public_key};
 use ncro_s3::{S3ClientPool, S3Error};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rustls::crypto::ring;
@@ -1261,8 +1261,7 @@ pub fn compression_for_nar_url(url: &str) -> Option<&'static str> {
 pub fn store_hash_from_canonical_nar_url(path: &str) -> Option<&str> {
   let rest = path.trim_start_matches('/').strip_prefix("nar/")?;
   let hash = rest.split_once(".nar").map_or(rest, |(hash, _)| hash);
-  (hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_alphanumeric()))
-    .then_some(hash)
+  is_store_hash(hash).then_some(hash)
 }
 
 fn relative_nar_url(url: &str) -> &str {
