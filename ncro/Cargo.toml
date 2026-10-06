@@ -13,6 +13,7 @@ anyhow.workspace   = true
 axum.workspace     = true
 hex.workspace      = true
 pound.workspace    = true
+socket2.workspace  = true
 tokio              = { workspace = true, features = [ "macros", "rt-multi-thread", "signal", "time", "net", "fs" ] }
 tracing.workspace  = true
 tracing-subscriber = { workspace = true, features = [ "env-filter", "json" ] }

@@ -10,7 +10,7 @@
   inherit (lib.types) attrsOf bool package nullOr path port submodule;
   inherit (lib.lists) optional optionals filter elemAt map flatten unique;
   inherit (lib.attrsets) optionalAttrs mapAttrsToList recursiveUpdate mapAttrs' nameValuePair filterAttrs;
-  inherit (lib.strings) match toInt;
+  inherit (lib.strings) hasPrefix match toInt;
   inherit (lib.trivial) defaultTo;
 
   tomlFormat = pkgs.formats.toml {};
@@ -52,6 +52,17 @@
     };
 
   portOfAddr = addr: (addrParts addr).port;
+
+  # systemd's ListenStream takes neither a hostname nor the `:port` shorthand,
+  # so spell out the sockets ncro would otherwise bind itself.
+  listenStreamsFor = addr: let
+    port = toString (portOfAddr addr);
+  in
+    if hasPrefix "localhost:" addr
+    then ["127.0.0.1:${port}" "[::1]:${port}"]
+    else if hasPrefix ":" addr
+    then [port]
+    else [addr];
 
   isLoopbackAddr = addr: let
     inherit ((addrParts addr)) host;
@@ -139,7 +150,7 @@
   listenAddrFor = fallbackPort: settings:
     if (settings.server.listen or "") != ""
     then settings.server.listen
-    else "127.0.0.1:${toString fallbackPort}";
+    else "localhost:${toString fallbackPort}";
 
   meshAddrFor = fallbackPort: settings:
     if (settings.mesh.bind_addr or "") != ""
@@ -161,7 +172,7 @@
 
   instanceSocket = _: instance: {
     wantedBy = ["sockets.target"];
-    socketConfig.ListenStream = normalizeAddr (effectiveInstanceSettings instance).server.listen;
+    socketConfig.ListenStream = listenStreamsFor (effectiveInstanceSettings instance).server.listen;
   };
 
   activeListeners =
@@ -196,10 +207,11 @@
       firewallListeners)
   );
 
-  instanceListenAddresses =
+  instanceListenAddresses = flatten (
     lib.mapAttrsToList
-    (_: instance: normalizeAddr (effectiveInstanceSettings instance).server.listen)
-    cfg.instances;
+    (_: instance: listenStreamsFor (effectiveInstanceSettings instance).server.listen)
+    cfg.instances
+  );
 
   instanceMeshAddresses =
     map (settings: normalizeAddr settings.mesh.bind_addr)
@@ -268,8 +280,8 @@ in {
       type = port;
       default = defaultServerPort;
       description = ''
-        TCP port for the ncro HTTP listener, bound on 127.0.0.1 unless
-        overridden. Reach for
+        TCP port for the ncro HTTP listener, bound on `localhost` (both
+        127.0.0.1 and ::1) unless overridden. Reach for
         {option}`services.ncro.settings.server.listen` when you need to pin the
         bind address too, since it overrides this option.
       '';
@@ -459,7 +471,7 @@ in {
         {
           ncro = mkIf (cfg.instances == {} && cfg.socketActivation) {
             wantedBy = ["sockets.target"];
-            socketConfig.ListenStream = normalizeAddr effectiveSettings.server.listen;
+            socketConfig.ListenStream = listenStreamsFor effectiveSettings.server.listen;
           };
         }
         // lib.mapAttrs' (
