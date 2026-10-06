@@ -247,7 +247,7 @@ mod tests {
   #[test]
   fn loads_defaults() -> Result<(), ConfigError> {
     let cfg = Config::load(None)?;
-    assert_eq!(cfg.server.listen, ":8080");
+    assert_eq!(cfg.server.listen, "127.0.0.1:8080");
     assert_eq!(cfg.cache.max_entries, 100_000);
     assert_eq!(cfg.cache.slow_statement_threshold.0, Duration::from_secs(1));
     assert_eq!(cfg.upstreams.len(), 1);
@@ -917,7 +917,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
   fn default() -> Self {
     Self {
-      listen:          ":8080".to_string(),
+      listen:          "127.0.0.1:8080".to_string(),
       cache_priority:  30,
       want_mass_query: true,
       read_timeout:    HumanDuration(Duration::from_secs(30)),

@@ -1,5 +1,5 @@
 [server]
-listen          = ":8080"
+listen          = "127.0.0.1:8080"
 read_timeout    = "30s"
 write_timeout   = "30s"
 # Advertised to Nix in /nix-cache-info. `cache_priority` sets `Priority` (lower
