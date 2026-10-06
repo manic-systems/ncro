@@ -29,8 +29,12 @@ use ncro_s3::S3ClientPool;
 use rustls::crypto::ring;
 use tokio::{
   sync::{RwLock, watch},
+  task::JoinHandle,
   time as tokio_time,
 };
+
+/// Bounds health probe requests, so a hung upstream counts as a failure.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -109,9 +113,7 @@ impl Prober {
         table: RwLock::new(HashMap::new()),
         auth: RwLock::new(HashMap::new()),
         s3: S3ClientPool::default(),
-        client: reqwest::Client::builder()
-          .timeout(Duration::from_secs(10))
-          .build()?,
+        client: reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?,
         persist_health: RwLock::new(None),
       }),
     })
@@ -273,32 +275,37 @@ impl Prober {
     let auth = self.inner.auth.read().await.get(&url).cloned();
     let start = Instant::now();
     let ok = if self.inner.s3.contains(&url) {
-      match self.inner.s3.head_object(&url, "nix-cache-info").await {
-        Ok(true) => true,
-        Ok(false) => false,
-        Err(head_error) => {
-          tracing::debug!(
-            upstream = %url,
-            error = %head_error,
-            "S3 HEAD probe failed, trying GET"
-          );
-          match self.inner.s3.get_object(&url, "nix-cache-info", None).await {
-            Ok(Some(object)) => {
-              drop(object.body);
-              true
-            },
-            Ok(None) => false,
-            Err(get_error) => {
-              tracing::debug!(
-                upstream = %url,
-                error = %get_error,
-                "S3 GET probe failed"
-              );
-              false
-            },
-          }
-        },
-      }
+      let probe = async {
+        match self.inner.s3.head_object(&url, "nix-cache-info").await {
+          Ok(true) => true,
+          Ok(false) => false,
+          Err(head_error) => {
+            tracing::debug!(
+              upstream = %url,
+              error = %head_error,
+              "S3 HEAD probe failed, trying GET"
+            );
+            match self.inner.s3.get_object(&url, "nix-cache-info", None).await {
+              Ok(Some(object)) => {
+                drop(object.body);
+                true
+              },
+              Ok(None) => false,
+              Err(get_error) => {
+                tracing::debug!(
+                  upstream = %url,
+                  error = %get_error,
+                  "S3 GET probe failed"
+                );
+                false
+              },
+            }
+          },
+        }
+      };
+      tokio_time::timeout(PROBE_TIMEOUT, probe)
+        .await
+        .unwrap_or(false)
     } else {
       let url_path = format!("{url}/nix-cache-info");
       let mut head_req = self.inner.client.head(&url_path);
@@ -342,7 +349,8 @@ impl Prober {
     let mut ticker = tokio_time::interval(check_tick);
 
     // When was it last probed. None means never, probe immediately.
-    let mut last_probed: HashMap<String, Instant> = HashMap::new();
+    let mut last_probed: HashMap<String, (Instant, JoinHandle<()>)> =
+      HashMap::new();
     loop {
       tokio::select! {
           _ = stop.changed() => return,
@@ -362,12 +370,15 @@ impl Prober {
                   let due = backoff_interval(interval, consecutive_fails);
                   let should_probe = match last_probed.get(&url) {
                       None => true,
-                      Some(&last) => now.saturating_duration_since(last) >= due,
+                      Some((last, probe)) => {
+                          probe.is_finished() && now.saturating_duration_since(*last) >= due
+                      }
                   };
                   if should_probe {
-                      last_probed.insert(url.clone(), now);
                       let prober = self.clone();
-                      tokio::spawn(async move { prober.probe_upstream(url).await; });
+                      let probe_url = url.clone();
+                      let probe = tokio::spawn(async move { prober.probe_upstream(probe_url).await; });
+                      last_probed.insert(url, (now, probe));
                   }
               }
           }
