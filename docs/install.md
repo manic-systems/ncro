@@ -73,9 +73,9 @@ course, prefer to package the built releases if you'd like.
 $ ncro
 ```
 
-By default, `ncro` listens on `127.0.0.1:8080` and uses `https://cache.nixos.org` as the
-primary upstream, so you can usually start it without writing a config file
-first.
+By default, `ncro` listens on `localhost:8080` and uses
+`https://cache.nixos.org` as the primary upstream, so you can usually start it
+without writing a config file first.
 
 To use an explicit config file:
 
@@ -89,7 +89,7 @@ You can also point the binary at a config file with `NCRO_CONFIG`.
 
 ```toml
 [server]
-listen = "127.0.0.1:8080"
+listen = "localhost:8080"
 
 [[upstreams]]
 url = "https://cache.nixos.org"
@@ -134,7 +134,7 @@ change it.
     openFirewall = true;
     settings = {
       # Listen on all interfaces so other machines can reach the proxy.
-      # The default is 127.0.0.1.
+      # The default is localhost.
       server.listen = ":8081";
       upstreams = [
         {
@@ -151,10 +151,11 @@ change it.
 ```
 
 `port` and `meshPort` are the short way to move ncro off its defaults of 8080
-and 7946. The HTTP listener binds `127.0.0.1` unless `settings.server.listen`
-says otherwise. Reach for `settings.server.listen` or `settings.mesh.bind_addr` when
-you need to pin the bind address too, since those carry an address as well as a
-port and override the port options.
+and 7946. The HTTP listener binds `localhost`, meaning both `127.0.0.1` and
+`::1`, unless `settings.server.listen` says otherwise. Reach for
+`settings.server.listen` or `settings.mesh.bind_addr` when you need to pin the
+bind address too, since those carry an address as well as a port and override
+the port options.
 
 `openFirewall` opens whichever ports the listeners actually landed on. It adds
 the mesh port only when mesh is enabled, and skips any listener bound to

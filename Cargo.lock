@@ -1998,6 +1998,7 @@ dependencies = [
  "ncro-router",
  "ncro-server",
  "pound",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

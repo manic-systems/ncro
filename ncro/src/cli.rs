@@ -4,23 +4,25 @@ use std::{
   ffi::OsString,
   io::{self, Write as _},
   mem,
-  net::TcpListener as StdTcpListener,
+  net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
   os::unix::{ffi::OsStringExt, io::FromRawFd, net::UnixDatagram},
   path::Path,
   process,
   time::Duration,
 };
 
-use ncro_config::{Config, LogFormat};
+use ncro_config::{Config, ListenAddr, LogFormat};
 use ncro_db::{Db, HealthRow};
 use ncro_discovery::Discovery;
 use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
 use pound::Parse;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
   net::TcpListener,
   signal,
   sync::{mpsc, watch},
+  task::JoinSet,
   time,
 };
 use tracing::subscriber::set_default;
@@ -35,23 +37,85 @@ fn parse_listen_fds(val: Option<&str>) -> Option<u32> {
   if n >= 1 { Some(n) } else { None }
 }
 
-/// Attempts to inherit a pre-bound TCP socket from systemd (fd 3).
+/// Attempts to inherit the pre-bound TCP sockets systemd passes from fd 3 on.
 /// Returns `None` when `LISTEN_FDS` is absent or zero, or when `LISTEN_PID`
 /// does not match this process (guards against inheriting stale env vars).
-fn inherited_listener() -> Option<StdTcpListener> {
-  parse_listen_fds(env::var("LISTEN_FDS").ok().as_deref())?;
+fn inherited_listeners() -> Option<Vec<StdTcpListener>> {
+  let count = parse_listen_fds(env::var("LISTEN_FDS").ok().as_deref())?;
   // Confirm the fds are intended for this process, as required by the
   // sd_listen_fds(3) protocol.
   let our_pid = process::id().to_string();
   if env::var("LISTEN_PID").ok().as_deref() != Some(our_pid.as_str()) {
     return None;
   }
-  // SAFETY: systemd passes a pre-bound TCP socket as fd 3
-  // (SD_LISTEN_FDS_START). The fd is valid for the lifetime of this process
-  // and not owned by anyone else when LISTEN_FDS >= 1 and LISTEN_PID matches.
-  let listener = unsafe { StdTcpListener::from_raw_fd(3) };
-  listener.set_nonblocking(true).ok()?;
-  Some(listener)
+  let count = i32::try_from(count).ok()?;
+  (3..3 + count)
+    .map(|fd| {
+      // SAFETY: systemd passes LISTEN_FDS pre-bound TCP sockets starting at
+      // fd 3 (SD_LISTEN_FDS_START). They are valid for the lifetime of this
+      // process and not owned by anyone else when LISTEN_PID matches.
+      let listener = unsafe { StdTcpListener::from_raw_fd(fd) };
+      listener.set_nonblocking(true).ok()?;
+      Some(listener)
+    })
+    .collect()
+}
+
+/// Binds `listen`, or adopts the sockets systemd passed in.
+async fn bind_listeners(
+  listen: Option<ListenAddr>,
+) -> io::Result<Vec<TcpListener>> {
+  if let Some(inherited) = inherited_listeners() {
+    tracing::info!(
+      count = inherited.len(),
+      "socket activation: using inherited listeners"
+    );
+    return inherited.into_iter().map(TcpListener::from_std).collect();
+  }
+  let Some(listen) = listen else {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "server.listen is empty and systemd passed no sockets",
+    ));
+  };
+  match listen {
+    ListenAddr::Socket(addr) => Ok(vec![TcpListener::bind(addr).await?]),
+    ListenAddr::Localhost(port) => {
+      let mut listeners =
+        vec![TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?];
+      match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+        Ok(listener) => listeners.push(listener),
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => return Err(err),
+        Err(err) => {
+          tracing::warn!(error = %err, "IPv6 loopback unavailable, listening on 127.0.0.1 only");
+        },
+      }
+      Ok(listeners)
+    },
+    ListenAddr::Any(port) => {
+      match bind_dual_stack(port) {
+        Ok(listener) => Ok(vec![listener]),
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => Err(err),
+        Err(err) => {
+          tracing::warn!(error = %err, "IPv6 unavailable, listening on 0.0.0.0 only");
+          Ok(vec![
+            TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?,
+          ])
+        },
+      }
+    },
+  }
+}
+
+/// Binds `[::]:port` with `IPV6_V6ONLY` off, so one socket takes IPv4 too.
+fn bind_dual_stack(port: u16) -> io::Result<TcpListener> {
+  let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+  socket.set_only_v6(false)?;
+  socket.set_reuse_address(true)?;
+  socket.set_nonblocking(true)?;
+  socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+  socket.listen(1024)?;
+  TcpListener::from_std(socket.into())
 }
 
 /// Sends `READY=1` to the systemd notification socket if `$NOTIFY_SOCKET` is
@@ -335,24 +399,34 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
     read_timeout:    cfg.server.read_timeout.0,
     write_timeout:   cfg.server.write_timeout.0,
   })?;
-  let listener = match inherited_listener() {
-    Some(std_listener) => {
-      tracing::info!("socket activation: using inherited listener (fd 3)");
-      TcpListener::from_std(std_listener)?
-    },
-    None => TcpListener::bind(normalize_listen(&cfg.server.listen)).await?,
-  };
+  let listeners = bind_listeners(cfg.server.listen).await?;
   tracing::info!(
-    addr = cfg.server.listen,
+    addrs = ?listeners
+      .iter()
+      .filter_map(|listener| listener.local_addr().ok())
+      .collect::<Vec<_>>(),
     upstreams = cfg.upstreams.len(),
     version = env!("CARGO_PKG_VERSION"),
     "ncro listening"
   );
   sd_notify_ready();
-  let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-    let _ = signal::ctrl_c().await;
-  });
-  let result = server.await;
+  let mut servers = JoinSet::new();
+  for listener in listeners {
+    let server = axum::serve(listener, app.clone())
+      .with_graceful_shutdown(async move {
+        let _ = signal::ctrl_c().await;
+      })
+      .into_future();
+    servers.spawn(server);
+  }
+  let result = async {
+    while let Some(joined) = servers.join_next().await {
+      joined??;
+    }
+    anyhow::Ok(())
+  }
+  .await;
+  drop(servers);
   let _ = stop_tx.send(true);
   let _ = health_worker.await;
   result?;
@@ -386,14 +460,6 @@ fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
     (LogFormat::Text, false) => {
       fmt().without_time().with_env_filter(filter).init();
     },
-  }
-}
-
-fn normalize_listen(listen: &str) -> String {
-  if listen.starts_with(':') {
-    format!("0.0.0.0{listen}")
-  } else {
-    listen.to_string()
   }
 }
 

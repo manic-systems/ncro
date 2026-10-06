@@ -1,4 +1,13 @@
-use std::{env, fmt, fs, io, iter, time::Duration};
+use std::{
+  env,
+  fmt,
+  fs,
+  io,
+  iter,
+  net::SocketAddr,
+  str::FromStr,
+  time::Duration,
+};
 
 use netrc::Netrc;
 use serde::{Deserialize, Deserializer, de};
@@ -247,7 +256,7 @@ mod tests {
   #[test]
   fn loads_defaults() -> Result<(), ConfigError> {
     let cfg = Config::load(None)?;
-    assert_eq!(cfg.server.listen, "127.0.0.1:8080");
+    assert_eq!(cfg.server.listen, Some(ListenAddr::Localhost(8080)));
     assert_eq!(cfg.cache.max_entries, 100_000);
     assert_eq!(cfg.cache.slow_statement_threshold.0, Duration::from_secs(1));
     assert_eq!(cfg.upstreams.len(), 1);
@@ -901,10 +910,65 @@ impl Default for FallbackCacheConfig {
   }
 }
 
+/// Where the HTTP server listens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenAddr {
+  /// `localhost:PORT`, bound on both `127.0.0.1` and `::1`.
+  Localhost(u16),
+  /// `:PORT`, bound on every interface over IPv4 and IPv6.
+  Any(u16),
+  /// `IP:PORT`, bound as written.
+  Socket(SocketAddr),
+}
+
+#[derive(Debug, Error)]
+#[error("listen address {0:?} must be localhost:PORT, :PORT, or IP:PORT")]
+pub struct InvalidListenAddr(String);
+
+impl FromStr for ListenAddr {
+  type Err = InvalidListenAddr;
+
+  fn from_str(raw: &str) -> Result<Self, Self::Err> {
+    let invalid = || InvalidListenAddr(raw.to_string());
+    if let Some(port) = raw.strip_prefix(':') {
+      return port.parse().map(Self::Any).map_err(|_| invalid());
+    }
+    if let Some(port) = raw.strip_prefix("localhost:") {
+      return port.parse().map(Self::Localhost).map_err(|_| invalid());
+    }
+    raw.parse().map(Self::Socket).map_err(|_| invalid())
+  }
+}
+
+impl fmt::Display for ListenAddr {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Localhost(port) => write!(f, "localhost:{port}"),
+      Self::Any(port) => write!(f, ":{port}"),
+      Self::Socket(addr) => write!(f, "{addr}"),
+    }
+  }
+}
+
+/// An empty `listen` leaves the listening sockets to socket activation.
+fn deserialize_listen<'de, D>(
+  deserializer: D,
+) -> Result<Option<ListenAddr>, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  let raw = String::deserialize(deserializer)?;
+  if raw.is_empty() {
+    return Ok(None);
+  }
+  raw.parse().map(Some).map_err(de::Error::custom)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-  pub listen:          String,
+  #[serde(deserialize_with = "deserialize_listen")]
+  pub listen:          Option<ListenAddr>,
   pub cache_priority:  i32,
   /// Value advertised as `WantMassQuery` in `/nix-cache-info`. When `true`,
   /// Nix may issue bulk `.narinfo` queries against this cache; disable it to
@@ -917,7 +981,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
   fn default() -> Self {
     Self {
-      listen:          "127.0.0.1:8080".to_string(),
+      listen:          Some(ListenAddr::Localhost(8080)),
       cache_priority:  30,
       want_mass_query: true,
       read_timeout:    HumanDuration(Duration::from_secs(30)),
@@ -1133,7 +1197,9 @@ impl Config {
     if let Ok(v) = env::var("NCRO_LISTEN")
       && !v.is_empty()
     {
-      cfg.server.listen = v;
+      cfg.server.listen = Some(v.parse().map_err(|err| {
+        ConfigError::Validation(format!("NCRO_LISTEN: {err}"))
+      })?);
     }
     if let Ok(v) = env::var("NCRO_DB_PATH")
       && !v.is_empty()

@@ -5,7 +5,7 @@
 ncro reads TOML from the file passed with `--config`. In a configuration file,
 `[[upstreams]]` must contain at least one entry; every other section and setting
 is optional and uses the defaults below. With no configuration file, ncro
-listens on `127.0.0.1:8080` and uses `https://cache.nixos.org` as its only upstream.
+listens on `localhost:8080` and uses `https://cache.nixos.org` as its only upstream.
 
 Start with one upstream, point Nix at ncro, then add routing, authentication, or
 network features only when they solve a concrete deployment need. See
@@ -16,7 +16,7 @@ reference.
 
 ```toml
 [server]
-listen = "127.0.0.1:8080"
+listen = "localhost:8080"
 
 [[upstreams]]
 url = "https://cache.nixos.org"
@@ -55,13 +55,13 @@ capabilities advertised at `/nix-cache-info`.
 
 <!--markdownlint-disable MD013-->
 
-| Key               | Default            | Meaning                                                                                           |
-| ----------------- | ------------------ | ------------------------------------------------------------------------------------------------- |
-| `listen`          | `"127.0.0.1:8080"` | TCP address to bind.                                                                              |
-| `read_timeout`    | `"30s"`            | Maximum time spent reading a client request body.                                                 |
-| `write_timeout`   | `"30s"`            | Maximum time allowed to write a response body to a client.                                        |
-| `cache_priority`  | `30`               | Positive `Priority` advertised to Nix; lower values are preferred by Nix when it compares caches. |
-| `want_mass_query` | `true`             | Advertise `WantMassQuery: 1`. Set false to discourage Nix from making bulk narinfo queries.       |
+| Key               | Default            | Meaning                                                                                                                                                |
+| ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `listen`          | `"localhost:8080"` | TCP address to bind. `localhost:PORT` binds `127.0.0.1` and `::1`, `:PORT` binds every interface over IPv4 and IPv6, and `IP:PORT` binds that address. |
+| `read_timeout`    | `"30s"`            | Maximum time spent reading a client request body.                                                                                                      |
+| `write_timeout`   | `"30s"`            | Maximum time allowed to write a response body to a client.                                                                                             |
+| `cache_priority`  | `30`               | Positive `Priority` advertised to Nix; lower values are preferred by Nix when it compares caches.                                                      |
+| `want_mass_query` | `true`             | Advertise `WantMassQuery: 1`. Set false to discourage Nix from making bulk narinfo queries.                                                            |
 
 <!--markdownlint-enable MD013-->
 
