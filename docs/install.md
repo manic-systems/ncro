@@ -73,7 +73,7 @@ course, prefer to package the built releases if you'd like.
 $ ncro
 ```
 
-By default, `ncro` listens on `:8080` and uses `https://cache.nixos.org` as the
+By default, `ncro` listens on `127.0.0.1:8080` and uses `https://cache.nixos.org` as the
 primary upstream, so you can usually start it without writing a config file
 first.
 
@@ -89,7 +89,7 @@ You can also point the binary at a config file with `NCRO_CONFIG`.
 
 ```toml
 [server]
-listen = ":8080"
+listen = "127.0.0.1:8080"
 
 [[upstreams]]
 url = "https://cache.nixos.org"
@@ -133,6 +133,9 @@ change it.
     port = 8081;
     openFirewall = true;
     settings = {
+      # Listen on all interfaces so other machines can reach the proxy.
+      # The default is 127.0.0.1.
+      server.listen = ":8081";
       upstreams = [
         {
           url = "https://cache.nixos.org";
@@ -148,7 +151,8 @@ change it.
 ```
 
 `port` and `meshPort` are the short way to move ncro off its defaults of 8080
-and 7946. Reach for `settings.server.listen` or `settings.mesh.bind_addr` when
+and 7946. The HTTP listener binds `127.0.0.1` unless `settings.server.listen`
+says otherwise. Reach for `settings.server.listen` or `settings.mesh.bind_addr` when
 you need to pin the bind address too, since those carry an address as well as a
 port and override the port options.
 

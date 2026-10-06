@@ -163,7 +163,7 @@ as `http://localhost:8080`).
 ## Quick Start
 
 ```bash
-# Run with defaults (upstreams: cache.nixos.org, listen: :8080)
+# Run with defaults (upstreams: cache.nixos.org, listen: 127.0.0.1:8080)
 $ ncro
 
 # Point at a config file
@@ -191,7 +191,7 @@ without starting the server.
 
 ```toml
 [server]
-listen = ":8080"
+listen = "127.0.0.1:8080"
 read_timeout = "30s"
 write_timeout = "30s"
 cache_priority = 30    # advertised as Priority in /nix-cache-info (lower = preferred)

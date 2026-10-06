@@ -139,7 +139,7 @@
   listenAddrFor = fallbackPort: settings:
     if (settings.server.listen or "") != ""
     then settings.server.listen
-    else ":${toString fallbackPort}";
+    else "127.0.0.1:${toString fallbackPort}";
 
   meshAddrFor = fallbackPort: settings:
     if (settings.mesh.bind_addr or "") != ""
@@ -268,7 +268,8 @@ in {
       type = port;
       default = defaultServerPort;
       description = ''
-        TCP port for the ncro HTTP listener. Reach for
+        TCP port for the ncro HTTP listener, bound on 127.0.0.1 unless
+        overridden. Reach for
         {option}`services.ncro.settings.server.listen` when you need to pin the
         bind address too, since it overrides this option.
       '';
