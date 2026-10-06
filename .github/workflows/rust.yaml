@@ -1,108 +1,65 @@
-name: Build and Test with Cargo
+name: Format, Lint and Test
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+  merge_group:
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  CARGO_NET_RETRY: 10
-  RUSTUP_MAX_RETRIES: 10
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
-  changes:
-    name: Detect Changed Files
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
-    outputs:
-      files_changed: ${{ steps.changed-files.outputs.files }}
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Get changed files
-        id: changed-files
-        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
-        with:
-          filters: |
-            files:
-              - '.github/workflows/rust.yaml'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'crates/**'
-              - 'ncro/**'
-  build:
-    name: Build with Cargo
-    needs: changes
-    if: ${{ needs.changes.outputs.files_changed == 'true' }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-24.04
-          - os: ubuntu-24.04-arm
-    runs-on: ${{ matrix.os }}
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - name: Check Rust Formatting
+        run: nix develop --command cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-
-      - name: Build
-        run: nix build .#ncro -L --no-link
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - name: Run Clippy
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: build
-    outputs:
-      passed: ${{ steps.nextest.outputs.passed }}
-      total: ${{ steps.nextest.outputs.total }}
-      pct: ${{ steps.nextest.outputs.pct }}
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
           persist-credentials: false
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - name: Run Test Suite
+        run: nix develop --command cargo nextest run --all
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-
-      - name: Run nextest
-        id: nextest
-        run: |
-          # Enable experimental libtest-json output
-          export NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1
-
-          # Run tests and capture NDJSON output
-          nix develop --command cargo nextest run --message-format libtest-json-plus > test-output.ndjson || true
-
-          # Count passed / failed tests
-          passed=$(jq -c '. | select(.type=="test" and .event=="ok")' test-output.ndjson | wc -l)
-          failed=$(jq -c '. | select(.type=="test" and .event=="failed")' test-output.ndjson | wc -l)
-
-          # Numbers must be integers
-          passed=$(echo "$passed" | tr -d '[:space:]')
-          failed=$(echo "$failed" | tr -d '[:space:]')
-          total=$((passed + failed))
-
-          if [ "$total" -gt 0 ]; then
-            pct=$(awk "BEGIN {printf \"%d\", ($passed / $total) * 100}")
-          else
-            pct=0
-          fi
-
-          # Can be used later for, e.g., banners
-          {
-            echo "passed=$passed"
-            echo "failed=$failed"
-            echo "total=$total"
-            echo "pct=$pct"
-          } >> "$GITHUB_OUTPUT"
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - name: Build
+        run: nix build .#ncro -L --no-link
