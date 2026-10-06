@@ -386,20 +386,20 @@ impl Prober {
     }
   }
 
-  pub async fn add_upstream(&self, url: String, priority: i32) {
-    let inserted = self
-      .inner
-      .table
-      .write()
-      .await
-      .insert(url.clone(), UpstreamHealth::new(url.clone(), priority))
-      .is_none();
-    if inserted {
-      let prober = self.clone();
-      tokio::spawn(async move {
-        prober.probe_upstream(url).await;
-      });
+  /// Starts tracking `url`, returning `false` if it was already tracked.
+  pub async fn add_upstream(&self, url: String, priority: i32) -> bool {
+    let mut table = self.inner.table.write().await;
+    if table.contains_key(&url) {
+      return false;
     }
+    table.insert(url.clone(), UpstreamHealth::new(url.clone(), priority));
+    drop(table);
+
+    let prober = self.clone();
+    tokio::spawn(async move {
+      prober.probe_upstream(url).await;
+    });
+    true
   }
 
   pub async fn remove_upstream(&self, url: &str) {
