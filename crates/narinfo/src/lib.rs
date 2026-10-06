@@ -114,6 +114,12 @@ fn normalize_nar_hash(s: &str) -> String {
   s.to_string()
 }
 
+/// Whether `hash` is a store path hash, 32 characters of Nix base32.
+#[must_use]
+pub fn is_store_hash(hash: &str) -> bool {
+  hash.len() == 32 && hash.bytes().all(|b| NIX_BASE32_ALPHABET.contains(&b))
+}
+
 /// # Errors
 ///
 /// Returns [`NarInfoError`] if the input lacks a `name:base64` separator,

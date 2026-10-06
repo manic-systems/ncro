@@ -26,7 +26,7 @@ use futures_util::{StreamExt, TryStreamExt, stream};
 use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
-use ncro_narinfo::NarInfo;
+use ncro_narinfo::{NarInfo, is_store_hash};
 use ncro_router::{
   HOP_HEADER,
   Hop,
@@ -404,7 +404,10 @@ async fn narinfo(
   Path(hash_narinfo): Path<String>,
   req: Request<Body>,
 ) -> Response {
-  let Some(hash) = hash_narinfo.strip_suffix(".narinfo") else {
+  let Some(hash) = hash_narinfo
+    .strip_suffix(".narinfo")
+    .filter(|hash| is_store_hash(hash))
+  else {
     return StatusCode::NOT_FOUND.into_response();
   };
   let hop = Hop::from_headers(req.headers());
