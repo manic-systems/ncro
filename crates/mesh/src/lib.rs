@@ -187,7 +187,7 @@ pub async fn listen_and_serve(
               let Ok((n, src)) = recv else { return; };
               match decode_packet(&buf[..n]) {
                   Ok((pubkey, sig, body, msg)) => {
-                      if !allowed_keys.is_empty() && !allowed_keys.iter().any(|k| k.as_slice() == pubkey) {
+                      if !allowed_keys.iter().any(|k| k.as_slice() == pubkey) {
                           tracing::warn!(?src, "mesh: rejecting packet from unknown sender");
                           continue;
                       }

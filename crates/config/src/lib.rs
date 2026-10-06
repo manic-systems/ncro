@@ -1056,11 +1056,45 @@ impl Default for MassQueryConfig {
   }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// A mesh peer's ed25519 public key, written as 64 hex characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshPublicKey([u8; 32]);
+
+impl FromStr for MeshPublicKey {
+  type Err = hex::FromHexError;
+
+  fn from_str(raw: &str) -> Result<Self, Self::Err> {
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(raw, &mut bytes)?;
+    Ok(Self(bytes))
+  }
+}
+
+impl From<MeshPublicKey> for [u8; 32] {
+  fn from(key: MeshPublicKey) -> Self {
+    key.0
+  }
+}
+
+impl<'de> Deserialize<'de> for MeshPublicKey {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let raw = String::deserialize(deserializer)?;
+    raw.parse().map_err(|err| {
+      de::Error::custom(format!(
+        "public_key must be a hex-encoded 32-byte ed25519 key: {err}"
+      ))
+    })
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
   pub addr:       String,
-  pub public_key: String,
+  pub public_key: MeshPublicKey,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1366,20 +1400,6 @@ impl Config {
         return Err(ConfigError::Validation(format!(
           "mesh.peers[{i}]: addr is empty"
         )));
-      }
-      if !peer.public_key.is_empty() {
-        let bytes = hex::decode(&peer.public_key).map_err(|_| {
-          ConfigError::Validation(format!(
-            "mesh.peers[{i}]: public_key must be a hex-encoded 32-byte \
-             ed25519 key"
-          ))
-        })?;
-        if bytes.len() != 32 {
-          return Err(ConfigError::Validation(format!(
-            "mesh.peers[{i}]: public_key must be a hex-encoded 32-byte \
-             ed25519 key"
-          )));
-        }
       }
     }
     if self.discovery.enabled {

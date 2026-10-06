@@ -363,7 +363,7 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
       .mesh
       .peers
       .iter()
-      .filter_map(|p| hex::decode(&p.public_key).ok()?.try_into().ok())
+      .map(|p| p.public_key.into())
       .collect::<Vec<[u8; 32]>>();
     ncro_mesh::listen_and_serve(
       &cfg.mesh.bind_addr,
