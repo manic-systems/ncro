@@ -1,82 +1,68 @@
-name: Publish Built Binaries
+name: Tag and Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: ["Format, Lint and Test"]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
+  prepare:
+    name: Prepare Release
     permissions:
       contents: write
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      release_id: ${{ steps.create_release.outputs.id }}
-    steps:
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          draft: false
-          prerelease: false
-          generate_release_notes: true
+      id-token: write
+      attestations: write
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@560a17ad36b7a4045622698befdc13dc17ca243f # v1.0.0
+    with:
+      stage: prepare
+      # The reusable workflow expands this unquoted, so shell quotes would reach fq literally.
+      version-command: nix run nixpkgs#fq -- -r .workspace.package.version Cargo.toml
 
-  build-release:
-    needs: create-release
+  build:
+    name: Build ncro (${{ matrix.suffix }})
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            name: ncro-linux-amd64
+          - os: ubuntu-latest
+            suffix: linux-amd64
           - os: ubuntu-24.04-arm
-            name: ncro-linux-arm64
+            suffix: linux-arm64
+    uses: manic-systems/workflows/.github/workflows/rust-build.yml@560a17ad36b7a4045622698befdc13dc17ca243f # v1.0.0
+    with:
+      upload: true
+      version: ${{ needs.prepare.outputs.version }}
+      os: ${{ matrix.os }}
+      build-command: nix build .#ncro -L
+      binary-name: ncro
+      asset-prefix: ncro
+      suffix: ${{ matrix.suffix }}
 
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-
-      - name: Build binary
-        run: nix build .#ncro -L
-
-      - name: Prepare binary (Unix)
-        run: |
-          cp result/bin/ncro ${{ matrix.name }}
-
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: ${{ matrix.name }}
-
-  generate-checksums:
-    needs: [create-release, build-release]
-    runs-on: ubuntu-latest
+  finalize:
+    name: Finalize Release
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Download Assets
-        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1
-        with:
-          tag: ${{ github.ref_name }}
-          fileName: "ncro-*"
-          out-file-path: "."
-
-      - name: Generate checksums
-        run: |
-          sha256sum ncro-* > SHA256SUMS
-
-      - name: Upload Checksums
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: SHA256SUMS
+      id-token: write
+      attestations: write
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.skip != 'true' && needs.build.result == 'success' }}
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@560a17ad36b7a4045622698befdc13dc17ca243f # v1.0.0
+    with:
+      stage: finalize
+      version: ${{ needs.prepare.outputs.version }}
+      asset-prefix: ncro
