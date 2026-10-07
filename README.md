@@ -44,7 +44,8 @@ metadata is persisted on disk; NAR content is streamed through with zero local
 storage. This keeps the proxy stateless on the data path and eliminates
 cache-invalidation complexity.
 
-[^bench]: Measured as client-observed narinfo lookup latency across three
+[^bench]:
+    Measured as client-observed narinfo lookup latency across three
     conditions (direct, ncro cold, ncro warm). The largest win is the warm case,
     where ncro serves cached narinfo from SQLite with no upstream round-trip; a
     cold ncro still pays the upstream race. See [Benchmarks](docs/benchmarks.md)
@@ -444,7 +445,8 @@ credentials from a netrc file instead (`NETRC` environment variable, or
 `~/.netrc`). The `machine` name must match the upstream hostname; a `default`
 entry is used as a fallback. Config credentials always win over netrc.
 
-On NixOS, set `services.ncro.netrcFile` to pass a netrc file into the service.
+On NixOS and nix-darwin, set `services.ncro.netrcFile` to pass a netrc file into
+the service. On nix-darwin the file must be readable by the `_ncro` user.
 
 ## NixOS Module
 
@@ -490,9 +492,45 @@ This repository provides a NixOS module. You may import it and use the provided
 > the [NixOS installation guide](docs/install.md#multiple-instances) shows the
 > complete configuration.
 
+## nix-darwin
+
+The flake also exports `darwinModules.ncro` for aarch64-darwin. It runs ncro as
+a launchd daemon under a dedicated `_ncro` user, with state in `/var/lib/ncro`
+and logs in `/var/lib/ncro/ncro.log`. Instances and socket activation are not
+available.
+
+```nix
+{inputs, lib, ...}: {
+  imports = [inputs.ncro.darwinModules.default];
+
+  services.ncro = {
+    enable = true;
+    settings = {
+      server.listen = "127.0.0.1:8080";
+      upstreams = [
+        {
+          url = "https://cache.nixos.org";
+          public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+        }
+      ];
+    };
+  };
+
+  # As on NixOS, ncro should be the only substituter.
+  nix.settings.substituters = lib.mkForce ["http://localhost:8080"];
+}
+```
+
+The module adds upstream public keys to `nix.settings.trusted-public-keys`,
+which requires nix-darwin to manage Nix (ensure you've set `nix.enable` to `true`).
+
+Unlike on NixOS, `services.ncro.netrcFile` is read directly by the `_ncro` user,
+so the file must be readable by `_ncro`. A root-only file, such as
+`/etc/nix/netrc`, keeps ncro from starting.
+
 ## Non-NixOS
 
-Alternatively, if you're not using NixOS, create a Systemd service similar to
+Alternatively, if you're on Linux without NixOS, create a Systemd service similar to
 this. You'll also want to harden this, but for the sake of brevity I will not
 cover that here. Make sure you have `ncro` in your `PATH`, and then write the
 Systemd service:

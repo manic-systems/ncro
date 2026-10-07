@@ -6,8 +6,8 @@
     nixpkgs,
     ...
   }: let
-    systems = ["x86_64-linux" "aarch64-linux"];
-    forEachSystem = nixpkgs.lib.genAttrs systems;
+    inherit (nixpkgs.lib) genAttrs optionalAttrs;
+    forEachSystem = genAttrs ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
     pkgsForEach = system: nixpkgs.legacyPackages.${system};
   in {
     nixosModules = {
@@ -21,6 +21,11 @@
       };
 
       default = self.nixosModules.ncro;
+    };
+
+    darwinModules = {
+      ncro = ./nix/darwin-module.nix;
+      default = self.darwinModules.ncro;
     };
 
     packages = forEachSystem (system: let
@@ -38,15 +43,19 @@
 
     checks = forEachSystem (system: let
       pkgs = pkgsForEach system;
-    in {
-      p2p-discovery = pkgs.callPackage ./nix/tests/p2p.nix {inherit self;};
-      e2e = pkgs.callPackage ./nix/tests/e2e.nix {inherit self;};
-      s3 = pkgs.callPackage ./nix/tests/s3.nix {inherit self;};
-      netrc = pkgs.callPackage ./nix/tests/netrc.nix {inherit self;};
-      socket-activation = pkgs.callPackage ./nix/tests/socket-activation.nix {inherit self;};
-      multi-instance = pkgs.callPackage ./nix/tests/multi-instance.nix {inherit self;};
-      public-keys = pkgs.callPackage ./nix/tests/public-keys.nix {inherit self;};
-    });
+    in
+      {
+        darwin-module = pkgs.callPackage ./nix/tests/darwin-module.nix {inherit self;};
+      }
+      // optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        p2p-discovery = pkgs.callPackage ./nix/tests/p2p.nix {inherit self;};
+        e2e = pkgs.callPackage ./nix/tests/e2e.nix {inherit self;};
+        s3 = pkgs.callPackage ./nix/tests/s3.nix {inherit self;};
+        netrc = pkgs.callPackage ./nix/tests/netrc.nix {inherit self;};
+        socket-activation = pkgs.callPackage ./nix/tests/socket-activation.nix {inherit self;};
+        multi-instance = pkgs.callPackage ./nix/tests/multi-instance.nix {inherit self;};
+        public-keys = pkgs.callPackage ./nix/tests/public-keys.nix {inherit self;};
+      });
 
     # Provides the default formatter for 'nix fmt'.
     formatter = forEachSystem (

@@ -4,34 +4,20 @@
   lib,
   ...
 }: let
-  inherit (builtins) isAttrs attrValues attrNames;
+  inherit (builtins) attrValues attrNames;
   inherit (lib.modules) mkIf;
-  inherit (lib.options) mkOption mkEnableOption literalExpression;
-  inherit (lib.types) attrsOf bool package nullOr path port submodule;
-  inherit (lib.lists) optional optionals filter elemAt map flatten unique;
-  inherit (lib.attrsets) optionalAttrs mapAttrsToList recursiveUpdate mapAttrs' nameValuePair filterAttrs;
+  inherit (lib.options) mkOption mkEnableOption;
+  inherit (lib.types) attrsOf bool nullOr path port submodule;
+  inherit (lib.lists) optionals filter elemAt map flatten unique;
+  inherit (lib.attrsets) optionalAttrs mapAttrsToList mapAttrs' nameValuePair filterAttrs;
   inherit (lib.strings) hasPrefix match toInt;
   inherit (lib.trivial) defaultTo;
 
-  tomlFormat = pkgs.formats.toml {};
-  tomlType = tomlFormat.type;
-
-  checkable = pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform;
-
-  generateConfig = name: settings: let
-    file = tomlFormat.generate name settings;
-  in
-    if checkable
-    then
-      pkgs.runCommand name {} ''
-        ${lib.getExe' cfg.package "ncro"} --config ${file} --check
-        cp ${file} $out
-      ''
-    else file;
+  common = import ./common.nix {inherit lib pkgs;};
+  inherit (common) tomlType defaultServerPort defaultMeshPort upstreamPublicKeysFor effectiveSettingsFor;
+  generateConfig = common.generateConfig cfg.package;
 
   cfg = config.services.ncro;
-  defaultServerPort = 8080;
-  defaultMeshPort = 7946;
   configFile = generateConfig "ncro.toml" effectiveSettings;
 
   # Normalize a ncro listen address (`:port` shorthand) to the
@@ -68,34 +54,6 @@
     inherit ((addrParts addr)) host;
   in
     host == "localhost" || host == "::1" || host == "[::1]" || lib.hasPrefix "127." host;
-
-  publicKeysFor = upstream:
-    optional ((upstream.public_key or "") != "") upstream.public_key
-    ++ (upstream.public_keys or []);
-
-  upstreamPublicKeysFor = settings: let
-    fallbackPublicKeys =
-      if settings.fallback_cache.enabled or false
-      then
-        publicKeysFor (
-          settings.fallback_cache
-          // {
-            public_key =
-              settings.fallback_cache.public_key
-                or "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
-          }
-        )
-      else [];
-  in
-    lib.pipe ((settings.upstreams or []) ++ [fallbackPublicKeys]) [
-      (map (upstream:
-        if isAttrs upstream
-        then publicKeysFor upstream
-        else upstream))
-      flatten
-      (filter (key: key != ""))
-      unique
-    ];
 
   instanceConfigFile = name: instance:
     generateConfig "ncro-${name}.toml" (effectiveInstanceSettings instance);
@@ -146,22 +104,6 @@
       SystemCallArchitectures = "native";
     };
   };
-
-  listenAddrFor = fallbackPort: settings:
-    if (settings.server.listen or "") != ""
-    then settings.server.listen
-    else "localhost:${toString fallbackPort}";
-
-  meshAddrFor = fallbackPort: settings:
-    if (settings.mesh.bind_addr or "") != ""
-    then settings.mesh.bind_addr
-    else "0.0.0.0:${toString fallbackPort}";
-
-  effectiveSettingsFor = serverPort: meshPort: settings:
-    recursiveUpdate settings {
-      server.listen = listenAddrFor serverPort settings;
-      mesh.bind_addr = meshAddrFor meshPort settings;
-    };
 
   effectiveSettings = effectiveSettingsFor cfg.port cfg.meshPort cfg.settings;
   effectiveInstanceSettings = instance:
@@ -242,197 +184,112 @@
     )
     cfg.instances;
 in {
-  options.services.ncro = {
-    enable = mkEnableOption "ncro, the Nix cache route optimizer";
+  options.services.ncro =
+    common.options
+    // {
+      enable = mkEnableOption "ncro, the Nix cache route optimizer";
 
-    addUpstreamPublicKeys = mkOption {
-      type = bool;
-      default = true;
-      description = ''
-        Append non-empty upstream public_key and public_keys values from {option}`services.ncro.settings`
-        to {option}`nix.settings.trusted-public-keys`.
+      socketActivation = mkOption {
+        type = bool;
+        default = false;
+        description = ''
+          Enable systemd socket activation for ncro. When enabled, systemd
+          creates and holds the listening TCP socket, starting ncro on the first
+          incoming connection.
 
-        This keeps Nix client signature validation aligned with the upstream
-        caches that ncro is allowed to route to. Disable this if you manage Nix
-        trusted public keys separately.
-      '';
-    };
+          ncro signals readiness via {manpage}`sd_notify(3)`, so downstream units
+          that declare `After = ncro.service` will not start until ncro is actually
+          accepting connections.
 
-    socketActivation = mkOption {
-      type = bool;
-      default = false;
-      description = ''
-        Enable systemd socket activation for ncro. When enabled, systemd
-        creates and holds the listening TCP socket, starting ncro on the first
-        incoming connection.
+          A {manpage}`systemd.socket(5)` unit `ncro.socket` is created automatically.
+          The listen address is taken from {option}`services.ncro.settings.server.listen`
+          if set, otherwise from {option}`services.ncro.port`.
+        '';
+      };
 
-        ncro signals readiness via {manpage}`sd_notify(3)`, so downstream units
-        that declare `After = ncro.service` will not start until ncro is actually
-        accepting connections.
+      openFirewall = mkOption {
+        type = bool;
+        default = false;
+        description = ''
+          Open the firewall for whichever ports the listeners actually landed
+          on, across every named instance as well. Mesh gossip is included only
+          when mesh is enabled, and a listener bound to loopback is skipped
+          since nothing outside the machine can reach one anyway.
+        '';
+      };
 
-        A {manpage}`systemd.socket(5)` unit `ncro.socket` is created automatically.
-        The listen address is taken from {option}`services.ncro.settings.server.listen`
-        if set, otherwise from {option}`services.ncro.port`.
-      '';
-    };
+      instances = mkOption {
+        type = attrsOf (submodule ({...}: {
+          options = {
+            port = mkOption {
+              type = nullOr port;
+              default = null;
+              example = 8081;
+              description = ''
+                TCP port for this instance, which is enough on its own to give
+                the instance a listen address. Setting `settings.server.listen`
+                overrides it.
+              '';
+            };
 
-    port = mkOption {
-      type = port;
-      default = defaultServerPort;
-      description = ''
-        TCP port for the ncro HTTP listener, bound on `localhost` (both
-        127.0.0.1 and ::1) unless overridden. Reach for
-        {option}`services.ncro.settings.server.listen` when you need to pin the
-        bind address too, since it overrides this option.
-      '';
-    };
+            meshPort = mkOption {
+              type = nullOr port;
+              default = null;
+              example = 7947;
+              description = ''
+                UDP port for this instance's mesh gossip. Setting
+                `settings.mesh.bind_addr` overrides it. Instances that enable
+                mesh each need a port of their own.
+              '';
+            };
 
-    meshPort = mkOption {
-      type = port;
-      default = defaultMeshPort;
-      description = ''
-        UDP port for mesh gossip. Reach for
-        {option}`services.ncro.settings.mesh.bind_addr` when you need to pin
-        the bind address too, since it overrides this option.
-      '';
-    };
+            openFirewall = mkOption {
+              type = bool;
+              default = false;
+              description = ''
+                Open the firewall for this instance alone, on the same terms as
+                the toplevel {option}`services.ncro.openFirewall`, which covers
+                every instance at once.
+              '';
+            };
 
-    openFirewall = mkOption {
-      type = bool;
-      default = false;
-      description = ''
-        Open the firewall for whichever ports the listeners actually landed
-        on, across every named instance as well. Mesh gossip is included only
-        when mesh is enabled, and a listener bound to loopback is skipped
-        since nothing outside the machine can reach one anyway.
-      '';
-    };
+            settings = mkOption {
+              type = tomlType;
+              default = {};
+              description = "Configuration for this ncro instance.";
+            };
 
-    package = mkOption {
-      type = package;
-      default = pkgs.callPackage ./package.nix {};
-      defaultText = literalExpression "inputs.ncro.packages.$${pkgs.stdenv.hostPlatform.system}.ncro"; # Set from flake.nix
-      description = "The ncro package to use.";
-    };
+            socketActivation = mkOption {
+              type = bool;
+              default = false;
+              description = "Enable systemd socket activation for this instance.";
+            };
 
-    netrcFile = mkOption {
-      type = nullOr path;
-      default = null;
-      example = "/etc/nix/netrc";
-      description = ''
-        The path to netrc file for upstream authentication.
-        If null, ncro will not use netrc for upstream authentication.
-      '';
-    };
+            netrcFile = mkOption {
+              type = nullOr path;
+              default = null;
+              description = "Netrc file for upstream authentication in this instance.";
+            };
+          };
+        }));
+        default = {};
+        description = ''
+          Named ncro instances. Each instance starts the `ncro@.service` template
+          as `ncro@<name>.service`, with its own
+          state directory, SQLite route cache, and optionally socket unit.
 
-    settings = mkOption {
-      type = tomlType;
-      default = {};
-      description = ''
-        ncro configuration as an attribute set.
-
-        Keys are the TOML field names, and anything left out keeps ncro's
-        own default. The generated file is checked with `ncro --check` at
-        build time, so a misspelt key or an out-of-range value fails the
-        build rather than the running service.
-      '';
-      example = {
-        logging.level = "info";
-        server = {
-          listen = ":8080";
-          cache_priority = 20;
-        };
-
-        upstreams = [
-          {
-            url = "https://cache.nixos.org";
-            priority = 10;
-          }
-          {
-            url = "https://nix-community.cachix.org";
-            priority = 20;
-          }
-        ];
-
-        cache = {
-          ttl = "2h";
-          negative_ttl = "15m";
+          Every instance must set `port` or `settings.server.listen` to a unique
+          address, and mesh-enabled instances must likewise use unique
+          `meshPort` or `settings.mesh.bind_addr` values.
+        '';
+        example.project = {
+          settings = {
+            server.listen = "127.0.0.1:8081";
+            upstreams = [{url = "https://cache.nixos.org";}];
+          };
         };
       };
     };
-
-    instances = mkOption {
-      type = attrsOf (submodule ({...}: {
-        options = {
-          port = mkOption {
-            type = nullOr port;
-            default = null;
-            example = 8081;
-            description = ''
-              TCP port for this instance, which is enough on its own to give
-              the instance a listen address. Setting `settings.server.listen`
-              overrides it.
-            '';
-          };
-
-          meshPort = mkOption {
-            type = nullOr port;
-            default = null;
-            example = 7947;
-            description = ''
-              UDP port for this instance's mesh gossip. Setting
-              `settings.mesh.bind_addr` overrides it. Instances that enable
-              mesh each need a port of their own.
-            '';
-          };
-
-          openFirewall = mkOption {
-            type = bool;
-            default = false;
-            description = ''
-              Open the firewall for this instance alone, on the same terms as
-              the toplevel {option}`services.ncro.openFirewall`, which covers
-              every instance at once.
-            '';
-          };
-
-          settings = mkOption {
-            type = tomlType;
-            default = {};
-            description = "Configuration for this ncro instance.";
-          };
-
-          socketActivation = mkOption {
-            type = bool;
-            default = false;
-            description = "Enable systemd socket activation for this instance.";
-          };
-
-          netrcFile = mkOption {
-            type = nullOr path;
-            default = null;
-            description = "Netrc file for upstream authentication in this instance.";
-          };
-        };
-      }));
-      default = {};
-      description = ''
-        Named ncro instances. Each instance starts the `ncro@.service` template
-        as `ncro@<name>.service`, with its own
-        state directory, SQLite route cache, and optionally socket unit.
-
-        Every instance must set `port` or `settings.server.listen` to a unique
-        address, and mesh-enabled instances must likewise use unique
-        `meshPort` or `settings.mesh.bind_addr` values.
-      '';
-      example.project = {
-        settings = {
-          server.listen = "127.0.0.1:8081";
-          upstreams = [{url = "https://cache.nixos.org";}];
-        };
-      };
-    };
-  };
 
   config = mkIf cfg.enable {
     nix.settings.trusted-public-keys =
