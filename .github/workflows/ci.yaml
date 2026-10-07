@@ -56,6 +56,54 @@ jobs:
         crates/**
         ncro/**
 
+  build-darwin:
+    name: Build (aarch64-darwin)
+    permissions:
+      actions: write
+      contents: read
+    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
+    with:
+      os: macos-latest
+      timeout-minutes: 45
+      flake-check: false
+      build: true
+      build-command: nix build .#ncro -L --no-link
+      cache: true
+      cache-save: true
+      cache-hash-files: |
+        **/*.nix
+        flake.lock
+        Cargo.lock
+        Cargo.toml
+        crates/**
+        ncro/**
+
+  darwin-module:
+    name: nix-darwin Module (${{ matrix.release }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: unstable
+            command: nix build .#checks.x86_64-linux.darwin-module -L --no-link
+          - release: "26.05"
+            command: |
+              nix build --impure -L --no-link --expr '
+                let
+                  pkgs = import (fetchTarball "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz") {system = "x86_64-linux";};
+                in
+                  pkgs.callPackage ./nix/tests/darwin-module.nix {
+                    self = builtins.getFlake (toString ./.);
+                    nix-darwin = fetchTarball "https://github.com/nix-darwin/nix-darwin/archive/nix-darwin-26.05.tar.gz";
+                  }
+              '
+    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
+    with:
+      timeout-minutes: 10
+      flake-check: false
+      build: true
+      build-command: ${{ matrix.command }}
+
   vm-test:
     name: ${{ matrix.name }}
     needs: build
@@ -102,6 +150,8 @@ jobs:
     needs:
       - checks
       - build
+      - build-darwin
+      - darwin-module
       - vm-test
       - actions
     runs-on: ubuntu-latest
