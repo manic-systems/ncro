@@ -6,8 +6,10 @@
     nixpkgs,
     ...
   }: let
-    systems = ["x86_64-linux" "aarch64-linux"];
+    linuxSystems = ["x86_64-linux" "aarch64-linux"];
+    systems = linuxSystems ++ ["aarch64-darwin"];
     forEachSystem = nixpkgs.lib.genAttrs systems;
+    forEachLinuxSystem = nixpkgs.lib.genAttrs linuxSystems;
     pkgsForEach = system: nixpkgs.legacyPackages.${system};
   in {
     nixosModules = {
@@ -23,6 +25,11 @@
       default = self.nixosModules.ncro;
     };
 
+    darwinModules = {
+      ncro = ./nix/darwin-module.nix;
+      default = self.darwinModules.ncro;
+    };
+
     packages = forEachSystem (system: let
       pkgs = pkgsForEach system;
     in {
@@ -36,7 +43,7 @@
       default = pkgs.callPackage ./nix/shell.nix {};
     });
 
-    checks = forEachSystem (system: let
+    checks = forEachLinuxSystem (system: let
       pkgs = pkgsForEach system;
     in {
       p2p-discovery = pkgs.callPackage ./nix/tests/p2p.nix {inherit self;};

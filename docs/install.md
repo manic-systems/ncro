@@ -8,7 +8,7 @@ This document covers installation, configuration, and first-run setup.
 
 Nix is the recommended way of downloading (and developing!) ncro. You can
 install it using Nix flakes using `nix profile add` if on non-nixos or add ncro
-as a flake input if you are on NixOS.
+as a flake input if you are on NixOS or nix-darwin.
 
 ```nix
 {
@@ -31,7 +31,8 @@ in {
 ```
 
 You can also use the NixOS module as described below in the
-[NixOS section](#nixos).
+[NixOS section](#nixos), or the nix-darwin module in the
+[nix-darwin section](#nix-darwin).
 
 If you want to give ncro a try before you switch to it, you may also run it one
 time with `nix run`.
@@ -217,9 +218,46 @@ defaults to `local`. For mesh, `mesh.private_key` may point at a persisted
 ed25519 key file. If you leave it empty, ncro creates an ephemeral identity on
 startup. Peer public keys must be hex-encoded ed25519 keys.
 
+## nix-darwin
+
+The flake also exports `darwinModules.ncro` for aarch64-darwin. It runs ncro as
+a launchd daemon under a dedicated `_ncro` user, with state in `/var/lib/ncro`
+and logs in `/var/lib/ncro/ncro.log`. Instances and socket activation are not
+available.
+
+```nix
+{inputs, lib, ...}: {
+  imports = [inputs.ncro.darwinModules.default];
+
+  services.ncro = {
+    enable = true;
+    settings = {
+      server.listen = "127.0.0.1:8080";
+      upstreams = [
+        {
+          url = "https://cache.nixos.org";
+          public_key = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
+        }
+      ];
+    };
+  };
+
+  # As on NixOS, ncro should be the only substituter.
+  nix.settings.substituters = lib.mkForce ["http://localhost:8080"];
+}
+```
+
+Upstream public keys are only added to `nix.settings.trusted-public-keys` when
+nix-darwin manages Nix (`nix.enable = true`). If you use another Nix
+installation, such as Determinate Nix, configure the substituter and keys there.
+
+Unlike on NixOS, `services.ncro.netrcFile` is read directly by the `_ncro` user,
+so the file must be readable by `_ncro`. A root-only file such as
+`/etc/nix/netrc` will be silently ignored.
+
 ## Systemd
 
-If you are not on NixOS, a small Systemd unit is usually enough to get started:
+If you are on Linux without NixOS, a small Systemd unit is usually enough to get started:
 
 ```ini
 [Unit]

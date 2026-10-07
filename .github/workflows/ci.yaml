@@ -86,6 +86,36 @@ jobs:
       - name: Build ncro
         run: nix build .#ncro -L --no-link
 
+  build-darwin:
+    name: Build (aarch64-darwin)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - name: Build ncro
+        run: nix build .#ncro -L --no-link
+
+  darwin-module:
+    name: nix-darwin Module (${{ matrix.darwin }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        darwin: [master, nix-darwin-26.05]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
+      - name: Evaluate darwinSystem with services.ncro enabled
+        env:
+          DARWIN_REF: ${{ matrix.darwin }}
+        run: nix eval --impure --raw --expr "import ./nix/tests/darwin-eval.nix {darwinRef = \"$DARWIN_REF\";}"
+
   vm-test:
     name: ${{ matrix.name }}
     needs: build
