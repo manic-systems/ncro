@@ -3,7 +3,7 @@ name: Tag and Release
 on:
   workflow_dispatch:
   workflow_run: # zizmor: ignore[dangerous-triggers]
-    workflows: ["Format, Lint and Test"]
+    workflows: ["CI"]
     types: [completed]
     branches: [main]
 
