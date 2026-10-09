@@ -162,7 +162,9 @@ If those fields are empty, ncro also consults a netrc file: `NETRC` if set, or
 `~/.netrc` otherwise. The `machine` name must match the upstream hostname; a
 `default` entry is used when no machine entry matches. Explicit configuration
 credentials take precedence over netrc credentials. S3 upstreams do not use
-Basic Auth or netrc.
+Basic Auth or netrc. ncro refuses to start when the file `NETRC` names cannot
+be read or parsed, so a wrong path or permission shows up at startup instead of
+as failed authentication later. A broken `~/.netrc` is skipped with a warning.
 
 ### S3 upstreams
 
