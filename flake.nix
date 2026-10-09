@@ -7,8 +7,9 @@
     ...
   }: let
     inherit (nixpkgs.lib) genAttrs optionalAttrs;
-    forEachSystem = genAttrs ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
-    pkgsForEach = system: nixpkgs.legacyPackages.${system};
+    inherit (nixpkgs.lib.systems) doubles;
+    forEachSystem = genAttrs (doubles.linux ++ doubles.darwin);
+    pkgsForEach = system: nixpkgs.legacyPackages.${system} or (import nixpkgs {inherit system;});
   in {
     nixosModules = {
       ncro = {
@@ -76,6 +77,6 @@
         }
     );
 
-    hydraJobs = self.packages;
+    hydraJobs = {inherit (self.packages) x86_64-linux aarch64-linux aarch64-darwin;};
   };
 }
