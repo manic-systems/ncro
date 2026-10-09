@@ -5,11 +5,12 @@ use std::{
   io,
   iter,
   net::SocketAddr,
+  path::PathBuf,
   str::FromStr,
   time::Duration,
 };
 
-use netrc::Netrc;
+use netrc::{Error as NetrcError, Netrc};
 use serde::{Deserialize, Deserializer, de};
 use thiserror::Error;
 use toml::de::Error as TomlError;
@@ -22,6 +23,8 @@ pub enum ConfigError {
   Read(#[from] io::Error),
   #[error("read password_file {path:?}: {source}")]
   PasswordFile { path: String, source: io::Error },
+  #[error("read netrc {path:?}: {source}")]
+  Netrc { path: PathBuf, source: NetrcError },
   #[error("parse config: {0}")]
   Parse(#[from] TomlError),
   #[error("{0}")]
@@ -174,6 +177,33 @@ fn parse_s3_url(raw: &str) -> Result<S3Config, ConfigError> {
     profile,
     addressing_style,
   })
+}
+
+/// Loads `NETRC` when set, which must succeed, otherwise `~/.netrc` when it
+/// exists, which is skipped with a warning if it cannot be loaded.
+fn load_netrc() -> Result<Option<Netrc>, ConfigError> {
+  if let Some(value) = env::var_os("NETRC").filter(|value| !value.is_empty()) {
+    let path = PathBuf::from(value);
+    return Netrc::from_file(&path)
+      .map(Some)
+      .map_err(|source| ConfigError::Netrc { path, source });
+  }
+
+  let Some(home) = env::var_os("HOME") else {
+    return Ok(None);
+  };
+  let path = PathBuf::from(home).join(".netrc");
+  if !path.exists() {
+    return Ok(None);
+  }
+
+  match Netrc::from_file(&path) {
+    Ok(nrc) => Ok(Some(nrc)),
+    Err(err) => {
+      tracing::warn!("skipping netrc {}: {err}", path.display());
+      Ok(None)
+    },
+  }
 }
 
 /// Fill empty `username`/`password` fields from matching netrc entries.
@@ -1292,7 +1322,7 @@ impl Config {
       )?;
     }
 
-    if let Ok(nrc) = Netrc::new() {
+    if let Some(nrc) = load_netrc()? {
       apply_netrc(
         cfg
           .upstreams
