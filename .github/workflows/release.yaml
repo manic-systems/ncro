@@ -21,11 +21,9 @@ jobs:
       id-token: write
       attestations: write
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    uses: manic-systems/workflows/.github/workflows/rust-release.yml@560a17ad36b7a4045622698befdc13dc17ca243f # v1.0.0
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
     with:
       stage: prepare
-      # The reusable workflow expands this unquoted, so shell quotes would reach fq literally.
-      version-command: nix run nixpkgs#fq -- -r .workspace.package.version Cargo.toml
 
   build:
     name: Build ncro (${{ matrix.suffix }})
@@ -41,9 +39,9 @@ jobs:
         include:
           - os: ubuntu-latest
             suffix: linux-amd64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             suffix: linux-arm64
-    uses: manic-systems/workflows/.github/workflows/rust-build.yml@560a17ad36b7a4045622698befdc13dc17ca243f # v1.0.0
+    uses: manic-systems/workflows/.github/workflows/rust-build.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
     with:
       upload: true
       version: ${{ needs.prepare.outputs.version }}
@@ -61,7 +59,7 @@ jobs:
       attestations: write
     needs: [prepare, build]
     if: ${{ needs.prepare.outputs.skip != 'true' && needs.build.result == 'success' }}
-    uses: manic-systems/workflows/.github/workflows/rust-release.yml@560a17ad36b7a4045622698befdc13dc17ca243f # v1.0.0
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
     with:
       stage: finalize
       version: ${{ needs.prepare.outputs.version }}

@@ -18,7 +18,7 @@ concurrency:
 jobs:
   checks:
     name: Checks
-    uses: manic-systems/workflows/.github/workflows/rust-checks.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    uses: manic-systems/workflows/.github/workflows/rust-checks.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
     with:
       os: ubuntu-latest
       timeout-minutes: 30
@@ -39,7 +39,7 @@ jobs:
     permissions:
       actions: write
       contents: read
-    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
     with:
       os: ${{ matrix.os }}
       timeout-minutes: 45
@@ -77,7 +77,7 @@ jobs:
             check: multi-instance
           - name: Public Keys Test
             check: public-keys
-    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
     with:
       timeout-minutes: 45
       flake-check: false
@@ -94,4 +94,4 @@ jobs:
 
   actions:
     name: Actions Lint
-    uses: manic-systems/workflows/.github/workflows/actions-lint.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    uses: manic-systems/workflows/.github/workflows/actions-lint.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
