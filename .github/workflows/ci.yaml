@@ -11,93 +11,54 @@ on:
 permissions:
   contents: read
 
-env:
-  # Each ref saves and purges only its own caches, so a PR can't evict main's,
-  # which every other ref falls back to.
-  CACHE_SCOPE: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'merge_group' && 'merge-queue' || github.ref_name }}
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
-      - name: Check Rust Formatting
-        run: nix develop --command cargo fmt --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
-      - name: Run Clippy
-        run: nix develop --command cargo clippy --all-targets -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
-      - name: Run Test Suite
-        run: nix develop --command cargo nextest run --all
+  checks:
+    name: Checks
+    uses: manic-systems/workflows/.github/workflows/rust-checks.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    with:
+      os: ubuntu-latest
+      timeout-minutes: 30
+      flake-check: false
+      fmt: true
+      fmt-command: cargo fmt --check
+      clippy: true
+      clippy-command: cargo clippy --all-targets -- -D warnings
+      test: true
+      test-command: cargo nextest run --all
 
   build:
-    name: Build (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    permissions:
-      actions: write
-      contents: read
+    name: Build (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x86_64
-            os: ubuntu-latest
-          - arch: aarch64
-            os: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
-      - name: Restore and save cached paths
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-ncro-${{ runner.os }}-${{ runner.arch }}-${{ env.CACHE_SCOPE }}-${{ hashFiles('**/*.nix', 'flake.lock', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'ncro/**') }}
-          restore-prefixes-first-match: |
-            nix-ncro-${{ runner.os }}-${{ runner.arch }}-${{ env.CACHE_SCOPE }}-
-            nix-ncro-${{ runner.os }}-${{ runner.arch }}-main-
-          gc-max-store-size-linux: 8G
-          purge: true
-          purge-prefixes: nix-ncro-${{ runner.os }}-${{ runner.arch }}-${{ env.CACHE_SCOPE }}-
-          purge-created: 0
-          purge-last-accessed: 0
-          purge-primary-key: never
-      - name: Build ncro
-        run: nix build .#ncro -L --no-link
+        os: [ubuntu-latest, ubuntu-26.04-arm]
+    permissions:
+      actions: write
+      contents: read
+    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    with:
+      os: ${{ matrix.os }}
+      timeout-minutes: 45
+      flake-check: false
+      build: true
+      build-command: nix build .#ncro -L --no-link
+      cache: true
+      cache-save: true
+      cache-hash-files: |
+        **/*.nix
+        flake.lock
+        Cargo.lock
+        Cargo.toml
+        crates/**
+        ncro/**
 
   vm-test:
     name: ${{ matrix.name }}
     needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -116,17 +77,21 @@ jobs:
             check: multi-instance
           - name: Public Keys Test
             check: public-keys
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@b97f05dcb019ddea06450a50ef6203d2fdc19fee # v31
-      - name: Restore cached paths
-        uses: nix-community/cache-nix-action/restore@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: nix-ncro-${{ runner.os }}-${{ runner.arch }}-${{ env.CACHE_SCOPE }}-${{ hashFiles('**/*.nix', 'flake.lock', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'ncro/**') }}
-          restore-prefixes-first-match: |
-            nix-ncro-${{ runner.os }}-${{ runner.arch }}-${{ env.CACHE_SCOPE }}-
-            nix-ncro-${{ runner.os }}-${{ runner.arch }}-main-
-      - name: Run ${{ matrix.check }}
-        run: nix build .#checks.x86_64-linux.${{ matrix.check }} -L --no-link
+    uses: manic-systems/workflows/.github/workflows/nix-checks.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
+    with:
+      timeout-minutes: 45
+      flake-check: false
+      build: true
+      build-command: nix build .#checks.x86_64-linux.${{ matrix.check }} -L --no-link
+      cache: true
+      cache-hash-files: |
+        **/*.nix
+        flake.lock
+        Cargo.lock
+        Cargo.toml
+        crates/**
+        ncro/**
+
+  actions:
+    name: Actions Lint
+    uses: manic-systems/workflows/.github/workflows/actions-lint.yml@171ebd10744313100ab6c193bf90ff37f9b22e4c # v2.0.0
