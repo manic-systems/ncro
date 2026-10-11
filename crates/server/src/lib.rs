@@ -1,5 +1,9 @@
+mod throughput;
+mod transfer;
+
 use std::{
-  collections::{BTreeMap, HashMap},
+  cmp::Ordering,
+  collections::HashMap,
   io,
   sync::Arc,
   time::{Duration, Instant},
@@ -23,7 +27,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
-use ncro_config::{NarHedgingConfig, UpstreamConfig};
+use ncro_config::{NarHedgingConfig, NarTransferConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_narinfo::{NarInfo, is_store_hash};
@@ -38,9 +42,10 @@ use ncro_router::{
 use ncro_s3::S3ClientPool;
 use rustls::crypto::ring;
 use serde::Serialize;
+use throughput::ThroughputStats;
 use tokio::{
   task::JoinSet,
-  time::{Instant as TokioInstant, sleep_until, timeout},
+  time::{Instant as TokioInstant, sleep_until, timeout, timeout_at},
 };
 use tower_http::timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer};
 use url::Url;
@@ -103,6 +108,8 @@ pub struct AppState {
   nar_timeouts:        HashMap<String, Duration>,
   default_nar_timeout: Duration,
   nar_hedging:         NarHedgingConfig,
+  nar_transfer:        NarTransferConfig,
+  throughput:          ThroughputStats,
   cache_priority:      i32,
   want_mass_query:     bool,
   started:             Instant,
@@ -122,6 +129,7 @@ pub struct AppConfig {
   pub upstreams:       Vec<UpstreamConfig>,
   pub fallback_cache:  Option<UpstreamConfig>,
   pub nar_hedging:     NarHedgingConfig,
+  pub nar_transfer:    NarTransferConfig,
   pub cache_priority:  i32,
   pub want_mass_query: bool,
   pub read_timeout:    Duration,
@@ -143,6 +151,7 @@ pub fn app(
     upstreams,
     fallback_cache,
     nar_hedging,
+    nar_transfer,
     cache_priority,
     want_mass_query,
     read_timeout,
@@ -172,6 +181,7 @@ pub fn app(
     .read_timeout(read_timeout)
     .build()?;
 
+  let throughput = ThroughputStats::new(&nar_transfer);
   let state = AppState {
     router,
     prober,
@@ -184,6 +194,8 @@ pub fn app(
     nar_timeouts,
     default_nar_timeout: read_timeout,
     nar_hedging,
+    nar_transfer,
+    throughput,
     cache_priority,
     want_mass_query,
     started: Instant::now(),
@@ -486,9 +498,82 @@ async fn narinfo(
 
 #[derive(Clone)]
 struct NarCandidate {
-  upstream: String,
-  path:     String,
-  route:    RouteKind,
+  upstream:  String,
+  path:      String,
+  route:     RouteKind,
+  priority:  i32,
+  latency:   f64,
+  estimated: Option<Duration>,
+}
+
+fn rank_nar_candidates(
+  state: &AppState,
+  candidates: &mut [NarCandidate],
+  remaining: u64,
+) {
+  for candidate in candidates.iter_mut() {
+    candidate.estimated = (state.nar_transfer.enabled
+      && remaining >= state.nar_transfer.sample_min_bytes)
+      .then(|| state.throughput.estimate(&candidate.upstream))
+      .flatten()
+      .map(|estimate| estimate.completion_time(remaining));
+  }
+  candidates.sort_by(|a, b| {
+    let priority = a.priority.cmp(&b.priority);
+    if !priority.is_eq() {
+      return priority;
+    }
+    match (a.estimated, b.estimated) {
+      (Some(a), Some(b)) if a != b => return a.cmp(&b),
+      (Some(_), None) => return Ordering::Less,
+      (None, Some(_)) => return Ordering::Greater,
+      _ => {},
+    }
+    match (
+      a.route == RouteKind::CacheHit,
+      b.route == RouteKind::CacheHit,
+    ) {
+      (true, false) => Ordering::Less,
+      (false, true) => Ordering::Greater,
+      _ => {
+        a.latency
+          .total_cmp(&b.latency)
+          .then_with(|| a.upstream.cmp(&b.upstream))
+      },
+    }
+  });
+}
+
+async fn open_nar_candidate(
+  state: &AppState,
+  method: Method,
+  headers: &HeaderMap,
+  candidate: &NarCandidate,
+) -> Option<Response> {
+  let started = Instant::now();
+  let sample = (state.nar_transfer.enabled && method == Method::GET)
+    .then(|| state.throughput.start(&candidate.upstream));
+  let response = timeout(
+    state.nar_timeout(&candidate.upstream),
+    try_nar_upstream(NarUpstreamRequest {
+      client: &state.nar_client,
+      s3: &state.s3,
+      method,
+      headers,
+      upstream: &candidate.upstream,
+      path: &candidate.path,
+      route: candidate.route,
+      auth: upstream_auth(state, &candidate.upstream),
+    }),
+  )
+  .await
+  .ok()
+  .flatten()?;
+  Some(if let Some(sample) = sample {
+    transfer::observe(response, sample, started.elapsed())
+  } else {
+    response
+  })
 }
 
 fn spawn_nar_attempt(
@@ -499,23 +584,8 @@ fn spawn_nar_attempt(
   candidate: NarCandidate,
 ) {
   attempts.spawn(async move {
-    let response_timeout = state.nar_timeout(&candidate.upstream);
-    let response = timeout(
-      response_timeout,
-      try_nar_upstream(NarUpstreamRequest {
-        client: &state.nar_client,
-        s3: &state.s3,
-        method,
-        headers: &headers,
-        upstream: &candidate.upstream,
-        path: &candidate.path,
-        route: candidate.route,
-        auth: upstream_auth(&state, &candidate.upstream),
-      }),
-    )
-    .await
-    .ok()
-    .flatten();
+    let response =
+      open_nar_candidate(&state, method, &headers, &candidate).await;
     (candidate, response)
   });
 }
@@ -523,9 +593,10 @@ fn spawn_nar_attempt(
 async fn hedged_nar(
   state: Arc<AppState>,
   method: Method,
-  headers: HeaderMap,
-  initial: NarCandidate,
+  mut headers: HeaderMap,
+  mut initial: NarCandidate,
   mut candidates: Vec<NarCandidate>,
+  context: transfer::Context,
 ) -> Option<Response> {
   let max_inflight = if state.nar_hedging.enabled {
     usize::try_from(state.nar_hedging.max_inflight).unwrap_or(1)
@@ -533,6 +604,25 @@ async fn hedged_nar(
     1
   };
   let delay = state.nar_hedging.delay.0;
+  if method == Method::GET && state.nar_transfer.enabled {
+    headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+  }
+  if method == Method::GET
+    && context.expected.is_some()
+    && state.nar_transfer.enabled
+  {
+    candidates.push(initial);
+    rank_nar_candidates(
+      &state,
+      &mut candidates,
+      context.expected.as_ref().map_or(0, |info| {
+        transfer::requested_length(&headers, info.file_size)
+      }),
+    );
+    candidates.reverse();
+    initial = candidates.pop()?;
+    candidates.retain(|candidate| hedge_allowed(&state, &candidate.upstream));
+  }
   let mut attempts = JoinSet::new();
   spawn_nar_attempt(
     &mut attempts,
@@ -576,7 +666,11 @@ async fn hedged_nar(
             tracing::info!(upstream = candidate.upstream, cancelled, "nar hedge losers cancelled");
           }
           attempts.abort_all();
-          return Some(response);
+          return Some(if method == Method::GET && state.nar_transfer.enabled {
+            transfer::supervise(Arc::clone(&state), candidate, headers, context, response)
+          } else {
+            response
+          });
         }
         ncro_metrics::get().nar_hedge_failures.with_label_values(&["unavailable", &candidate.upstream]).inc();
         tracing::debug!(upstream = candidate.upstream, "nar attempt failed");
@@ -613,45 +707,65 @@ async fn hedge_candidates(
   skip: &str,
   include_hedging_opt_outs: bool,
   expected_narinfo: Option<&NarInfo>,
+  deadline: Option<TokioInstant>,
 ) -> Vec<NarCandidate> {
-  let mut by_priority = BTreeMap::<i32, Vec<UpstreamHealth>>::new();
-  for health in state.prober.sorted_by_latency().await {
-    if health.status == Status::Down || health.url == skip {
-      continue;
-    }
-    if !include_hedging_opt_outs && !hedge_allowed(state, &health.url) {
-      continue;
-    }
-    by_priority.entry(health.priority).or_default().push(health);
-  }
+  let health = state.prober.sorted_by_latency().await;
   let expected_compression = compression_for_nar_url(path);
+  let pending = stream::iter(
+    health
+      .into_iter()
+      .filter(|health| {
+        health.status != Status::Down
+          && health.url != skip
+          && (include_hedging_opt_outs || hedge_allowed(state, &health.url))
+      })
+      .map(|health| {
+        async move {
+          let candidate_path = if let Some(store_hash) = store_hash {
+            state
+              .router
+              .upstream_nar_path(
+                &health.url,
+                store_hash,
+                expected_narinfo,
+                expected_compression,
+              )
+              .await
+              .ok()?
+          } else {
+            path.to_string()
+          };
+          Some(NarCandidate {
+            upstream:  health.url,
+            path:      candidate_path,
+            route:     RouteKind::Hedge,
+            estimated: None,
+            priority:  health.priority,
+            latency:   health.ema_latency,
+          })
+        }
+      }),
+  )
+  .buffer_unordered(8);
+  let mut pending = std::pin::pin!(pending);
   let mut candidates = Vec::new();
-  for group in by_priority.into_values() {
-    for health in group {
-      let candidate_path = if let Some(store_hash) = store_hash {
-        let Ok(candidate_path) = state
-          .router
-          .upstream_nar_path(
-            &health.url,
-            store_hash,
-            expected_narinfo,
-            expected_compression,
-          )
-          .await
-        else {
-          continue;
-        };
-        candidate_path
-      } else {
-        path.to_string()
-      };
-      candidates.push(NarCandidate {
-        upstream: health.url,
-        path:     candidate_path,
-        route:    RouteKind::Hedge,
-      });
+  loop {
+    let next = if let Some(deadline) = deadline {
+      timeout_at(deadline, pending.next()).await.ok().flatten()
+    } else {
+      pending.next().await
+    };
+    match next {
+      Some(Some(candidate)) => candidates.push(candidate),
+      Some(None) => {},
+      None => break,
     }
   }
+  rank_nar_candidates(
+    state,
+    &mut candidates,
+    expected_narinfo.map_or(0, |info| info.file_size),
+  );
   candidates.reverse();
   candidates
 }
@@ -685,32 +799,45 @@ async fn nar(
     } else {
       &entry.upstream_nar_url
     };
-    let candidates = if let Some(Ok(expected_narinfo)) =
-      entry.narinfo_bytes.as_deref().map(NarInfo::parse)
-    {
+    let expected_narinfo = entry
+      .narinfo_bytes
+      .as_deref()
+      .and_then(|bytes| NarInfo::parse(bytes).ok());
+    let candidates = if let Some(expected_narinfo) = &expected_narinfo {
       hedge_candidates(
         &state,
         store_hash_from_canonical_nar_url(&nar_url),
         &path_and_query,
         &entry.upstream_url,
         false,
-        Some(&expected_narinfo),
+        Some(expected_narinfo),
+        None,
       )
       .await
     } else {
       Vec::new()
     };
     normal_attempted = true;
+    let health = state.prober.get_health(&entry.upstream_url).await;
     if let Some(resp) = hedged_nar(
       Arc::clone(&state),
       req.method().clone(),
       req.headers().clone(),
       NarCandidate {
-        upstream: entry.upstream_url.clone(),
-        path:     upstream_path.clone(),
-        route:    RouteKind::CacheHit,
+        upstream:  entry.upstream_url.clone(),
+        path:      upstream_path.clone(),
+        route:     RouteKind::CacheHit,
+        priority:  health.as_ref().map_or(40, |health| health.priority),
+        latency:   health.as_ref().map_or(0.0, |health| health.ema_latency),
+        estimated: None,
       },
       candidates,
+      transfer::Context {
+        expected:   expected_narinfo,
+        store_hash: store_hash_from_canonical_nar_url(&nar_url)
+          .map(str::to_owned),
+        path:       path_and_query.clone(),
+      },
     )
     .await
     {
@@ -727,6 +854,7 @@ async fn nar(
       "",
       true,
       None,
+      None,
     )
     .await;
     if let Some(mut initial) = candidates.pop() {
@@ -738,6 +866,12 @@ async fn nar(
         req.headers().clone(),
         initial,
         candidates,
+        transfer::Context {
+          expected:   None,
+          store_hash: store_hash_from_canonical_nar_url(&nar_url)
+            .map(str::to_owned),
+          path:       path_and_query.clone(),
+        },
       )
       .await
       {
@@ -1006,7 +1140,12 @@ async fn response_from_reqwest_first_byte(
   let status = StatusCode::from_u16(resp.status().as_u16()).ok()?;
   let headers = resp.headers().clone();
   let mut stream = Box::pin(resp.bytes_stream().map_err(io::Error::other));
-  let first = stream.try_next().await.ok()??;
+  let first = loop {
+    let bytes = stream.try_next().await.ok()??;
+    if !bytes.is_empty() {
+      break bytes;
+    }
+  };
   let body =
     Body::from_stream(stream::once(async move { Ok(first) }).chain(stream));
   Some(response_from_headers(status, &headers, body))
@@ -1016,7 +1155,12 @@ async fn response_from_s3_first_byte(
   object: ncro_s3::S3Object,
 ) -> Option<Response> {
   let mut stream = Box::pin(S3ClientPool::body_stream(object.body));
-  let first = stream.try_next().await.ok()??;
+  let first = loop {
+    let bytes = stream.try_next().await.ok()??;
+    if !bytes.is_empty() {
+      break bytes;
+    }
+  };
   let mut out =
     Response::builder().status(StatusCode::from_u16(object.status).ok()?);
   for (name, value) in [
