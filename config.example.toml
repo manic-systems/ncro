@@ -1,7 +1,7 @@
 [server]
-listen          = "localhost:8080"
-read_timeout    = "30s"
-write_timeout   = "30s"
+listen        = "localhost:8080"
+read_timeout  = "30s"
+write_timeout = "30s"
 # Advertised to Nix in /nix-cache-info. `cache_priority` sets `Priority` (lower
 # is preferred by Nix on ties); `want_mass_query` sets `WantMassQuery` (allow
 # bulk .narinfo queries).
@@ -65,6 +65,23 @@ ttl                      = "1h"
 delay        = "1s"
 enabled      = true
 max_inflight = 2
+
+[cache.nar_transfer]
+# Passive throughput selection and safe Range recovery/sustained-slow switching.
+# Alternate requests honor upstream allow_hedging; fallback is not a candidate.
+# max_switches = 0 keeps measurements and selection but disables switching.
+enabled             = true
+max_switches        = 2
+min_improvement     = 0.25
+probe_bytes         = 262144
+probe_timeout       = "2s"
+sample_min_bytes    = 262144
+sample_min_duration = "250ms"
+slow_window         = "3s"
+stall_timeout       = "5s"
+stats_ttl           = "5m"
+switch_margin       = "1s"
+throughput_alpha    = 0.3
 
 [cache.mass_query]
 in_memory_negative_ttl    = "5s"
