@@ -9,6 +9,7 @@ repository.workspace  = true
 
 [dependencies]
 axum                    = { workspace = true, features = [ "macros" ] }
+bytes.workspace         = true
 futures-util.workspace  = true
 misstep.workspace       = true
 ncro-config.workspace   = true
@@ -24,6 +25,10 @@ tokio.workspace         = true
 tower-http.workspace    = true
 tracing.workspace       = true
 url.workspace           = true
+
+[dev-dependencies]
+sha2  = "0.11.0"
+tokio = { workspace = true, features = [ "macros", "rt-multi-thread", "net", "sync", "time" ] }
 
 [lints]
 workspace = true

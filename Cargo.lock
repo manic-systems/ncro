@@ -1660,6 +1660,7 @@ name = "ncro-server"
 version = "2.4.0"
 dependencies = [
  "axum",
+ "bytes",
  "futures-util",
  "misstep",
  "ncro-config",
@@ -1671,6 +1672,7 @@ dependencies = [
  "ncro-upstream",
  "reqwest",
  "serde",
+ "sha2 0.11.0",
  "tokio",
  "tower-http 0.7.1",
  "tracing",
