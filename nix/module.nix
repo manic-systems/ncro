@@ -357,6 +357,20 @@ in {
         cache = {
           ttl = "2h";
           negative_ttl = "15m";
+          nar_transfer = {
+            enabled = true;
+            throughput_alpha = 0.3;
+            sample_min_bytes = 262144;
+            sample_min_duration = "250ms";
+            stats_ttl = "5m";
+            stall_timeout = "5s";
+            slow_window = "3s";
+            switch_margin = "1s";
+            min_improvement = 0.25;
+            max_switches = 2;
+            probe_bytes = 262144;
+            probe_timeout = "2s";
+          };
         };
       };
     };
