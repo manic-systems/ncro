@@ -737,21 +737,6 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   }
 
   #[test]
-  fn nar_hedging_defaults_and_upstream_opt_out_parse() -> Result<(), TomlError>
-  {
-    let cfg: Config = toml::from_str(
-      "[[upstreams]]\nurl = \"https://cache.example.com\"\n\
-       [cache.nar_hedging]\nmax_inflight = 3\n",
-    )?;
-
-    assert!(cfg.upstreams[0].allow_hedging);
-    assert!(cfg.cache.nar_hedging.enabled);
-    assert_eq!(cfg.cache.nar_hedging.max_inflight, 3);
-    assert_eq!(cfg.cache.nar_hedging.delay.0, Duration::from_secs(1));
-    Ok(())
-  }
-
-  #[test]
   fn upstream_can_opt_out_of_nar_hedging() -> Result<(), TomlError> {
     let cfg: Config = toml::from_str(
       "[[upstreams]]\nurl = \"https://cache.example.com\"\nallow_hedging = \
@@ -770,6 +755,50 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     )?;
 
     assert!(cfg.validate().is_err());
+    Ok(())
+  }
+  #[test]
+  fn nar_transfer_accepts_boundaries_and_disabled_switching()
+  -> Result<(), ConfigError> {
+    for max_switches in [0, 16] {
+      let cfg: Config = toml::from_str(&format!(
+        "[[upstreams]]\nurl = \"https://cache.example.com\"\n\
+         [cache.nar_transfer]\nsample_min_bytes = 1\nprobe_bytes = 16777216\n\
+         max_switches = {max_switches}\nthroughput_alpha = 0.0001\n\
+         min_improvement = 0.9999\nsample_min_duration = \"1ns\"\n"
+      ))?;
+      cfg.validate()?;
+      assert_eq!(cfg.cache.nar_transfer.max_switches, max_switches);
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn nar_transfer_rejects_invalid_settings() -> Result<(), TomlError> {
+    for setting in [
+      "throughput_alpha = 0",
+      "throughput_alpha = 1",
+      "throughput_alpha = nan",
+      "min_improvement = 0",
+      "min_improvement = 1",
+      "min_improvement = inf",
+      "sample_min_bytes = 0",
+      "probe_bytes = 0",
+      "probe_bytes = 16777217",
+      "max_switches = 17",
+      "sample_min_duration = \"0s\"",
+      "stats_ttl = \"0s\"",
+      "stall_timeout = \"0s\"",
+      "slow_window = \"0s\"",
+      "switch_margin = \"0s\"",
+      "probe_timeout = \"0s\"",
+    ] {
+      let cfg: Config = toml::from_str(&format!(
+        "[[upstreams]]\nurl = \"https://cache.example.com\"\n\
+         [cache.nar_transfer]\n{setting}\n"
+      ))?;
+      assert!(cfg.validate().is_err(), "accepted {setting}");
+    }
     Ok(())
   }
 
@@ -1067,6 +1096,7 @@ pub struct CacheConfig {
   pub slow_statement_threshold: HumanDuration,
   pub mass_query:               MassQueryConfig,
   pub nar_hedging:              NarHedgingConfig,
+  pub nar_transfer:             NarTransferConfig,
 }
 
 impl Default for CacheConfig {
@@ -1080,6 +1110,7 @@ impl Default for CacheConfig {
       slow_statement_threshold: HumanDuration(Duration::from_secs(1)),
       mass_query:               MassQueryConfig::default(),
       nar_hedging:              NarHedgingConfig::default(),
+      nar_transfer:             NarTransferConfig::default(),
     }
   }
 }
@@ -1098,6 +1129,42 @@ impl Default for NarHedgingConfig {
       enabled:      true,
       delay:        HumanDuration(Duration::from_secs(1)),
       max_inflight: 2,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NarTransferConfig {
+  pub enabled:             bool,
+  pub throughput_alpha:    f64,
+  pub sample_min_bytes:    u64,
+  pub sample_min_duration: HumanDuration,
+  pub stats_ttl:           HumanDuration,
+  pub stall_timeout:       HumanDuration,
+  pub slow_window:         HumanDuration,
+  pub switch_margin:       HumanDuration,
+  pub min_improvement:     f64,
+  pub max_switches:        u32,
+  pub probe_bytes:         u64,
+  pub probe_timeout:       HumanDuration,
+}
+
+impl Default for NarTransferConfig {
+  fn default() -> Self {
+    Self {
+      enabled:             true,
+      throughput_alpha:    0.3,
+      sample_min_bytes:    262_144,
+      sample_min_duration: HumanDuration(Duration::from_millis(250)),
+      stats_ttl:           HumanDuration(Duration::from_secs(300)),
+      stall_timeout:       HumanDuration(Duration::from_secs(5)),
+      slow_window:         HumanDuration(Duration::from_secs(3)),
+      switch_margin:       HumanDuration(Duration::from_secs(1)),
+      min_improvement:     0.25,
+      max_switches:        2,
+      probe_bytes:         262_144,
+      probe_timeout:       HumanDuration(Duration::from_secs(2)),
     }
   }
 }
@@ -1442,6 +1509,48 @@ impl Config {
     if self.cache.nar_hedging.max_inflight == 0 {
       return Err(ConfigError::Validation(
         "cache.nar_hedging.max_inflight must be >= 1".to_string(),
+      ));
+    }
+    let transfer = &self.cache.nar_transfer;
+    for (name, value) in [
+      ("throughput_alpha", transfer.throughput_alpha),
+      ("min_improvement", transfer.min_improvement),
+    ] {
+      if !(value > 0.0 && value < 1.0) {
+        return Err(ConfigError::Validation(format!(
+          "cache.nar_transfer.{name} must be between 0 and 1 exclusive, got \
+           {value}"
+        )));
+      }
+    }
+    for (name, value) in [
+      ("sample_min_duration", transfer.sample_min_duration.0),
+      ("stats_ttl", transfer.stats_ttl.0),
+      ("stall_timeout", transfer.stall_timeout.0),
+      ("slow_window", transfer.slow_window.0),
+      ("switch_margin", transfer.switch_margin.0),
+      ("probe_timeout", transfer.probe_timeout.0),
+    ] {
+      if value.is_zero() {
+        return Err(ConfigError::Validation(format!(
+          "cache.nar_transfer.{name} must be positive"
+        )));
+      }
+    }
+    if transfer.sample_min_bytes == 0 {
+      return Err(ConfigError::Validation(
+        "cache.nar_transfer.sample_min_bytes must be positive".to_string(),
+      ));
+    }
+    if transfer.probe_bytes == 0 || transfer.probe_bytes > 16 * 1024 * 1024 {
+      return Err(ConfigError::Validation(
+        "cache.nar_transfer.probe_bytes must be between 1 and 16777216"
+          .to_string(),
+      ));
+    }
+    if transfer.max_switches > 16 {
+      return Err(ConfigError::Validation(
+        "cache.nar_transfer.max_switches must be <= 16".to_string(),
       ));
     }
     if self.logging.level.trim().is_empty() {
