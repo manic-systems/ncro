@@ -5,7 +5,8 @@
 ncro reads TOML from the file passed with `--config`. In a configuration file,
 `[[upstreams]]` must contain at least one entry; every other section and setting
 is optional and uses the defaults below. With no configuration file, ncro
-listens on `localhost:8080` and uses `https://cache.nixos.org` as its only upstream.
+listens on `localhost:8080` and uses `https://cache.nixos.org` as its only
+upstream.
 
 Start with one upstream, point Nix at ncro, then add routing, authentication, or
 network features only when they solve a concrete deployment need. See
@@ -44,9 +45,9 @@ these non-empty environment variables after reading that file:
 | `NCRO_DB_PATH`   | `cache.db_path` |
 | `NCRO_LOG_LEVEL` | `logging.level` |
 
-Unknown keys are an error. `ncro --config <file> --check` parses and validates
-a file and exits, without reading passwords or applying the overrides above, so
-it can run inside a build sandbox.
+Unknown keys are an error. `ncro --config <file> --check` parses and validates a
+file and exits, without reading passwords or applying the overrides above, so it
+can run inside a build sandbox.
 
 ## Server
 
@@ -87,20 +88,20 @@ nar_timeout = "60s"
 
 <!--markdownlint-disable MD013-->
 
-| Key               | Default               | Meaning                                                                                                                                           |
-| ----------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `url`             | required              | Base HTTP(S) cache URL or a Nix-style `s3://` URL.                                                                                                |
-| `priority`        | `0`                   | Latency-tie preference; lower is preferred.                                                                                                       |
-| `public_key`      | empty                 | One accepted Nix narinfo signing key. Empty disables signature verification unless `public_keys` is set.                                          |
-| `public_keys`     | `[]`                  | Additional accepted signing keys. Use this for pull-through caches that can return narinfos signed by multiple origins.                           |
-| `username`        | empty                 | HTTP Basic Auth username. An empty username disables configured Basic Auth.                                                                       |
-| `password`        | unset                 | HTTP Basic Auth password. Mutually exclusive with `password_file`.                                                                                |
-| `password_file`   | unset                 | File containing the HTTP Basic Auth password. One trailing newline is removed.                                                                    |
-| `narinfo_timeout` | `"5s"`                | Timeout for this upstream's narinfo HEAD race and GET fetches.                                                                                    |
-| `nar_timeout`     | `server.read_timeout` | Time allowed to receive successful NAR response headers and the first body chunk. Streaming continues after this deadline.                       |
-| `allow_hedging`   | `true`                | Permit this upstream to be launched as an additional NAR hedge. Set false for metered or residential sources; it may still be the initial source. |
-| `nar_url_mode`    | `"to_self"`           | How the narinfo `URL:` field is returned; described below.                                                                                        |
-| `filters`         | `[]`                  | Narinfo path filters, described below.                                                                                                            |
+| Key               | Default               | Meaning                                                                                                                                                                   |
+| ----------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`             | required              | Base HTTP(S) cache URL or a Nix-style `s3://` URL.                                                                                                                        |
+| `priority`        | `0`                   | Latency-tie preference; lower is preferred.                                                                                                                               |
+| `public_key`      | empty                 | One accepted Nix narinfo signing key. Empty disables signature verification unless `public_keys` is set.                                                                  |
+| `public_keys`     | `[]`                  | Additional accepted signing keys. Use this for pull-through caches that can return narinfos signed by multiple origins.                                                   |
+| `username`        | empty                 | HTTP Basic Auth username. An empty username disables configured Basic Auth.                                                                                               |
+| `password`        | unset                 | HTTP Basic Auth password. Mutually exclusive with `password_file`.                                                                                                        |
+| `password_file`   | unset                 | File containing the HTTP Basic Auth password. One trailing newline is removed.                                                                                            |
+| `narinfo_timeout` | `"5s"`                | Timeout for this upstream's narinfo HEAD race and GET fetches.                                                                                                            |
+| `nar_timeout`     | `server.read_timeout` | Time allowed to receive successful NAR response headers and the first body chunk. Streaming continues after this deadline.                                                |
+| `allow_hedging`   | `true`                | Permit additional NAR hedge, throughput-selection, probe, and recovery requests. Set false for metered or residential sources; it may still be the routed initial source. |
+| `nar_url_mode`    | `"to_self"`           | How the narinfo `URL:` field is returned; described below.                                                                                                                |
+| `filters`         | `[]`                  | Narinfo path filters, described below.                                                                                                                                    |
 
 <!--markdownlint-enable MD013-->
 
@@ -162,9 +163,9 @@ If those fields are empty, ncro also consults a netrc file: `NETRC` if set, or
 `~/.netrc` otherwise. The `machine` name must match the upstream hostname; a
 `default` entry is used when no machine entry matches. Explicit configuration
 credentials take precedence over netrc credentials. S3 upstreams do not use
-Basic Auth or netrc. ncro refuses to start when the file `NETRC` names cannot
-be read or parsed, so a wrong path or permission shows up at startup instead of
-as failed authentication later. A broken `~/.netrc` is skipped with a warning.
+Basic Auth or netrc. ncro refuses to start when the file `NETRC` names cannot be
+read or parsed, so a wrong path or permission shows up at startup instead of as
+failed authentication later. A broken `~/.netrc` is skipped with a warning.
 
 ### S3 upstreams
 
@@ -241,9 +242,74 @@ The fallback cache is never a hedge candidate.
 
 <!--markdownlint-enable MD013-->
 
-Additional candidates use global priority groups and EMA latency within each
-group. `allow_hedging = false` excludes an upstream only from those additional
-candidates. Hedge winners do not replace the narinfo route stored in SQLite.
+Additional candidates use global priority groups, then fresh NAR transfer
+estimates when available, with latency as the fallback. `allow_hedging = false`
+excludes an upstream from additional requests, including adaptive selection and
+mid-stream recovery. NAR winners do not replace the narinfo route in SQLite.
+
+### Adaptive NAR transfers
+
+`[cache.nar_transfer]` learns from actual HTTP and S3 NAR transfers and
+supervises normal-source response bodies. It is enabled by default and
+independent of first-byte hedging. Disabling it restores first-byte-only
+streaming; `max_switches = 0` retains measurement and source selection but
+disables mid-stream probes and recovery.
+
+Within each priority group, transfers at least `sample_min_bytes` in size prefer
+sources with fresh measurements and rank them by measured first-byte time plus
+remaining **compressed** bytes divided by observed throughput. Unknown sources
+retain cached-route/latency ordering and can be explored by hedging or a bounded
+slow-stream probe. Client ranges use their requested length, not the whole file
+size. Narinfo lookup races remain latency-based.
+
+Measurement windows require both minimum bytes and minimum actively awaited
+upstream time. Time between downstream body polls is not included; bounded
+streaming does not prefetch entire files. Active requests conservatively damp
+estimates under increased concurrency. Statistics are in memory, expire, and are
+capped at 1,024 upstreams; they are not persisted or mesh-gossiped.
+
+<!--markdownlint-disable MD013-->
+
+| Key                   | Default   | Meaning                                                                                                                  |
+| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`             | `true`    | Enable passive measurement, adaptive selection, and supervised streams.                                                  |
+| `throughput_alpha`    | `0.3`     | EWMA weighting; finite and strictly between 0 and 1.                                                                     |
+| `sample_min_bytes`    | `262144`  | Minimum bytes per sustained measurement window; positive.                                                                |
+| `sample_min_duration` | `"250ms"` | Minimum active upstream time per measurement window; positive.                                                           |
+| `stats_ttl`           | `"5m"`    | Maximum age of usable throughput and first-byte observations; positive.                                                  |
+| `stall_timeout`       | `"5s"`    | No-progress deadline while actively awaiting a body chunk; positive.                                                     |
+| `slow_window`         | `"3s"`    | Sustained active-read window before considering a slow-source probe; positive.                                           |
+| `switch_margin`       | `"1s"`    | Minimum predicted completion-time saving, including discovery/setup/probe time; positive.                                |
+| `min_improvement`     | `0.25`    | Also require this fractional reduction in predicted remaining completion time; finite and strictly between 0 and 1.      |
+| `max_switches`        | `2`       | Per-download upper bound on discovery rounds and alternate NAR request attempts, including failed/rejected probes; 0–16. |
+| `probe_bytes`         | `262144`  | Maximum prefix sampled from a slow-stream replacement; 1–16777216 bytes.                                                 |
+| `probe_timeout`       | `"2s"`    | Deadline for a discovery round and each replacement/probe attempt; positive.                                             |
+
+<!--markdownlint-enable MD013-->
+
+On a stall, body error, or premature EOF, ncro discovers eligible sources again
+and requests the exact remaining absolute byte range. A replacement requires
+matching store path, compression, nonempty compressed `FileHash`, positive
+`FileSize`, `NarHash`, and `NarSize`. It must return `206` with the exact
+`Content-Range` and compatible length. Matching uncompressed NAR hashes alone is
+insufficient; different compressed representations cannot be spliced.
+Unsupported, multipart, or unverifiable ranges cannot be resumed. HTTP content
+encoding must be absent or identity; ncro requests identity encoding.
+
+Slow-stream probing pauses the current byte cursor and reads a bounded prefix
+from an alternate's remaining-range response. A worthwhile candidate retains
+that prefix and the same connection; otherwise ncro cancels the probe and
+continues the original body. The application buffer holds at most `probe_bytes`
+plus one transport chunk, with a 256-chunk prefix cap. Each source is attempted
+at most once after the initial source, and both absolute and fractional saving
+thresholds discourage churn. There is no parallel chunk striping or disk cache.
+
+The original downstream status, length, and range remain unchanged. An exhausted
+or unsafe recovery ends the body with an error rather than emitting unvalidated
+alternate bytes; Nix still performs its normal integrity verification. Client
+disconnects drop the original stream and any active probe. The fallback cache is
+neither measured nor used for adaptive switching. Provenance headers describe
+the initial source; subsequent switches are recorded in ncro's logs.
 
 ## Fallback cache
 
@@ -301,13 +367,13 @@ public_key = "a1b2c3..." # 32-byte ed25519 key, hex encoded
 
 <!--markdownlint-disable MD013-->
 
-| Key               | Default          | Meaning                                                                                |
-| ----------------- | ---------------- | -------------------------------------------------------------------------------------- |
-| `enabled`         | `false`          | Enable mesh gossip. At least one peer is required when enabled.                        |
-| `bind_addr`       | `"0.0.0.0:7946"` | UDP address on which to receive gossip.                                                |
-| `private_key`     | empty            | Path to an ed25519 private key. Empty uses an ephemeral identity.                      |
-| `gossip_interval` | `"30s"`          | Interval between route announcements.                                                  |
-| `peers`           | `[]`             | Peer entries, each with required `addr` and hex-encoded 32-byte `public_key`.          |
+| Key               | Default          | Meaning                                                                       |
+| ----------------- | ---------------- | ----------------------------------------------------------------------------- |
+| `enabled`         | `false`          | Enable mesh gossip. At least one peer is required when enabled.               |
+| `bind_addr`       | `"0.0.0.0:7946"` | UDP address on which to receive gossip.                                       |
+| `private_key`     | empty            | Path to an ed25519 private key. Empty uses an ephemeral identity.             |
+| `gossip_interval` | `"30s"`          | Interval between route announcements.                                         |
+| `peers`           | `[]`             | Peer entries, each with required `addr` and hex-encoded 32-byte `public_key`. |
 
 <!--markdownlint-enable MD013-->
 
