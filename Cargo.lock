@@ -2143,6 +2143,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "sha2 0.11.0",
  "tokio",
  "tower-http 0.7.0",
  "tracing",

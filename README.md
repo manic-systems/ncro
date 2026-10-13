@@ -69,14 +69,13 @@ flowchart TD
     E --> L{All caches unavailable?}
     L -- yes --> M[Optional fallback cache]
 
-    D --> H[Try upstreams in latency order]
-    H --> I{404?}
-    I -- yes --> J[Fallback to next upstream]
-    J --> N{All caches failed?}
-    N -- yes --> M
-    I -- no --> K[Zero copy stream to client]
-
-    J --> H
+    D --> H[Completion-time source ordering]
+    H --> I[First-byte hedging]
+    I --> K[Supervised NAR stream]
+    I -- all sources fail --> M
+    K -- stall or slow transfer --> J[Validated Range replacement]
+    J -- safe and worthwhile --> K
+    J -- recovery exhausted --> N[Body error]
     M --> A
     K --> A
 ```
@@ -86,8 +85,8 @@ The request flow follows two distinct paths depending on the request type:
 ### Narinfo Lookups
 
 1. Nix requests `/<hash>.narinfo`
-2. ncro checks the SQLite route cache; on a hit, it re-fetches from the cached
-   upstream without probing others
+2. ncro checks SQLite; cached narinfo bytes are served locally while valid,
+   otherwise the cached upstream is fetched without probing others
 3. On a miss, it races HEAD requests to all configured upstreams in parallel
 4. The fastest upstream wins; the full narinfo body is fetched from that
    upstream and checked against any per-upstream filters
@@ -101,16 +100,28 @@ The request flow follows two distinct paths depending on the request type:
 
 ### NAR Streaming
 
-1. Nix requests `/nar/<hash>.nar`
-2. ncro looks up the route for the corresponding narinfo hash; if no route is
-   found (e.g. the narinfo was requested directly from an upstream), it tries
-   upstreams in latency order
-3. The NAR body is streamed chunk-by-chunk from the selected upstream to the
-   client with zero buffering on disk
-4. If the upstream returns 404, ncro falls through to the next upstream in
-   latency order
-5. After all normal upstreams are exhausted with no success, ncro may
-   _optionally_ try the optional fallback cache before returning 404
+1. Nix requests `/nar/<hash>.nar`; ncro finds the routed source and validates
+   eligible alternates against its narinfo
+2. Within priority groups, fresh transfer measurements rank large NAR requests
+   by estimated completion time; cached-route/latency ordering remains the
+   fallback when measurements are unavailable
+3. First-byte hedging starts another eligible source if the initial request is
+   slow to respond; the winner is streamed with no disk buffering
+4. A supervised body discovers alternates and resumes an identical compressed
+   file using validated byte ranges after stalls, errors, or premature EOF
+5. Sustained-slow transfers may sample a bounded alternate prefix and switch
+   only when predicted savings exceed absolute and fractional thresholds
+6. If all normal sources fail before streaming starts, ncro may try the optional
+   fallback cache. Unsafe or exhausted mid-stream recovery fails the body
+
+[configuration reference]: docs/configuration.md#adaptive-nar-transfers
+
+Adaptive transfers are enabled by default under `[cache.nar_transfer]`. They
+respect alternate-source opt-outs, preserve client ranges, and cancel upstream
+work on client disconnect. See the [configuration reference] for limits and
+tuning. Please note that this feature is experimental, and do not always
+correlate to positive results. They also do not change Nix's download
+concurrency.
 
 Background probes (`HEAD /nix-cache-info`) run every 30 seconds to keep latency
 measurements current and detect unhealthy upstreams. System design is covered
@@ -128,10 +139,10 @@ further in the [architechture document].
   per-upstream detail)
 
 Successful narinfo and NAR responses include diagnostic provenance headers:
-`X-Ncro-Upstream` is the selected upstream hostname and `X-Ncro-Route` is one of
-`cache-hit`, `race`, `direct`, `hedge`, or `fallback`. These headers are for
-operators; Nix still identifies the substituter by ncro's configured URL (such
-as `http://localhost:8080`).
+`X-Ncro-Upstream` is the initial upstream hostname and `X-Ncro-Route` is one of
+`cache-hit`, `race`, `direct`, `hedge`, or `fallback`. Mid-stream changes cannot
+rewrite headers already sent; ncro logs those switches. Nix still identifies the
+substituter by ncro's configured URL (such as `http://localhost:8080`).
 
 ### Routing Notes
 
@@ -150,8 +161,14 @@ as `http://localhost:8080`).
   probe failures) are excluded from the race until they recover.
 - NAR downloads start with the selected upstream and hedge progressively when it
   has not delivered a first byte. Hedging defaults to one second and two
-  concurrent attempts; set `allow_hedging = false` for a source that must not be
-  launched as an additional hedge.
+  concurrent attempts; set `allow_hedging = false` to prevent additional hedge,
+  adaptive-selection, probe, and recovery requests to a source.
+- Adaptive NAR transfers learn sustained throughput from active upstream reads,
+  excluding downstream poll pauses. Statistics expire after five minutes and are
+  not persisted. Default mid-stream limits allow two discovery rounds and two
+  alternate NAR attempts per download, including rejected probes.
+- Recovery requires identical compressed-file metadata and an exact `206` range
+  response; a matching uncompressed NAR alone does not permit splicing.
 - Per-upstream filters are applied after ncro fetches the full narinfo from a
   candidate winner. Rejected upstreams are not cached as winners and ncro keeps
   looking for another acceptable upstream.
@@ -188,6 +205,8 @@ Deployment instructions are in [installation document].
 The defaults are built in, so a TOML file only needs the fields you want to
 change. Note that `ncro --config <file> --check` can catch typos or invalid keys
 without starting the server.
+
+<!--markdownlint-disable MD013-->
 
 ```toml
 [server]
@@ -265,6 +284,8 @@ peers = []       # list of {addr, public_key} peer entries
 private_key = "" # path to ed25519 key file; empty = ephemeral
 gossip_interval = "30s"
 ```
+
+<!--markdownlint-enable MD013-->
 
 ### Environment Overrides
 
