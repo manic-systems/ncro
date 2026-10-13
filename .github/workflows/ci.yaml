@@ -95,3 +95,16 @@ jobs:
   actions:
     name: Actions Lint
     uses: manic-systems/workflows/.github/workflows/actions-lint.yml@b22b11dd6ae5da25aa9c82fcba380b05003af2dd # v2.1.2
+
+  required:
+    name: Required Checks
+    if: always()
+    needs:
+      - checks
+      - build
+      - vm-test
+      - actions
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
