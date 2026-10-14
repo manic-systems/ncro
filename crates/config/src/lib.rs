@@ -10,6 +10,7 @@ use std::{
   time::Duration,
 };
 
+use jiff::{SignedDuration, Span, SpanRelativeTo};
 use netrc::{Error as NetrcError, Netrc};
 use serde::{Deserialize, Deserializer, de};
 use thiserror::Error;
@@ -799,7 +800,12 @@ impl<'de> Deserialize<'de> for HumanDuration {
   where
     D: Deserializer<'de>,
   {
-    humantime_serde::deserialize(deserializer).map(Self)
+    let text = String::deserialize(deserializer)?;
+    let span = text.parse::<Span>().map_err(de::Error::custom)?;
+    let signed: SignedDuration = span
+      .to_duration(SpanRelativeTo::days_are_24_hours())
+      .map_err(de::Error::custom)?;
+    signed.try_into().map(Self).map_err(de::Error::custom)
   }
 }
 

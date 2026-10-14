@@ -5,8 +5,8 @@ use std::{
   time::{Duration, Instant},
 };
 
-use chrono::Utc;
 use dashmap::{DashMap, mapref::entry::Entry};
+use jiff::Timestamp;
 use moka::future::Cache as MokaCache;
 use ncro_config::{
   FilterAction,
@@ -926,7 +926,7 @@ impl Router {
       .prober
       .record_latency(&winner.url, winner.latency_ms)
       .await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     self
       .inner
       .db
@@ -939,8 +939,8 @@ impl Router {
         query_count: 1,
         failure_count: 0,
         ttl: now
-          + chrono::Duration::from_std(self.inner.route_ttl)
-            .unwrap_or_default(),
+          .saturating_add(self.inner.route_ttl)
+          .unwrap_or(Timestamp::MAX),
         nar_hash: parsed.nar_hash,
         nar_size: parsed.nar_size,
         nar_url,
@@ -1363,8 +1363,8 @@ mod tests {
   use std::{slice, sync::Arc, time::Duration};
 
   use base64::{Engine as _, engine::general_purpose::STANDARD};
-  use chrono::Utc;
   use ed25519_dalek::{Signer, SigningKey};
+  use jiff::{SignedDuration, Timestamp};
   use ncro_config::{NarUrlMode, UpstreamConfig};
   use ncro_db::{Db, RouteEntry};
   use ncro_health::Prober;
@@ -1827,7 +1827,7 @@ mod tests {
         ..Default::default()
       }])
       .await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     router
       .inner
       .db
@@ -1839,7 +1839,7 @@ mod tests {
         last_verified:    now,
         query_count:      1,
         failure_count:    0,
-        ttl:              now + chrono::Duration::hours(1),
+        ttl:              now + SignedDuration::from_hours(1),
         nar_hash:         "sha256:abc".to_string(),
         nar_size:         1,
         nar_url:          "nar/test.nar.xz".to_string(),
@@ -1891,7 +1891,7 @@ mod tests {
       },
     ])
     .await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     router
       .inner
       .db
@@ -1903,7 +1903,7 @@ mod tests {
         last_verified:    now,
         query_count:      1,
         failure_count:    0,
-        ttl:              now + chrono::Duration::hours(1),
+        ttl:              now + SignedDuration::from_hours(1),
         nar_hash:         "sha256:abc".to_string(),
         nar_size:         1,
         nar_url:          "nar/test.nar.xz".to_string(),

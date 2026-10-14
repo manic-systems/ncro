@@ -4,8 +4,8 @@ use std::{
   sync::Arc,
 };
 
-use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use jiff::Timestamp;
 use ncro_db::{Db, RouteEntry};
 use rand::RngExt;
 use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
@@ -215,7 +215,7 @@ pub async fn listen_and_serve(
 }
 
 async fn merge_routes(db: &Db, incoming: Vec<RouteEntry>) {
-  let now = Utc::now();
+  let now = Timestamp::now();
   let usable = |route: &RouteEntry| {
     route.ttl > now && route.latency_ema.is_finite() && route.latency_ema >= 0.0
   };
@@ -252,7 +252,8 @@ pub async fn announce(
   let msg = Message {
     r#type: MsgType::Announce,
     node_id: node.id(),
-    timestamp: Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+    timestamp: i64::try_from(Timestamp::now().as_nanosecond())
+      .unwrap_or_default(),
     routes,
   };
   let packet = encode_packet(node, &msg)?;
@@ -315,7 +316,7 @@ mod tests {
     time::{Duration, SystemTime, UNIX_EPOCH},
   };
 
-  use chrono::Duration as ChronoDuration;
+  use jiff::{SignedDuration, Timestamp};
   use ncro_db::{Db, RouteEntry};
   use tokio::fs;
 
@@ -350,7 +351,7 @@ mod tests {
   }
 
   fn route(store_path: &str, latency_ema: f64, ttl_secs: i64) -> RouteEntry {
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
     RouteEntry {
       store_path: store_path.into(),
       upstream_url: "http://test.example.com".into(),
@@ -359,7 +360,7 @@ mod tests {
       last_verified: now,
       query_count: 1,
       failure_count: 0,
-      ttl: now + ChronoDuration::seconds(ttl_secs),
+      ttl: now + SignedDuration::from_secs(ttl_secs),
       nar_hash: "sha256:aabbcc".into(),
       nar_size: 42,
       nar_url: "nar/test.nar".into(),
