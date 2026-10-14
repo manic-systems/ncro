@@ -263,7 +263,6 @@ impl NarInfo {
 #[cfg(test)]
 mod tests {
   use ed25519_dalek::{Signer, SigningKey};
-  use rand::RngExt;
 
   use super::*;
 
@@ -387,8 +386,7 @@ mod tests {
     // Regression for issue #19. The previous implementation used the
     // padding-strict `STANDARD` base64 engine and rejected 43-character
     // unpadded keys with `Invalid padding`, even though Nix accepts them.
-    let mut seed = [0_u8; 32];
-    rand::rng().fill(&mut seed);
+    let seed = [7_u8; 32];
     let signing = SigningKey::from_bytes(&seed);
     let bytes = signing.verifying_key().to_bytes();
     let unpadded = STANDARD.encode(bytes).trim_end_matches('=').to_string();
@@ -407,8 +405,7 @@ mod tests {
     // Generate a real keypair so the verifying key is guaranteed to be a
     // valid ed25519 curve point (ed25519-dalek's `from_bytes` rejects
     // arbitrary 32-byte inputs that don't decode to a point on the curve).
-    let mut seed = [0_u8; 32];
-    rand::rng().fill(&mut seed);
+    let seed = [7_u8; 32];
     let signing = SigningKey::from_bytes(&seed);
     let bytes = signing.verifying_key().to_bytes();
     let padded = STANDARD.encode(bytes);
@@ -424,8 +421,7 @@ mod tests {
 
   #[test]
   fn verifies_roundtrip_signature() -> Result<(), NarInfoError> {
-    let mut key_bytes = [0_u8; 32];
-    rand::rng().fill(&mut key_bytes);
+    let key_bytes = [7_u8; 32];
     let signing = SigningKey::from_bytes(&key_bytes);
     let mut ni = NarInfo {
       store_path: "/nix/store/abc-test".into(),
@@ -446,10 +442,8 @@ mod tests {
 
   #[test]
   fn verify_with_wrong_key_returns_false() -> Result<(), NarInfoError> {
-    let mut key1_bytes = [0u8; 32];
-    let mut key2_bytes = [1u8; 32];
-    rand::rng().fill(&mut key1_bytes);
-    rand::rng().fill(&mut key2_bytes);
+    let key1_bytes = [1u8; 32];
+    let key2_bytes = [2u8; 32];
     let signing1 = SigningKey::from_bytes(&key1_bytes);
     let signing2 = SigningKey::from_bytes(&key2_bytes);
     let mut ni = NarInfo {
@@ -470,8 +464,7 @@ mod tests {
 
   #[test]
   fn verify_tampered_content_returns_false() -> Result<(), NarInfoError> {
-    let mut key_bytes = [0u8; 32];
-    rand::rng().fill(&mut key_bytes);
+    let key_bytes = [7u8; 32];
     let signing = SigningKey::from_bytes(&key_bytes);
     let mut ni = NarInfo {
       store_path: "/nix/store/abc-test".into(),

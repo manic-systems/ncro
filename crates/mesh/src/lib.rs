@@ -7,7 +7,6 @@ use std::{
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use jiff::Timestamp;
 use ncro_db::{Db, RouteEntry};
-use rand::RngExt;
 use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,6 +38,8 @@ pub enum MeshError {
   InvalidSignature,
   #[error("invalid key file size {got}, want 32 or 64 bytes")]
   InvalidKeyFileSize { got: usize },
+  #[error("read system entropy: {0}")]
+  Entropy(#[from] getrandom::Error),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,7 +68,7 @@ impl Node {
   pub async fn new(key_path: &str) -> Result<Self, MeshError> {
     if key_path.is_empty() {
       return Ok(Self {
-        signing_key: Arc::new(SigningKey::from_bytes(&random_key_bytes())),
+        signing_key: Arc::new(SigningKey::from_bytes(&random_key_bytes()?)),
       });
     }
     match fs::read(key_path).await {
@@ -89,7 +90,7 @@ impl Node {
     {
       fs::create_dir_all(parent).await?;
     }
-    let key = SigningKey::from_bytes(&random_key_bytes());
+    let key = SigningKey::from_bytes(&random_key_bytes()?);
     write_new_key(Path::new(key_path), &key.to_bytes()).await?;
     Ok(Self {
       signing_key: Arc::new(key),
@@ -119,8 +120,8 @@ impl Node {
 async fn write_new_key(
   key_path: &Path,
   key_bytes: &[u8; 32],
-) -> Result<(), io::Error> {
-  let temp_path = temporary_key_path(key_path);
+) -> Result<(), MeshError> {
+  let temp_path = temporary_key_path(key_path)?;
   let mut options = OpenOptions::new();
   options.write(true).create_new(true);
   #[cfg(unix)]
@@ -137,19 +138,19 @@ async fn write_new_key(
   drop(file);
   let cleanup_result = fs::remove_file(temp_path).await;
   write_result?;
-  cleanup_result
+  Ok(cleanup_result?)
 }
 
-fn temporary_key_path(key_path: &Path) -> PathBuf {
+fn temporary_key_path(key_path: &Path) -> Result<PathBuf, MeshError> {
   let mut path = key_path.as_os_str().to_os_string();
-  path.push(format!(".{}.tmp", hex::encode(random_key_bytes())));
-  path.into()
+  path.push(format!(".{}.tmp", hex::encode(random_key_bytes()?)));
+  Ok(path.into())
 }
 
-fn random_key_bytes() -> [u8; 32] {
+fn random_key_bytes() -> Result<[u8; 32], getrandom::Error> {
   let mut bytes = [0_u8; 32];
-  rand::rng().fill(&mut bytes);
-  bytes
+  getrandom::fill(&mut bytes)?;
+  Ok(bytes)
 }
 
 /// # Errors

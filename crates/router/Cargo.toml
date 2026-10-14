@@ -10,7 +10,7 @@ repository.workspace  = true
 [dependencies]
 dashmap.workspace      = true
 jiff.workspace         = true
-moka.workspace         = true
+lru.workspace          = true
 ncro-config.workspace  = true
 ncro-db.workspace      = true
 ncro-health.workspace  = true
@@ -26,7 +26,6 @@ tracing.workspace      = true
 [dev-dependencies]
 base64.workspace        = true
 ed25519-dalek.workspace = true
-rand.workspace          = true
 
 [lints]
 workspace = true
