@@ -1,13 +1,14 @@
 use std::{
   collections::{BTreeMap, HashMap},
+  num::NonZeroUsize,
   str,
-  sync::Arc,
+  sync::{Arc, Mutex as StdMutex, PoisonError},
   time::{Duration, Instant},
 };
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use jiff::Timestamp;
-use moka::future::Cache as MokaCache;
+use lru::LruCache;
 use ncro_config::{
   FilterAction,
   FilterField,
@@ -162,6 +163,45 @@ pub struct RouterTuning {
   pub upstream_cooldown:         Duration,
 }
 
+/// A bounded LRU whose entries expire `ttl` after insertion.
+struct TtlCache<V> {
+  entries: StdMutex<LruCache<String, (Instant, V)>>,
+  ttl:     Duration,
+}
+
+impl<V: Clone> TtlCache<V> {
+  fn new(capacity: usize, ttl: Duration) -> Self {
+    let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+    Self {
+      entries: StdMutex::new(LruCache::new(capacity)),
+      ttl,
+    }
+  }
+
+  fn get(&self, key: &str) -> Option<V> {
+    let mut entries =
+      self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+    let (inserted, value) = entries.get(key)?;
+    if inserted.elapsed() < self.ttl {
+      return Some(value.clone());
+    }
+    entries.pop(key);
+    None
+  }
+
+  fn insert(&self, key: String, value: V) {
+    let mut entries =
+      self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+    entries.put(key, (Instant::now(), value));
+  }
+
+  fn invalidate(&self, key: &str) {
+    let mut entries =
+      self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+    entries.pop(key);
+  }
+}
+
 struct RouterInner {
   db:                       Db,
   prober:                   Prober,
@@ -176,8 +216,8 @@ struct RouterInner {
   upstream_filters:         RwLock<HashMap<String, Vec<FilterRule>>>,
   upstream_nar_url_modes:   RwLock<HashMap<String, NarUrlMode>>,
   inflight:                 DashMap<String, Arc<Mutex<()>>>,
-  lru:                      MokaCache<String, Arc<ResolveResult>>,
-  miss_lru:                 MokaCache<String, ()>,
+  lru:                      TtlCache<Arc<ResolveResult>>,
+  miss_lru:                 TtlCache<()>,
   race_semaphore:           Arc<Semaphore>,
   per_upstream_limit:       u32,
   upstream_semaphores:      DashMap<(String, Hop), Arc<Semaphore>>,
@@ -268,14 +308,8 @@ impl Router {
         upstream_filters: RwLock::new(HashMap::new()),
         upstream_nar_url_modes: RwLock::new(HashMap::new()),
         inflight: DashMap::new(),
-        lru: MokaCache::builder()
-          .max_capacity(1024)
-          .time_to_live(route_ttl)
-          .build(),
-        miss_lru: MokaCache::builder()
-          .max_capacity(32_768)
-          .time_to_live(tuning.in_memory_negative_ttl)
-          .build(),
+        lru: TtlCache::new(1024, route_ttl),
+        miss_lru: TtlCache::new(32_768, tuning.in_memory_negative_ttl),
         race_semaphore: Arc::new(Semaphore::new(
           usize::try_from(tuning.max_concurrent_races).unwrap_or(64),
         )),
@@ -491,7 +525,7 @@ impl Router {
 
     let result = self.race(store_hash, candidates, hop).await;
     if hop == Hop::Client && matches!(result, Err(RouterError::NotFound)) {
-      self.inner.miss_lru.insert(store_hash.to_string(), ()).await;
+      self.inner.miss_lru.insert(store_hash.to_string(), ());
       let _ = self
         .inner
         .db
@@ -506,7 +540,7 @@ impl Router {
     store_hash: &str,
     hop: Hop,
   ) -> Result<Option<ResolveResult>, RouterError> {
-    if self.inner.miss_lru.get(store_hash).await.is_some() {
+    if self.inner.miss_lru.get(store_hash).is_some() {
       ncro_metrics::get().narinfo_memory_negative_hits.inc();
       return Err(RouterError::NotFound);
     }
@@ -521,7 +555,7 @@ impl Router {
     store_hash: &str,
     hop: Hop,
   ) -> Result<Option<ResolveResult>, RouterError> {
-    if let Some(cached) = self.inner.lru.get(store_hash).await {
+    if let Some(cached) = self.inner.lru.get(store_hash) {
       let fetched = match self
         .cached_route_filter_check(
           &cached.url,
@@ -534,7 +568,7 @@ impl Router {
         CachedFilterCheck::Cached => None,
         CachedFilterCheck::Fetched(bytes) => Some(bytes),
         CachedFilterCheck::Rejected => {
-          self.inner.lru.invalidate(store_hash).await;
+          self.inner.lru.invalidate(store_hash);
           return Ok(None);
         },
       };
@@ -548,8 +582,7 @@ impl Router {
         self
           .inner
           .lru
-          .insert(store_hash.to_string(), Arc::new(result.clone()))
-          .await;
+          .insert(store_hash.to_string(), Arc::new(result.clone()));
       }
       return Ok(Some(result));
     }
@@ -594,7 +627,7 @@ impl Router {
       narinfo_bytes,
     };
     let arc = Arc::new(result.clone());
-    self.inner.lru.insert(store_hash.to_string(), arc).await;
+    self.inner.lru.insert(store_hash.to_string(), arc);
     Ok(Some(result))
   }
 
@@ -959,8 +992,7 @@ impl Router {
     self
       .inner
       .lru
-      .insert(store_hash.to_string(), Arc::new(result.clone()))
-      .await;
+      .insert(store_hash.to_string(), Arc::new(result.clone()));
     Ok(CommitOutcome::Accepted(result))
   }
 
@@ -1368,7 +1400,6 @@ mod tests {
   use ncro_config::{NarUrlMode, UpstreamConfig};
   use ncro_db::{Db, RouteEntry};
   use ncro_health::Prober;
-  use rand::RngExt;
   use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -1494,8 +1525,7 @@ mod tests {
   }
 
   fn signed_narinfo(key_name: &str) -> (NarInfo, String) {
-    let mut key_bytes = [0_u8; 32];
-    rand::rng().fill(&mut key_bytes);
+    let key_bytes = [7_u8; 32];
     let signing = SigningKey::from_bytes(&key_bytes);
     let mut narinfo = NarInfo {
       store_path: "/nix/store/abc123-test".to_string(),
