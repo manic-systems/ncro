@@ -1,6 +1,5 @@
 use std::{
   env,
-  error::Error,
   fs,
   process::{self, Command},
 };
@@ -11,7 +10,7 @@ fn ncro() -> Command {
 
 #[test]
 fn generate_mesh_key_persists_identity_and_validates_arguments()
--> Result<(), Box<dyn Error>> {
+-> misstep::Result<()> {
   let dir =
     env::temp_dir().join(format!("ncro-mesh-key-cli-{}", process::id()));
   fs::create_dir_all(&dir)?;

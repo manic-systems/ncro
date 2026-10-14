@@ -11,6 +11,7 @@ repository.workspace  = true
 dashmap.workspace      = true
 jiff.workspace         = true
 lru.workspace          = true
+misstep.workspace      = true
 ncro-config.workspace  = true
 ncro-db.workspace      = true
 ncro-health.workspace  = true

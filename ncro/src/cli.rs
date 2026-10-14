@@ -11,7 +11,7 @@ use std::{
   time::Duration,
 };
 
-use misstep::{OptionExt, Report, bail};
+use misstep::{OptionExt, Report, ResultExt, bail};
 use ncro_config::{Config, ListenAddr, LogFormat};
 use ncro_db::{Db, HealthRow};
 use ncro_discovery::Discovery;
@@ -19,6 +19,7 @@ use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
 use pound::Parse;
 use socket2::{Domain, Protocol, Socket, Type};
+use thiserror::Error;
 use tokio::{
   net::TcpListener,
   signal,
@@ -65,28 +66,32 @@ fn inherited_listeners() -> Option<Vec<StdTcpListener>> {
 /// Binds `listen`, or adopts the sockets systemd passed in.
 async fn bind_listeners(
   listen: Option<ListenAddr>,
-) -> io::Result<Vec<TcpListener>> {
+) -> misstep::Result<Vec<TcpListener>> {
   if let Some(inherited) = inherited_listeners() {
     tracing::info!(
       count = inherited.len(),
       "socket activation: using inherited listeners"
     );
-    return inherited.into_iter().map(TcpListener::from_std).collect();
+    return inherited
+      .into_iter()
+      .map(TcpListener::from_std)
+      .collect::<io::Result<_>>()
+      .context("adopt systemd sockets")
+      .erase();
   }
   let Some(listen) = listen else {
-    return Err(io::Error::new(
-      io::ErrorKind::InvalidInput,
-      "server.listen is empty and systemd passed no sockets",
-    ));
+    bail!("server.listen is empty and systemd passed no sockets");
   };
   match listen {
-    ListenAddr::Socket(addr) => Ok(vec![TcpListener::bind(addr).await?]),
+    ListenAddr::Socket(addr) => Ok(vec![bind(addr).await?]),
     ListenAddr::Localhost(port) => {
       let mut listeners =
-        vec![TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?];
-      match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+        vec![bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?];
+      match bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await {
         Ok(listener) => listeners.push(listener),
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => return Err(err),
+        Err(err) if err.source.kind() == io::ErrorKind::AddrInUse => {
+          return Err(err.into());
+        },
         Err(err) => {
           tracing::warn!(error = %err, "IPv6 loopback unavailable, listening on 127.0.0.1 only");
         },
@@ -96,11 +101,13 @@ async fn bind_listeners(
     ListenAddr::Any(port) => {
       match bind_dual_stack(port) {
         Ok(listener) => Ok(vec![listener]),
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => Err(err),
+        Err(err) if err.source.kind() == io::ErrorKind::AddrInUse => {
+          Err(err.into())
+        },
         Err(err) => {
-          tracing::warn!(error = %err, "IPv6 unavailable, listening on 0.0.0.0 only");
+          tracing::warn!(error = %Report::new(err), "IPv6 unavailable, listening on 0.0.0.0 only");
           Ok(vec![
-            TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?,
+            bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))).await?,
           ])
         },
       }
@@ -108,15 +115,32 @@ async fn bind_listeners(
   }
 }
 
+#[derive(Debug, Error)]
+#[error("bind {addr}")]
+struct BindError {
+  addr:   SocketAddr,
+  source: io::Error,
+}
+
+async fn bind(addr: SocketAddr) -> Result<TcpListener, BindError> {
+  TcpListener::bind(addr)
+    .await
+    .map_err(|source| BindError { addr, source })
+}
+
 /// Binds `[::]:port` with `IPV6_V6ONLY` off, so one socket takes IPv4 too.
-fn bind_dual_stack(port: u16) -> io::Result<TcpListener> {
-  let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-  socket.set_only_v6(false)?;
-  socket.set_reuse_address(true)?;
-  socket.set_nonblocking(true)?;
-  socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
-  socket.listen(1024)?;
-  TcpListener::from_std(socket.into())
+fn bind_dual_stack(port: u16) -> Result<TcpListener, BindError> {
+  let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+  let listen = || -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+  };
+  listen().map_err(|source| BindError { addr, source })
 }
 
 /// Sends `READY=1` to the systemd notification socket if `$NOTIFY_SOCKET` is
@@ -441,7 +465,10 @@ async fn flush_health(
   match db.save_health(&rows).await {
     Ok(()) => true,
     Err(err) => {
-      tracing::warn!("health snapshot not persisted, will retry: {err}");
+      tracing::warn!(
+        "health snapshot not persisted, will retry: {}",
+        Report::new(err)
+      );
       pending.extend(rows.into_iter().map(|row| (row.url.clone(), row)));
       false
     },

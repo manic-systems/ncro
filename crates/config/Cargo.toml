@@ -10,6 +10,7 @@ repository.workspace  = true
 [dependencies]
 hex.workspace        = true
 jiff.workspace       = true
+misstep.workspace    = true
 rust-netrc.workspace = true
 serde                = { workspace = true, features = [ "derive" ] }
 thiserror.workspace  = true

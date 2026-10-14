@@ -9,6 +9,7 @@ use std::{
 use dashmap::{DashMap, mapref::entry::Entry};
 use jiff::Timestamp;
 use lru::LruCache;
+use misstep::Report;
 use ncro_config::{
   FilterAction,
   FilterField,
@@ -43,11 +44,11 @@ pub enum RouterError {
   NoCandidates(String),
   #[error("narinfo signature verification failed")]
   SignatureVerificationFailed,
-  #[error("fetch narinfo: {0}")]
+  #[error("fetch narinfo")]
   FetchNarinfo(#[from] reqwest::Error),
-  #[error("S3 request failed: {0}")]
+  #[error(transparent)]
   S3(#[from] S3Error),
-  #[error("parse narinfo: {0}")]
+  #[error("parse narinfo")]
   ParseNarinfo(#[from] NarInfoError),
   #[error(transparent)]
   Db(#[from] DbError),
@@ -55,9 +56,9 @@ pub enum RouterError {
 
 #[derive(Debug, Error)]
 pub enum UpstreamRegistrationError {
-  #[error("invalid upstream public key: {0}")]
+  #[error("invalid upstream public key")]
   PublicKey(#[from] NarInfoError),
-  #[error("build upstream HTTP client: {0}")]
+  #[error("build upstream HTTP client")]
   HttpClient(#[from] reqwest::Error),
 }
 
@@ -708,7 +709,7 @@ impl Router {
                 tracing::warn!(
                   upstream = &winner_url,
                   store = store_hash,
-                  error = %err,
+                  error = %Report::new(err),
                   "narinfo winner could not be committed; trying next candidate"
                 );
                 group_candidates.retain(|url| url != &winner_url);

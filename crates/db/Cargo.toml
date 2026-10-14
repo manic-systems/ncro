@@ -16,7 +16,8 @@ thiserror.workspace = true
 tokio               = { workspace = true, features = [ "fs", "sync" ] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = [ "macros", "rt-multi-thread" ] }
+misstep.workspace = true
+tokio             = { workspace = true, features = [ "macros", "rt-multi-thread" ] }
 
 [lints]
 workspace = true

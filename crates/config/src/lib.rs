@@ -11,6 +11,7 @@ use std::{
 };
 
 use jiff::{SignedDuration, Span, SpanRelativeTo};
+use misstep::Report;
 use netrc::{Error as NetrcError, Netrc};
 use serde::{Deserialize, Deserializer, de};
 use thiserror::Error;
@@ -20,14 +21,14 @@ use url::Url;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-  #[error("read config: {0}")]
-  Read(#[from] io::Error),
-  #[error("read password_file {path:?}: {source}")]
+  #[error("read config {path:?}")]
+  Read { path: String, source: io::Error },
+  #[error("read password_file {path:?}")]
   PasswordFile { path: String, source: io::Error },
-  #[error("read netrc {path:?}: {source}")]
+  #[error("read netrc {path:?}")]
   Netrc { path: PathBuf, source: NetrcError },
-  #[error("parse config: {0}")]
-  Parse(#[from] TomlError),
+  #[error("parse config {path:?}")]
+  Parse { path: String, source: TomlError },
   #[error("{0}")]
   Validation(String),
 }
@@ -201,7 +202,7 @@ fn load_netrc() -> Result<Option<Netrc>, ConfigError> {
   match Netrc::from_file(&path) {
     Ok(nrc) => Ok(Some(nrc)),
     Err(err) => {
-      tracing::warn!("skipping netrc {}: {err}", path.display());
+      tracing::warn!("skipping netrc {}: {}", path.display(), Report::new(err));
       Ok(None)
     },
   }
@@ -312,7 +313,7 @@ mod tests {
 
   static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-  fn test_dir(name: &str) -> Result<PathBuf, ConfigError> {
+  fn test_dir(name: &str) -> misstep::Result<PathBuf> {
     let id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = env::temp_dir()
       .join(format!("ncro-config-{name}-{}-{id}", process::id()));
@@ -321,7 +322,7 @@ mod tests {
   }
 
   #[test]
-  fn loads_defaults() -> Result<(), ConfigError> {
+  fn loads_defaults() -> misstep::Result<()> {
     let cfg = Config::load(None)?;
     assert_eq!(cfg.server.listen, Some(ListenAddr::Localhost(8080)));
     assert_eq!(cfg.cache.max_entries, 100_000);
@@ -346,7 +347,7 @@ mod tests {
   }
 
   #[test]
-  fn parses_upstream_filters() -> Result<(), ConfigError> {
+  fn parses_upstream_filters() -> misstep::Result<()> {
     let cfg: Config = toml::from_str(
       "[[upstreams]]\nurl = \"https://cache.example\"\n\n\
        [[upstreams.filters]]\naction = \"allow\"\nfield = \"name\"\npattern = \"zedless*\"\n\n\
@@ -376,8 +377,7 @@ mod tests {
   }
 
   #[test]
-  fn logging_level_accepts_tracing_filter_directives() -> Result<(), ConfigError>
-  {
+  fn logging_level_accepts_tracing_filter_directives() -> misstep::Result<()> {
     let cfg: Config =
       toml::from_str("[logging]\nlevel = \"ncro=debug,tower_http=warn\"\n")?;
 
@@ -428,7 +428,7 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_custom_endpoint_http() -> Result<(), ConfigError> {
+  fn s3_url_custom_endpoint_http() -> misstep::Result<()> {
     assert_eq!(
       parse_s3_url(
         "s3://my-cache?profile=default&scheme=http&region=us-east-1&\
@@ -442,7 +442,7 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_custom_endpoint_default_scheme() -> Result<(), ConfigError> {
+  fn s3_url_custom_endpoint_default_scheme() -> misstep::Result<()> {
     assert_eq!(
       parse_s3_url("s3://my-cache?endpoint=minio.example.com")?
         .endpoint_url()
@@ -453,7 +453,7 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_custom_endpoint_virtual_addressing() -> Result<(), ConfigError> {
+  fn s3_url_custom_endpoint_virtual_addressing() -> misstep::Result<()> {
     assert!(
       !parse_s3_url(
         "s3://my-cache?endpoint=minio.example.com&addressing-style=virtual"
@@ -464,7 +464,7 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_aws_path_addressing() -> Result<(), ConfigError> {
+  fn s3_url_aws_path_addressing() -> misstep::Result<()> {
     assert!(
       parse_s3_url("s3://my-cache?region=eu-west-1&addressing-style=path")?
         .force_path_style()
@@ -473,7 +473,7 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_aws_auto_uses_path_for_dotted_bucket() -> Result<(), ConfigError> {
+  fn s3_url_aws_auto_uses_path_for_dotted_bucket() -> misstep::Result<()> {
     assert!(parse_s3_url("s3://my.cache?region=eu-west-1")?.force_path_style());
     Ok(())
   }
@@ -486,7 +486,7 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_aws_with_region() -> Result<(), ConfigError> {
+  fn s3_url_aws_with_region() -> misstep::Result<()> {
     assert_eq!(
       parse_s3_url("s3://my-cache?region=eu-west-1")?.region,
       "eu-west-1"
@@ -495,27 +495,27 @@ mod tests {
   }
 
   #[test]
-  fn s3_url_aws_no_params() -> Result<(), ConfigError> {
+  fn s3_url_aws_no_params() -> misstep::Result<()> {
     assert_eq!(parse_s3_url("s3://my-cache")?.region, "us-east-1");
     Ok(())
   }
 
   #[test]
-  fn s3_url_path_becomes_key_prefix() -> Result<(), ConfigError> {
+  fn s3_url_path_becomes_key_prefix() -> misstep::Result<()> {
     let s3 = parse_s3_url("s3://my-cache/nix?endpoint=s3.example.com")?;
     assert_eq!(s3.key_prefix.as_deref(), Some("nix"));
     Ok(())
   }
 
   #[test]
-  fn s3_url_no_path_means_no_key_prefix() -> Result<(), ConfigError> {
+  fn s3_url_no_path_means_no_key_prefix() -> misstep::Result<()> {
     let s3 = parse_s3_url("s3://my-cache?endpoint=s3.example.com")?;
     assert_eq!(s3.key_prefix, None);
     Ok(())
   }
 
   #[test]
-  fn s3_url_multi_segment_path_becomes_key_prefix() -> Result<(), ConfigError> {
+  fn s3_url_multi_segment_path_becomes_key_prefix() -> misstep::Result<()> {
     let s3 = parse_s3_url("s3://my-cache/a/b?endpoint=s3.example.com")?;
     assert_eq!(s3.key_prefix.as_deref(), Some("a/b"));
     Ok(())
@@ -527,7 +527,7 @@ mod tests {
   }
 
   #[test]
-  fn load_parses_s3_upstream() -> Result<(), ConfigError> {
+  fn load_parses_s3_upstream() -> misstep::Result<()> {
     let toml = r#"
 [[upstreams]]
 url = "s3://dcr-nix-cache?profile=default&scheme=http&region=us-east-1&endpoint=s3.example.com"
@@ -540,7 +540,7 @@ priority = 10
   }
 
   #[test]
-  fn load_parses_s3_fallback_cache() -> Result<(), ConfigError> {
+  fn load_parses_s3_fallback_cache() -> misstep::Result<()> {
     let toml = r#"
 [[upstreams]]
 url = "https://cache.example"
@@ -674,7 +674,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   }
 
   #[test]
-  fn password_file_fills_upstream_password() -> Result<(), ConfigError> {
+  fn password_file_fills_upstream_password() -> misstep::Result<()> {
     let dir = test_dir("password-file-fills")?;
     let password_path = dir.join("password");
     let config_path = dir.join("ncro.toml");
@@ -695,8 +695,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   }
 
   #[test]
-  fn password_file_preserves_non_newline_whitespace() -> Result<(), ConfigError>
-  {
+  fn password_file_preserves_non_newline_whitespace() -> misstep::Result<()> {
     let dir = test_dir("password-file-whitespace")?;
     let password_path = dir.join("password");
     let config_path = dir.join("ncro.toml");
@@ -1351,8 +1350,18 @@ impl Config {
   }
 
   fn parse(path: &str) -> Result<Self, ConfigError> {
-    let data = fs::read_to_string(path)?;
-    let mut cfg = toml::from_str::<Self>(&data)?;
+    let data = fs::read_to_string(path).map_err(|source| {
+      ConfigError::Read {
+        path: path.to_owned(),
+        source,
+      }
+    })?;
+    let mut cfg = toml::from_str::<Self>(&data).map_err(|source| {
+      ConfigError::Parse {
+        path: path.to_owned(),
+        source,
+      }
+    })?;
 
     for upstream in &mut cfg.upstreams {
       if upstream.url.starts_with("s3://") {

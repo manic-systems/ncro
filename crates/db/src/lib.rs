@@ -1,6 +1,6 @@
 use std::{
   io,
-  path::Path,
+  path::{Path, PathBuf},
   sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -26,10 +26,12 @@ use tokio::{fs as tokio_fs, sync::Mutex};
 
 #[derive(Debug, Error)]
 pub enum DbError {
-  #[error("sqlite: {0}")]
+  #[error("sqlite")]
   Sqlx(#[from] sqlx::Error),
-  #[error("create database directory: {0}")]
-  CreateDir(#[from] io::Error),
+  #[error("create database directory {path:?}")]
+  CreateDir { path: PathBuf, source: io::Error },
+  #[error("open database {path:?}")]
+  Open { path: String, source: sqlx::Error },
   #[error("invalid stored route data: {0}")]
   InvalidData(String),
 }
@@ -88,7 +90,12 @@ impl Db {
     if path != ":memory:"
       && let Some(parent) = Path::new(path).parent()
     {
-      tokio_fs::create_dir_all(parent).await?;
+      tokio_fs::create_dir_all(parent).await.map_err(|source| {
+        DbError::CreateDir {
+          path: parent.to_owned(),
+          source,
+        }
+      })?;
     }
 
     let options = if path == ":memory:" {
@@ -110,7 +117,13 @@ impl Db {
     let pool = SqlitePoolOptions::new()
       .max_connections(max_conn)
       .connect_with(options)
-      .await?;
+      .await
+      .map_err(|source| {
+        DbError::Open {
+          path: path.to_owned(),
+          source,
+        }
+      })?;
     migrate(&pool).await?;
     Ok(Self {
       pool,
@@ -495,7 +508,6 @@ fn timestamp(value: i64, field: &'static str) -> Result<Timestamp, DbError> {
 mod tests {
   use std::{
     env,
-    error::Error,
     fs,
     iter,
     process,
@@ -571,7 +583,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn concurrent_reads_do_not_deadlock() -> Result<(), Box<dyn Error>> {
+  async fn concurrent_reads_do_not_deadlock() -> misstep::Result<()> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     let now = Timestamp::now();
     let entry = RouteEntry {
@@ -604,8 +616,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn concurrent_file_writes_are_serialized() -> Result<(), Box<dyn Error>>
-  {
+  async fn concurrent_file_writes_are_serialized() -> misstep::Result<()> {
     let path = env::temp_dir()
       .join(format!(
         "ncro-db-concurrent-writes-{}-{}.db",
