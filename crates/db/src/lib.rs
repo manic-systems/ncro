@@ -8,7 +8,7 @@ use std::{
   time::Duration,
 };
 
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use sqlx::{
   ConnectOptions,
   Row,
@@ -40,10 +40,10 @@ pub struct RouteEntry {
   pub upstream_url:     String,
   pub latency_ms:       f64,
   pub latency_ema:      f64,
-  pub last_verified:    DateTime<Utc>,
+  pub last_verified:    Timestamp,
   pub query_count:      u32,
   pub failure_count:    u32,
-  pub ttl:              DateTime<Utc>,
+  pub ttl:              Timestamp,
   pub nar_hash:         String,
   pub nar_size:         u64,
   pub nar_url:          String,
@@ -55,7 +55,7 @@ pub struct RouteEntry {
 impl RouteEntry {
   #[must_use]
   pub fn is_valid(&self) -> bool {
-    Utc::now() < self.ttl
+    Timestamp::now() < self.ttl
   }
 }
 
@@ -151,7 +151,7 @@ impl Db {
                  FROM routes WHERE nar_url = ? AND ttl > ?",
         )
         .bind(nar_url)
-        .bind(Utc::now().timestamp())
+        .bind(Timestamp::now().as_second())
         .fetch_optional(&self.pool)
         .await?;
     row.as_ref().map(row_to_route).transpose()
@@ -187,8 +187,8 @@ impl Db {
         .bind(entry.latency_ema)
         .bind(i64::from(entry.query_count))
         .bind(i64::from(entry.failure_count))
-        .bind(entry.last_verified.timestamp())
-        .bind(entry.ttl.timestamp())
+        .bind(entry.last_verified.as_second())
+        .bind(entry.ttl.as_second())
         .bind(&entry.nar_hash)
         .bind(i64::try_from(entry.nar_size).unwrap_or(i64::MAX))
         .bind(&entry.nar_url)
@@ -209,7 +209,7 @@ impl Db {
   pub async fn expire_old_routes(&self) -> Result<(), DbError> {
     let _guard = self.write_lock.lock().await;
     sqlx::query("DELETE FROM routes WHERE ttl < ?")
-      .bind(Utc::now().timestamp())
+      .bind(Timestamp::now().as_second())
       .execute(&self.pool)
       .await?;
     Ok(())
@@ -227,7 +227,7 @@ impl Db {
                       last_verified, ttl, nar_hash, nar_size, nar_url, upstream_nar_url, narinfo_bytes
                  FROM routes WHERE ttl > ? ORDER BY last_verified DESC LIMIT ?",
         )
-        .bind(Utc::now().timestamp())
+        .bind(Timestamp::now().as_second())
         .bind(n)
         .fetch_all(&self.pool)
         .await?;
@@ -260,7 +260,7 @@ impl Db {
                ON CONFLICT(store_path) DO UPDATE SET expires_at = excluded.expires_at",
         )
         .bind(store_path)
-        .bind((Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default()).timestamp())
+        .bind(Timestamp::now().saturating_add(ttl).unwrap_or(Timestamp::MAX).as_second())
         .execute(&self.pool)
         .await?;
     Ok(())
@@ -276,7 +276,7 @@ impl Db {
          expires_at > ?)",
       )
       .bind(store_path)
-      .bind(Utc::now().timestamp())
+      .bind(Timestamp::now().as_second())
       .fetch_one(&self.pool)
       .await?
       .get::<i64, _>(0)
@@ -290,7 +290,7 @@ impl Db {
   pub async fn expire_negatives(&self) -> Result<(), DbError> {
     let _guard = self.write_lock.lock().await;
     sqlx::query("DELETE FROM negative_cache WHERE expires_at < ?")
-      .bind(Utc::now().timestamp())
+      .bind(Timestamp::now().as_second())
       .execute(&self.pool)
       .await?;
     Ok(())
@@ -485,11 +485,8 @@ fn row_to_route(row: &SqliteRow) -> Result<RouteEntry, DbError> {
   })
 }
 
-fn timestamp(
-  value: i64,
-  field: &'static str,
-) -> Result<DateTime<Utc>, DbError> {
-  Utc.timestamp_opt(value, 0).single().ok_or_else(|| {
+fn timestamp(value: i64, field: &'static str) -> Result<Timestamp, DbError> {
+  Timestamp::from_second(value).map_err(|_| {
     DbError::InvalidData(format!("{field} timestamp out of range: {value}"))
   })
 }
@@ -506,6 +503,7 @@ mod tests {
     time::{SystemTime, UNIX_EPOCH},
   };
 
+  use jiff::SignedDuration;
   use tokio::sync::Barrier;
 
   use super::*;
@@ -515,7 +513,7 @@ mod tests {
   #[tokio::test]
   async fn route_roundtrip_and_negative_cache() -> Result<(), DbError> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let entry = RouteEntry {
       store_path:       "abc123".into(),
       upstream_url:     "https://cache.nixos.org".into(),
@@ -524,7 +522,7 @@ mod tests {
       last_verified:    now,
       query_count:      1,
       failure_count:    0,
-      ttl:              now + chrono::Duration::hours(1),
+      ttl:              now + SignedDuration::from_hours(1),
       nar_hash:         "sha256:abc".into(),
       nar_size:         42,
       nar_url:          "nar/abc.nar.xz".into(),
@@ -546,7 +544,7 @@ mod tests {
   #[tokio::test]
   async fn narinfo_bytes_roundtrip() -> Result<(), DbError> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let bytes = b"StorePath: /nix/store/abc\n".to_vec();
     let entry = RouteEntry {
       store_path:       "abc".into(),
@@ -556,7 +554,7 @@ mod tests {
       last_verified:    now,
       query_count:      1,
       failure_count:    0,
-      ttl:              now + chrono::Duration::hours(1),
+      ttl:              now + SignedDuration::from_hours(1),
       nar_hash:         "sha256:abc".into(),
       nar_size:         26,
       nar_url:          "nar/abc.nar".into(),
@@ -575,7 +573,7 @@ mod tests {
   #[tokio::test]
   async fn concurrent_reads_do_not_deadlock() -> Result<(), Box<dyn Error>> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let entry = RouteEntry {
       store_path:       "aaa".into(),
       upstream_url:     "https://cache.nixos.org".into(),
@@ -584,7 +582,7 @@ mod tests {
       last_verified:    now,
       query_count:      1,
       failure_count:    0,
-      ttl:              now + chrono::Duration::hours(1),
+      ttl:              now + SignedDuration::from_hours(1),
       nar_hash:         "sha256:x".into(),
       nar_size:         1,
       nar_url:          "nar/x.nar".into(),
@@ -625,7 +623,7 @@ mod tests {
         let db = Arc::clone(&db);
         let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
-          let now = Utc::now();
+          let now = Timestamp::now();
           let entry = RouteEntry {
             store_path:       format!("hash{i}"),
             upstream_url:     "https://cache.nixos.org".into(),
@@ -634,7 +632,7 @@ mod tests {
             last_verified:    now,
             query_count:      1,
             failure_count:    0,
-            ttl:              now + chrono::Duration::hours(1),
+            ttl:              now + SignedDuration::from_hours(1),
             nar_hash:         format!("sha256:{i}"),
             nar_size:         1,
             nar_url:          format!("nar/{i}.nar"),
@@ -671,7 +669,7 @@ mod tests {
 
   #[test]
   fn expired_route_is_not_valid() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let entry = RouteEntry {
       store_path:       "abc".into(),
       upstream_url:     "https://cache.nixos.org".into(),
@@ -680,7 +678,7 @@ mod tests {
       last_verified:    now,
       query_count:      1,
       failure_count:    0,
-      ttl:              now - chrono::Duration::seconds(1),
+      ttl:              now - SignedDuration::from_secs(1),
       nar_hash:         "sha256:abc".into(),
       nar_size:         1,
       nar_url:          "nar/abc.nar".into(),
@@ -689,7 +687,7 @@ mod tests {
     };
     assert!(!entry.is_valid());
     let fresh = RouteEntry {
-      ttl: now + chrono::Duration::hours(1),
+      ttl: now + SignedDuration::from_hours(1),
       ..entry
     };
     assert!(fresh.is_valid());
@@ -698,7 +696,7 @@ mod tests {
   #[tokio::test]
   async fn get_route_by_nar_url_rejects_expired_ttl() -> Result<(), DbError> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let entry = RouteEntry {
       store_path:       "exp".into(),
       upstream_url:     "https://cache.nixos.org".into(),
@@ -707,7 +705,7 @@ mod tests {
       last_verified:    now,
       query_count:      1,
       failure_count:    0,
-      ttl:              now - chrono::Duration::seconds(1),
+      ttl:              now - SignedDuration::from_secs(1),
       nar_hash:         "sha256:exp".into(),
       nar_size:         1,
       nar_url:          "nar/exp.nar".into(),
@@ -725,7 +723,7 @@ mod tests {
   #[tokio::test]
   async fn expire_old_routes_removes_stale_entries() -> Result<(), DbError> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let expired = RouteEntry {
       store_path:       "stale".into(),
       upstream_url:     "https://cache.nixos.org".into(),
@@ -734,7 +732,7 @@ mod tests {
       last_verified:    now,
       query_count:      1,
       failure_count:    0,
-      ttl:              now - chrono::Duration::seconds(1),
+      ttl:              now - SignedDuration::from_secs(1),
       nar_hash:         "sha256:stale".into(),
       nar_size:         1,
       nar_url:          "nar/stale.nar".into(),
@@ -746,7 +744,7 @@ mod tests {
       nar_hash: "sha256:fresh".into(),
       nar_url: "nar/fresh.nar".into(),
       upstream_nar_url: "nar/fresh.nar".into(),
-      ttl: now + chrono::Duration::hours(1),
+      ttl: now + SignedDuration::from_hours(1),
       ..expired.clone()
     };
     db.set_route(&expired).await?;
@@ -763,7 +761,7 @@ mod tests {
   async fn eviction_bounds_table_size() -> Result<(), DbError> {
     let max: i64 = 3;
     let db = Db::open(":memory:", max, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     // 100 writes triggers eviction at write #100 (count 99 mod 100 == 99)
     for i in 0..100u64 {
       let entry = RouteEntry {
@@ -774,7 +772,7 @@ mod tests {
         last_verified:    now,
         query_count:      1,
         failure_count:    0,
-        ttl:              now + chrono::Duration::hours(1),
+        ttl:              now + SignedDuration::from_hours(1),
         nar_hash:         format!("sha256:{i}"),
         nar_size:         1,
         nar_url:          format!("nar/{i}.nar"),
@@ -793,7 +791,7 @@ mod tests {
   #[tokio::test]
   async fn eviction_is_throttled() -> Result<(), DbError> {
     let db = Db::open(":memory:", 2, SLOW_STATEMENT_THRESHOLD).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     for i in 0..3u64 {
       let entry = RouteEntry {
         store_path:       format!("hash{i}"),
@@ -803,7 +801,7 @@ mod tests {
         last_verified:    now,
         query_count:      1,
         failure_count:    0,
-        ttl:              now + chrono::Duration::hours(1),
+        ttl:              now + SignedDuration::from_hours(1),
         nar_hash:         format!("sha256:{i}"),
         nar_size:         1,
         nar_url:          format!("nar/{i}.nar"),

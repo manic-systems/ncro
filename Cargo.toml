@@ -29,12 +29,11 @@ ncro-server    = { path = "./crates/server", version = "2.4.0" }
 axum               = "0.8.9"
 base64             = "0.23.1"
 bytes              = "1.12.1"
-chrono             = "0.4.45"
 dashmap            = "6.2.1"
 ed25519-dalek      = "3.0.0"
 futures-util       = "0.3.34"
 hex                = "0.4.3"
-humantime-serde    = "1.1.1"
+jiff               = { version = "0.2.38", default-features = false, features = [ "std" ] }
 log                = "0.4.34"
 mdns-sd            = "0.21.0"
 misstep            = "0.4.1"

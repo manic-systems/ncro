@@ -8,9 +8,9 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-chrono.workspace    = true
 ed25519-dalek       = { workspace = true, features = [ "rand_core" ] }
 hex.workspace       = true
+jiff.workspace      = true
 ncro-db.workspace   = true
 rand.workspace      = true
 rmp-serde.workspace = true
