@@ -4,7 +4,7 @@ use std::{
   time::{Duration, Instant},
 };
 
-use mdns_sd::{ServiceDaemon, ServiceEvent};
+use mdns_sd::{Error as MdnsError, ServiceDaemon, ServiceEvent};
 use ncro_config::{AddressFamily, DiscoveryConfig};
 use ncro_health::Prober;
 use tokio::{
@@ -88,7 +88,7 @@ impl Discovery {
   /// # Errors
   ///
   /// Returns an error if the mDNS service daemon cannot be created.
-  pub fn new(cfg: DiscoveryConfig, prober: Prober) -> anyhow::Result<Self> {
+  pub fn new(cfg: DiscoveryConfig, prober: Prober) -> Result<Self, MdnsError> {
     Ok(Self {
       cfg,
       prober,
@@ -102,7 +102,7 @@ impl Discovery {
   pub async fn run(
     self,
     mut stop: watch::Receiver<bool>,
-  ) -> anyhow::Result<()> {
+  ) -> Result<(), MdnsError> {
     let service = format!(
       "{}.{}.",
       self.cfg.service_name.trim_end_matches('.'),

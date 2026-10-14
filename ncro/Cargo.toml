@@ -9,9 +9,9 @@ repository.workspace  = true
 readme.workspace      = true
 
 [dependencies]
-anyhow.workspace   = true
 axum.workspace     = true
 hex.workspace      = true
+misstep            = { workspace = true, features = [ "color", "location", "panic-hook" ] }
 pound.workspace    = true
 socket2.workspace  = true
 tokio              = { workspace = true, features = [ "macros", "rt-multi-thread", "signal", "time", "net", "fs" ] }
