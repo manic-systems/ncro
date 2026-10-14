@@ -23,6 +23,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
+use misstep::Report;
 use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
@@ -474,7 +475,7 @@ async fn narinfo(
       (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
     },
     Err(err) => {
-      tracing::warn!(hash, error = %err, "narinfo resolve failed");
+      tracing::warn!(hash, error = %Report::new(err), "narinfo resolve failed");
       ncro_metrics::get()
         .narinfo_requests
         .with_label_values(&["error"])
@@ -825,7 +826,7 @@ async fn try_fallback_narinfo(
       Some(StatusCode::NOT_FOUND.into_response())
     },
     Err(err) => {
-      tracing::warn!(hash, upstream = fallback.url, error = %err, "fallback cache failed");
+      tracing::warn!(hash, upstream = fallback.url, error = %Report::new(err), "fallback cache failed");
       None
     },
   }
@@ -932,7 +933,7 @@ async fn proxy(
   match upstream_request(client, method, headers, url, auth, Some(hop)).await {
     Ok(resp) => response_from_reqwest(resp),
     Err(err) => {
-      tracing::warn!(error = %err, "upstream request failed");
+      tracing::warn!(error = %Report::new(err), "upstream request failed");
       (StatusCode::BAD_GATEWAY, "upstream error").into_response()
     },
   }

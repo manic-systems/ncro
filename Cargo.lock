@@ -1916,6 +1916,7 @@ dependencies = [
  "ncro-server",
  "pound",
  "socket2",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1927,6 +1928,7 @@ version = "2.4.0"
 dependencies = [
  "hex",
  "jiff",
+ "misstep",
  "rust-netrc",
  "serde",
  "thiserror 2.0.21",
@@ -1942,6 +1944,7 @@ version = "2.4.0"
 dependencies = [
  "jiff",
  "log",
+ "misstep",
  "serde",
  "sqlx",
  "thiserror 2.0.21",
@@ -1963,6 +1966,7 @@ dependencies = [
 name = "ncro-health"
 version = "2.4.0"
 dependencies = [
+ "misstep",
  "ncro-config",
  "ncro-s3",
  "reqwest",
@@ -1979,6 +1983,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "jiff",
+ "misstep",
  "ncro-db",
  "rmp-serde",
  "serde",
@@ -2013,6 +2018,7 @@ dependencies = [
  "ed25519-dalek",
  "jiff",
  "lru",
+ "misstep",
  "ncro-config",
  "ncro-db",
  "ncro-health",
@@ -2036,6 +2042,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures-util",
+ "misstep",
  "ncro-config",
  "thiserror 2.0.21",
 ]
@@ -2047,6 +2054,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "misstep",
  "ncro-config",
  "ncro-db",
  "ncro-health",

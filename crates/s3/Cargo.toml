@@ -14,6 +14,7 @@ aws-smithy-http-client.workspace = true
 bytes.workspace                  = true
 dashmap.workspace                = true
 futures-util.workspace           = true
+misstep.workspace                = true
 ncro-config.workspace            = true
 thiserror.workspace              = true
 

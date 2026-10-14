@@ -6,6 +6,7 @@ use std::{
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use jiff::Timestamp;
+use misstep::Report;
 use ncro_db::{Db, RouteEntry};
 use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
 use serde::{Deserialize, Serialize};
@@ -26,19 +27,25 @@ type DecodedPacket<'a> = (&'a [u8], &'a [u8], &'a [u8], Message);
 
 #[derive(Debug, Error)]
 pub enum MeshError {
-  #[error("io: {0}")]
-  Io(#[from] io::Error),
-  #[error("msgpack: {0}")]
+  #[error("read mesh key {path:?}")]
+  ReadKey { path: PathBuf, source: io::Error },
+  #[error("write mesh key {path:?}")]
+  WriteKey { path: PathBuf, source: io::Error },
+  #[error("bind mesh socket {addr}")]
+  Bind { addr: String, source: io::Error },
+  #[error("send to mesh peer {addr}")]
+  Send { addr: String, source: io::Error },
+  #[error("encode msgpack")]
   Encode(#[from] EncodeError),
-  #[error("decode msgpack: {0}")]
+  #[error("decode msgpack")]
   Decode(#[from] DecodeError),
   #[error("packet too short: {0} bytes")]
   PacketTooShort(usize),
   #[error("invalid signature")]
   InvalidSignature,
-  #[error("invalid key file size {got}, want 32 or 64 bytes")]
-  InvalidKeyFileSize { got: usize },
-  #[error("read system entropy: {0}")]
+  #[error("mesh key {path:?} is {got} bytes, want 32 or 64")]
+  InvalidKeyFileSize { path: PathBuf, got: usize },
+  #[error("read system entropy")]
   Entropy(#[from] getrandom::Error),
 }
 
@@ -71,10 +78,14 @@ impl Node {
         signing_key: Arc::new(SigningKey::from_bytes(&random_key_bytes()?)),
       });
     }
-    match fs::read(key_path).await {
+    let path = Path::new(key_path);
+    match fs::read(path).await {
       Ok(data) => {
         if data.len() != 32 && data.len() != 64 {
-          return Err(MeshError::InvalidKeyFileSize { got: data.len() });
+          return Err(MeshError::InvalidKeyFileSize {
+            path: path.to_owned(),
+            got:  data.len(),
+          });
         }
         let bytes = <[u8; 32]>::try_from(&data[..32])
           .map_err(|_| MeshError::InvalidSignature)?;
@@ -83,15 +94,15 @@ impl Node {
         });
       },
       Err(err) if err.kind() == ErrorKind::NotFound => {},
-      Err(err) => return Err(MeshError::Io(err)),
-    }
-    if let Some(parent) = Path::new(key_path).parent()
-      && !parent.as_os_str().is_empty()
-    {
-      fs::create_dir_all(parent).await?;
+      Err(source) => {
+        return Err(MeshError::ReadKey {
+          path: path.to_owned(),
+          source,
+        });
+      },
     }
     let key = SigningKey::from_bytes(&random_key_bytes()?);
-    write_new_key(Path::new(key_path), &key.to_bytes()).await?;
+    write_new_key(path, &key.to_bytes()).await?;
     Ok(Self {
       signing_key: Arc::new(key),
     })
@@ -121,6 +132,17 @@ async fn write_new_key(
   key_path: &Path,
   key_bytes: &[u8; 32],
 ) -> Result<(), MeshError> {
+  let write_error = |source| {
+    MeshError::WriteKey {
+      path: key_path.to_owned(),
+      source,
+    }
+  };
+  if let Some(parent) = key_path.parent()
+    && !parent.as_os_str().is_empty()
+  {
+    fs::create_dir_all(parent).await.map_err(write_error)?;
+  }
   let temp_path = temporary_key_path(key_path)?;
   let mut options = OpenOptions::new();
   options.write(true).create_new(true);
@@ -128,7 +150,7 @@ async fn write_new_key(
   {
     options.mode(0o600);
   }
-  let mut file = options.open(&temp_path).await?;
+  let mut file = options.open(&temp_path).await.map_err(write_error)?;
   let write_result = async {
     file.write_all(key_bytes).await?;
     file.sync_all().await?;
@@ -137,8 +159,8 @@ async fn write_new_key(
   .await;
   drop(file);
   let cleanup_result = fs::remove_file(temp_path).await;
-  write_result?;
-  Ok(cleanup_result?)
+  write_result.map_err(write_error)?;
+  cleanup_result.map_err(write_error)
 }
 
 fn temporary_key_path(key_path: &Path) -> Result<PathBuf, MeshError> {
@@ -177,7 +199,12 @@ pub async fn listen_and_serve(
   allowed_keys: Vec<[u8; 32]>,
   stop: watch::Receiver<bool>,
 ) -> Result<(), MeshError> {
-  let socket = UdpSocket::bind(addr).await?;
+  let socket = UdpSocket::bind(addr).await.map_err(|source| {
+    MeshError::Bind {
+      addr: addr.to_owned(),
+      source,
+    }
+  })?;
   tokio::spawn(async move {
     let mut stop = stop;
     let mut buf = vec![0; MAX_PACKET_SIZE];
@@ -206,7 +233,7 @@ pub async fn listen_and_serve(
                           merge_routes(&db, msg.routes).await;
                       }
                   }
-                  Err(err) => tracing::warn!(?src, error = %err, "mesh: malformed packet"),
+                  Err(err) => tracing::warn!(?src, error = %Report::new(err), "mesh: malformed packet"),
               }
           }
       }
@@ -231,12 +258,12 @@ async fn merge_routes(db: &Db, incoming: Vec<RouteEntry>) {
       },
       Ok(_) => true,
       Err(err) => {
-        tracing::warn!(error = %err, store = route.store_path, "mesh: route lookup failed");
+        tracing::warn!(error = %Report::new(err), store = route.store_path, "mesh: route lookup failed");
         false
       },
     };
     if should_set && let Err(err) = db.set_route(&route).await {
-      tracing::warn!(error = %err, store = route.store_path, "mesh: route merge failed");
+      tracing::warn!(error = %Report::new(err), store = route.store_path, "mesh: route merge failed");
     }
   }
 }
@@ -258,8 +285,17 @@ pub async fn announce(
     routes,
   };
   let packet = encode_packet(node, &msg)?;
-  let socket = UdpSocket::bind("0.0.0.0:0").await?;
-  socket.send_to(&packet, peer_addr).await?;
+  let send_error = |source| {
+    MeshError::Send {
+      addr: peer_addr.to_owned(),
+      source,
+    }
+  };
+  let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(send_error)?;
+  socket
+    .send_to(&packet, peer_addr)
+    .await
+    .map_err(send_error)?;
   Ok(())
 }
 
@@ -312,12 +348,12 @@ fn decode_packet(packet: &[u8]) -> Result<DecodedPacket<'_>, MeshError> {
 mod tests {
   use std::{
     env,
-    error::Error,
     process,
     time::{Duration, SystemTime, UNIX_EPOCH},
   };
 
   use jiff::{SignedDuration, Timestamp};
+  use misstep::OptionExt;
   use ncro_db::{Db, RouteEntry};
   use tokio::fs;
 
@@ -326,8 +362,7 @@ mod tests {
   const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
 
   #[tokio::test]
-  async fn node_generates_and_reloads_private_key() -> Result<(), Box<dyn Error>>
-  {
+  async fn node_generates_and_reloads_private_key() -> misstep::Result<()> {
     let path = env::temp_dir().join(format!(
       "ncro-mesh-key-{}-{}",
       process::id(),
@@ -371,7 +406,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_inserts_new_route() -> Result<(), Box<dyn Error>> {
+  async fn merge_routes_inserts_new_route() -> misstep::Result<()> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     merge_routes(&db, vec![route("abc123", 10.0, 3600)]).await;
     assert!(db.get_route("abc123").await?.is_some());
@@ -379,7 +414,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_skips_expired_route() -> Result<(), Box<dyn Error>> {
+  async fn merge_routes_skips_expired_route() -> misstep::Result<()> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     merge_routes(&db, vec![route("abc123", 10.0, -1)]).await;
     assert!(db.get_route("abc123").await?.is_none());
@@ -387,15 +422,15 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_does_not_overwrite_lower_latency()
-  -> Result<(), Box<dyn Error>> {
+  async fn merge_routes_does_not_overwrite_lower_latency() -> misstep::Result<()>
+  {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     db.set_route(&route("abc123", 5.0, 3600)).await?;
     merge_routes(&db, vec![route("abc123", 20.0, 3600)]).await;
     let got = db
       .get_route("abc123")
       .await?
-      .ok_or("expected route in db")?;
+      .context("expected route in db")?;
     assert!(
       (got.latency_ema - 5.0).abs() < f64::EPSILON,
       "worse incoming must not overwrite better existing: got {}",
@@ -405,15 +440,14 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn merge_routes_overwrites_higher_latency() -> Result<(), Box<dyn Error>>
-  {
+  async fn merge_routes_overwrites_higher_latency() -> misstep::Result<()> {
     let db = Db::open(":memory:", 100, SLOW_STATEMENT_THRESHOLD).await?;
     db.set_route(&route("abc123", 20.0, 3600)).await?;
     merge_routes(&db, vec![route("abc123", 5.0, 3600)]).await;
     let got = db
       .get_route("abc123")
       .await?
-      .ok_or("expected route in db")?;
+      .context("expected route in db")?;
     assert!(
       (got.latency_ema - 5.0).abs() < f64::EPSILON,
       "better incoming must overwrite worse existing: got {}",

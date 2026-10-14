@@ -417,12 +417,12 @@ const fn compute_status(consecutive_fails: u32) -> Status {
 
 #[cfg(test)]
 mod tests {
-  use std::error::Error;
+  use misstep::OptionExt;
 
   use super::*;
 
   #[tokio::test]
-  async fn ema_and_status_progression() -> Result<(), Box<dyn Error>> {
+  async fn ema_and_status_progression() -> misstep::Result<()> {
     let p = Prober::new(0.3)?;
     p.add_upstream("https://example.com".into(), 1).await;
     p.record_latency("https://example.com", 100.0).await;
@@ -430,7 +430,7 @@ mod tests {
     let h = p
       .get_health("https://example.com")
       .await
-      .ok_or("missing health")?;
+      .context("missing health")?;
     assert!((84.0..=86.0).contains(&h.ema_latency));
     for _ in 0..10 {
       p.record_failure("https://example.com").await;
@@ -438,7 +438,7 @@ mod tests {
     assert_eq!(
       p.get_health("https://example.com")
         .await
-        .ok_or("missing health")?
+        .context("missing health")?
         .status,
       Status::Down
     );
@@ -467,11 +467,14 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn first_record_latency_sets_exact_ema() -> Result<(), Box<dyn Error>> {
+  async fn first_record_latency_sets_exact_ema() -> misstep::Result<()> {
     let p = Prober::new(0.3)?;
     p.add_upstream("https://example.com".into(), 1).await;
     p.record_latency("https://example.com", 42.0).await;
-    let h = p.get_health("https://example.com").await.ok_or("missing")?;
+    let h = p
+      .get_health("https://example.com")
+      .await
+      .context("missing")?;
     assert!(
       (h.ema_latency - 42.0).abs() < f64::EPSILON,
       "first sample must be exact, not alpha-weighted: got {}",
@@ -482,8 +485,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn record_latency_resets_consecutive_fails()
-  -> Result<(), Box<dyn Error>> {
+  async fn record_latency_resets_consecutive_fails() -> misstep::Result<()> {
     let p = Prober::new(0.3)?;
     p.add_upstream("https://example.com".into(), 1).await;
     for _ in 0..5 {
@@ -492,19 +494,22 @@ mod tests {
     assert_eq!(
       p.get_health("https://example.com")
         .await
-        .ok_or("missing")?
+        .context("missing")?
         .status,
       Status::Degraded
     );
     p.record_latency("https://example.com", 10.0).await;
-    let h = p.get_health("https://example.com").await.ok_or("missing")?;
+    let h = p
+      .get_health("https://example.com")
+      .await
+      .context("missing")?;
     assert_eq!(h.consecutive_fails, 0);
     assert_eq!(h.status, Status::Active);
     Ok(())
   }
 
   #[tokio::test]
-  async fn sorted_by_latency_down_goes_last() -> Result<(), Box<dyn Error>> {
+  async fn sorted_by_latency_down_goes_last() -> misstep::Result<()> {
     use ncro_config::UpstreamConfig;
     let p = Prober::new(0.3)?;
     p.init_upstreams(&[
@@ -525,14 +530,14 @@ mod tests {
     p.seed("https://fast.com", 10.0, 0, 5).await;
     p.seed("https://down.com", 5.0, 10, 5).await; // faster but Down
     let sorted = p.sorted_by_latency().await;
-    let last = sorted.last().ok_or("sorted list must not be empty")?;
+    let last = sorted.last().context("sorted list must not be empty")?;
     assert_eq!(last.url, "https://down.com");
     Ok(())
   }
 
   #[tokio::test]
   async fn sorted_by_latency_priority_within_10pct_window()
-  -> Result<(), Box<dyn Error>> {
+  -> misstep::Result<()> {
     use ncro_config::UpstreamConfig;
     let p = Prober::new(0.3)?;
     p.init_upstreams(&[

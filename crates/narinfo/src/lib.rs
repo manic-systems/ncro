@@ -29,20 +29,20 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum NarInfoError {
-  #[error("read narinfo: {0}")]
+  #[error("read narinfo")]
   Io(#[from] io::Error),
   #[error("malformed line: {0:?}")]
   MalformedLine(String),
   #[error("missing StorePath")]
   MissingStorePath,
-  #[error("{field}: {source}")]
+  #[error("invalid {field}")]
   ParseInt {
     field:  &'static str,
     source: ParseIntError,
   },
   #[error("invalid public key {input:?}: missing ':'")]
   MissingPublicKeySeparator { input: String },
-  #[error("invalid public key {input:?}: {source}")]
+  #[error("invalid public key {input:?}")]
   InvalidPublicKeyBase64 { input: String, source: DecodeError },
   #[error("invalid public key size {got}, want 32")]
   InvalidPublicKeySize { got: usize },

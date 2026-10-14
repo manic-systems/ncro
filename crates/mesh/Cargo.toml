@@ -12,6 +12,7 @@ ed25519-dalek.workspace = true
 getrandom.workspace     = true
 hex.workspace           = true
 jiff.workspace          = true
+misstep.workspace       = true
 ncro-db.workspace       = true
 rmp-serde.workspace     = true
 serde                   = { workspace = true, features = [ "derive" ] }

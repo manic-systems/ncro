@@ -11,6 +11,7 @@ repository.workspace  = true
 axum                   = { workspace = true, features = [ "macros" ] }
 bytes.workspace        = true
 futures-util.workspace = true
+misstep.workspace      = true
 ncro-config.workspace  = true
 ncro-db.workspace      = true
 ncro-health.workspace  = true
@@ -24,7 +25,7 @@ serde                  = { workspace = true, features = [ "derive" ] }
 tokio.workspace        = true
 tower-http.workspace   = true
 tracing.workspace      = true
-url.workspace           = true
+url.workspace          = true
 
 [lints]
 workspace = true
