@@ -39,7 +39,7 @@ humantime-serde    = "1.1.1"
 log                = "0.4.34"
 mdns-sd            = "0.21.0"
 moka               = { version = "0.12.16", features = [ "future" ] }
-pound              = "0.1.6"
+pound              = "0.2.0"
 prometheus         = "0.14.0"
 rand               = "0.10.2"
 reqwest            = { version = "0.13.4", default-features = false }
