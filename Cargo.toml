@@ -9,7 +9,7 @@ homepage     = "https://github.com/feel-co/ncro"
 license      = "EUPL-1.2"
 readme       = "./README.md"
 repository   = "https://github.com/feel-co/ncro"
-rust-version = "1.90.0"
+rust-version = "1.95.0"
 version      = "2.4.0"
 
 [workspace.dependencies]
@@ -26,7 +26,6 @@ ncro-s3        = { path = "./crates/s3", version = "2.4.0" }
 ncro-server    = { path = "./crates/server", version = "2.4.0" }
 
 # Other deps
-anyhow             = "1.0.104"
 axum               = "0.8.9"
 base64             = "0.23.1"
 bytes              = "1.12.1"
@@ -38,6 +37,7 @@ hex                = "0.4.3"
 humantime-serde    = "1.1.1"
 log                = "0.4.34"
 mdns-sd            = "0.21.0"
+misstep            = "0.4.1"
 moka               = { version = "0.12.16", features = [ "future" ] }
 pound              = "0.2.0"
 prometheus         = "0.14.0"

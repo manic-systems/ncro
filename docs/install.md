@@ -63,7 +63,7 @@ releases are made when a version gets tagged, and are available under
 
 Additionally, you may get ncro from source via `cargo install` using
 `cargo install --git https://github.com/feel-co/ncro --locked` or you may check
-out to the repository, and use Cargo to build it. You'll need Rust 1.90 or
+out to the repository, and use Cargo to build it. You'll need Rust 1.95 or
 above. Most distributions should package this version already. You may, of
 course, prefer to package the built releases if you'd like.
 

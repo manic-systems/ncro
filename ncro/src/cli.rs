@@ -11,6 +11,7 @@ use std::{
   time::Duration,
 };
 
+use misstep::{OptionExt, Report, bail};
 use ncro_config::{Config, ListenAddr, LogFormat};
 use ncro_db::{Db, HealthRow};
 use ncro_discovery::Discovery;
@@ -170,26 +171,25 @@ enum Command {
 }
 
 impl TryFrom<Args> for Command {
-  type Error = anyhow::Error;
+  type Error = Report;
 
   fn try_from(args: Args) -> Result<Self, Self::Error> {
     let config = args.config.filter(|path| !path.is_empty());
 
     if let Some(path) = args.generate_mesh_key {
       if config.is_some() || args.check {
-        anyhow::bail!(
+        bail!(
           "--generate-mesh-key cannot be combined with --config or --check"
         );
       }
       if path.is_empty() {
-        anyhow::bail!("--generate-mesh-key requires a non-empty path");
+        bail!("--generate-mesh-key requires a non-empty path");
       }
       return Ok(Self::GenerateMeshKey { path });
     }
 
     if args.check {
-      let config =
-        config.ok_or_else(|| anyhow::anyhow!("--check requires --config"))?;
+      let config = config.context("--check requires --config")?;
       return Ok(Self::Check { config });
     }
 
@@ -197,7 +197,7 @@ impl TryFrom<Args> for Command {
   }
 }
 
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run() -> misstep::Result<()> {
   match Command::try_from(Args::parse())? {
     Command::Serve { config } => serve(config.as_deref()).await,
     Command::Check { config } => {
@@ -212,7 +212,7 @@ pub async fn run() -> anyhow::Result<()> {
   }
 }
 
-async fn serve(config: Option<&str>) -> anyhow::Result<()> {
+async fn serve(config: Option<&str>) -> misstep::Result<()> {
   // Config loading happens before we know the configured log level/format, so
   // buffer any diagnostics it emits and replay them once logging is set up.
   let buffer = BufferLayer::default();
@@ -423,7 +423,7 @@ async fn serve(config: Option<&str>) -> anyhow::Result<()> {
     while let Some(joined) = servers.join_next().await {
       joined??;
     }
-    anyhow::Ok(())
+    Ok::<_, Report>(())
   }
   .await;
   drop(servers);
