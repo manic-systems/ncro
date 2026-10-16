@@ -12,19 +12,19 @@ use aws_smithy_http_client::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
+use flub::Error;
 use futures_util::{Stream, stream};
-use misstep::Report;
+use misstep::{Report, ReportError};
 use ncro_config::S3Config;
-use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum S3Error {
   #[error("unknown S3 upstream {0:?}")]
   UnknownUpstream(String),
-  #[error("S3 request failed: {0}")]
-  Request(String),
-  #[error("read S3 object body: {0}")]
-  Body(String),
+  #[error("S3 request failed")]
+  Request(#[source] ReportError),
+  #[error("read S3 object body")]
+  Body(#[source] ReportError),
 }
 
 pub struct S3Object {
@@ -108,7 +108,7 @@ impl S3ClientPool {
         }))
       },
       Err(err) if is_not_found(&err) => Ok(None),
-      Err(err) => Err(S3Error::Request(Report::new(err).to_string())),
+      Err(err) => Err(S3Error::Request(Report::new(err).into())),
     }
   }
 
@@ -129,7 +129,7 @@ impl S3ClientPool {
       .body
       .collect()
       .await
-      .map_err(|err| S3Error::Body(Report::new(err).to_string()))?
+      .map_err(|err| S3Error::Body(Report::new(err).into()))?
       .into_bytes();
     Ok(Some(bytes.to_vec()))
   }
@@ -166,7 +166,7 @@ impl S3ClientPool {
         }))
       },
       Err(err) if is_not_found(&err) => Ok(None),
-      Err(err) => Err(S3Error::Request(Report::new(err).to_string())),
+      Err(err) => Err(S3Error::Request(Report::new(err).into())),
     }
   }
 

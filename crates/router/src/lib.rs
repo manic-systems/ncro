@@ -7,6 +7,7 @@ use std::{
 };
 
 use dashmap::{DashMap, mapref::entry::Entry};
+use flub::Error;
 use jiff::Timestamp;
 use lru::LruCache;
 use misstep::Report;
@@ -27,7 +28,6 @@ use reqwest::{
   header::{HeaderMap, HeaderName, HeaderValue},
 };
 use rustls::crypto::ring;
-use thiserror::Error;
 use tokio::{
   sync::{Mutex, RwLock, Semaphore},
   task::JoinSet,

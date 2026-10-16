@@ -10,11 +10,11 @@ use std::{
   time::Duration,
 };
 
+use flub::Error;
 use jiff::{SignedDuration, Span, SpanRelativeTo};
 use misstep::Report;
 use netrc::{Error as NetrcError, Netrc};
 use serde::{Deserialize, Deserializer, de};
-use thiserror::Error;
 use toml::de::Error as TomlError;
 use tracing_subscriber::EnvFilter;
 use url::Url;

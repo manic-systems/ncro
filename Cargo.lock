@@ -1119,6 +1119,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "flub"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dafd7b8315f0512f6cc3ce477bd02462188dabf194c678d3bb8dd803a20db27"
+dependencies = [
+ "flub-derive",
+]
+
+[[package]]
+name = "flub-derive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0c21917c538f4d0ad7e7e0019ed0ce3a287c0573a29ced48fbc641cf93ae245"
+
+[[package]]
 name = "flume"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1904,6 +1919,7 @@ name = "ncro"
 version = "2.4.0"
 dependencies = [
  "axum",
+ "flub",
  "hex",
  "misstep",
  "ncro-config",
@@ -1916,7 +1932,6 @@ dependencies = [
  "ncro-server",
  "pound",
  "socket2",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1926,12 +1941,12 @@ dependencies = [
 name = "ncro-config"
 version = "2.4.0"
 dependencies = [
+ "flub",
  "hex",
  "jiff",
  "misstep",
  "rust-netrc",
  "serde",
- "thiserror 2.0.21",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -1942,12 +1957,12 @@ dependencies = [
 name = "ncro-db"
 version = "2.4.0"
 dependencies = [
+ "flub",
  "jiff",
  "log",
  "misstep",
  "serde",
  "sqlx",
- "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -1980,6 +1995,7 @@ name = "ncro-mesh"
 version = "2.4.0"
 dependencies = [
  "ed25519-dalek",
+ "flub",
  "getrandom 0.4.2",
  "hex",
  "jiff",
@@ -1987,7 +2003,6 @@ dependencies = [
  "ncro-db",
  "rmp-serde",
  "serde",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -2005,8 +2020,8 @@ version = "2.4.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
+ "flub",
  "hex",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2016,6 +2031,7 @@ dependencies = [
  "base64 0.23.1",
  "dashmap",
  "ed25519-dalek",
+ "flub",
  "jiff",
  "lru",
  "misstep",
@@ -2027,7 +2043,6 @@ dependencies = [
  "ncro-s3",
  "reqwest",
  "rustls",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
 ]
@@ -2041,10 +2056,10 @@ dependencies = [
  "aws-smithy-http-client",
  "bytes",
  "dashmap",
+ "flub",
  "futures-util",
  "misstep",
  "ncro-config",
- "thiserror 2.0.21",
 ]
 
 [[package]]

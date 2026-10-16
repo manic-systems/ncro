@@ -11,6 +11,7 @@ use std::{
   time::Duration,
 };
 
+use flub::Error;
 use misstep::{OptionExt, Report, ResultExt, bail};
 use ncro_config::{Config, ListenAddr, LogFormat};
 use ncro_db::{Db, HealthRow};
@@ -19,7 +20,6 @@ use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
 use pound::Parse;
 use socket2::{Domain, Protocol, Socket, Type};
-use thiserror::Error;
 use tokio::{
   net::TcpListener,
   signal,

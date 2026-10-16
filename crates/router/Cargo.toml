@@ -9,6 +9,7 @@ repository.workspace  = true
 
 [dependencies]
 dashmap.workspace      = true
+flub.workspace         = true
 jiff.workspace         = true
 lru.workspace          = true
 misstep.workspace      = true
@@ -20,7 +21,6 @@ ncro-narinfo.workspace = true
 ncro-s3.workspace      = true
 reqwest                = { workspace = true, features = [ "rustls-no-provider" ] }
 rustls.workspace       = true
-thiserror.workspace    = true
 tokio                  = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
 tracing.workspace      = true
 
