@@ -13,6 +13,7 @@ axum.workspace          = true
 caress.workspace        = true
 data-encoding.workspace = true
 flub.workspace          = true
+libc.workspace          = true
 misstep                 = { workspace = true, features = [ "color", "location", "panic-hook" ] }
 pound.workspace         = true
 socket2.workspace       = true

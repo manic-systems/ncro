@@ -36,6 +36,7 @@ flub               = "0.1.0"
 futures-util       = "0.3.34"
 getrandom          = "0.4.2"
 jiff               = { version = "0.2.38", default-features = false, features = [ "std" ] }
+libc               = "0.2.186"
 log                = "0.4.34"
 lru                = { version = "0.18.3", default-features = false }
 mdns-sd            = "0.21.0"

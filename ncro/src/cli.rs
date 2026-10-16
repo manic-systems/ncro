@@ -375,6 +375,21 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
     }
   });
 
+  #[cfg(target_env = "gnu")]
+  {
+    let mut trim_stop = stop_rx.clone();
+    tokio::spawn(async move {
+      let mut ticker = time::interval(Duration::from_mins(1));
+      loop {
+        tokio::select! {
+            _ = trim_stop.changed() => return,
+            // SAFETY: malloc_trim only returns free pages to the kernel.
+            _ = ticker.tick() => unsafe { libc::malloc_trim(0); },
+        }
+      }
+    });
+  }
+
   if cfg.discovery.enabled {
     let discovery = Discovery::new(cfg.discovery.clone(), prober.clone())?;
     let discovery_stop = stop_rx.clone();
