@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
   Router as AxumRouter,
-  body::Body,
+  body::{Body, Bytes},
   extract::{Path, State},
   http::{
     HeaderMap,
@@ -21,7 +21,6 @@ use axum::{
   response::{IntoResponse, Response},
   routing::get,
 };
-use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use misstep::Report;
 use ncro_config::{NarHedgingConfig, UpstreamConfig};

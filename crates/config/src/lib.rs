@@ -10,6 +10,7 @@ use std::{
   time::Duration,
 };
 
+use data_encoding::{DecodeError, DecodeKind, HEXLOWER_PERMISSIVE};
 use flub::Error;
 use jiff::{SignedDuration, Span, SpanRelativeTo};
 use misstep::Report;
@@ -1132,12 +1133,16 @@ impl Default for MassQueryConfig {
 pub struct MeshPublicKey([u8; 32]);
 
 impl FromStr for MeshPublicKey {
-  type Err = hex::FromHexError;
+  type Err = DecodeError;
 
   fn from_str(raw: &str) -> Result<Self, Self::Err> {
-    let mut bytes = [0; 32];
-    hex::decode_to_slice(raw, &mut bytes)?;
-    Ok(Self(bytes))
+    let bytes = HEXLOWER_PERMISSIVE.decode(raw.as_bytes())?;
+    bytes.try_into().map(Self).map_err(|_| {
+      DecodeError {
+        position: raw.len(),
+        kind:     DecodeKind::Length,
+      }
+    })
   }
 }
 

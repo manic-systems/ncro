@@ -8,10 +8,9 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-base64.workspace        = true
-ed25519-dalek.workspace = true
-flub.workspace          = true
-hex.workspace           = true
+data-encoding.workspace   = true
+ed25519-compact.workspace = true
+flub.workspace            = true
 
 [lints]
 workspace = true

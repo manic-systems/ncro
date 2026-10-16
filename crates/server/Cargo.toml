@@ -9,7 +9,6 @@ repository.workspace  = true
 
 [dependencies]
 axum                   = { workspace = true, features = [ "macros" ] }
-bytes.workspace        = true
 futures-util.workspace = true
 misstep.workspace      = true
 ncro-config.workspace  = true

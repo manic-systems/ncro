@@ -11,6 +11,7 @@ use std::{
   time::Duration,
 };
 
+use data_encoding::HEXLOWER;
 use flub::Error;
 use misstep::{OptionExt, Report, ResultExt, bail};
 use ncro_config::{Config, ListenAddr, LogFormat};
@@ -230,7 +231,11 @@ pub async fn run() -> misstep::Result<()> {
     },
     Command::GenerateMeshKey { path } => {
       let node = ncro_mesh::Node::new(&path).await?;
-      writeln!(io::stdout().lock(), "{}", hex::encode(node.public_key()))?;
+      writeln!(
+        io::stdout().lock(),
+        "{}",
+        HEXLOWER.encode(&node.public_key())
+      )?;
       Ok(())
     },
   }
@@ -380,7 +385,7 @@ async fn serve(config: Option<&str>) -> misstep::Result<()> {
     let node = ncro_mesh::Node::new(&cfg.mesh.private_key_path).await?;
     tracing::info!(
       node_id = node.id(),
-      public_key = hex::encode(node.public_key()),
+      public_key = HEXLOWER.encode(&node.public_key()),
       "mesh node identity"
     );
     let allowed = cfg

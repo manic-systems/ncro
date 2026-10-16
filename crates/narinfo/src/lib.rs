@@ -3,28 +3,8 @@ use std::{
   num::ParseIntError,
 };
 
-use base64::{
-  DecodeError,
-  Engine,
-  alphabet,
-  engine::{
-    DecodePaddingMode,
-    GeneralPurpose,
-    GeneralPurposeConfig,
-    general_purpose::STANDARD,
-  },
-};
-
-/// Base64 engine that accepts the standard alphabet with or without trailing
-/// `=` padding. Nix's `trusted-public-keys` format and the keys emitted by
-/// tools like `atticd` are not consistent about padding so decoding must
-/// tolerate both.
-const STANDARD_LENIENT: GeneralPurpose = GeneralPurpose::new(
-  &alphabet::STANDARD,
-  GeneralPurposeConfig::new()
-    .with_decode_padding_mode(DecodePaddingMode::Indifferent),
-);
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use data_encoding::{BASE64, BASE64_NOPAD, DecodeError, HEXLOWER_PERMISSIVE};
+use ed25519_compact::{PublicKey, Signature};
 use flub::Error;
 
 #[derive(Debug, Error)]
@@ -107,7 +87,7 @@ fn normalize_nar_hash(s: &str) -> String {
   if algo == "sha256"
     && digest.len() == 64
     && digest.bytes().all(|b| b.is_ascii_hexdigit())
-    && let Ok(bytes) = hex::decode(digest)
+    && let Ok(bytes) = HEXLOWER_PERMISSIVE.decode(digest.as_bytes())
   {
     return format!("{algo}:{}", nix_base32_encode(&bytes));
   }
@@ -127,7 +107,7 @@ pub fn is_store_hash(hash: &str) -> bool {
 /// bytes do not encode a valid Ed25519 public key.
 pub fn parse_public_key(
   input: &str,
-) -> Result<(String, VerifyingKey), NarInfoError> {
+) -> Result<(String, PublicKey), NarInfoError> {
   let (name, b64) = input.split_once(':').ok_or_else(|| {
     NarInfoError::MissingPublicKeySeparator {
       input: input.to_string(),
@@ -138,7 +118,7 @@ pub fn parse_public_key(
       input: input.to_string(),
     });
   }
-  let raw = STANDARD_LENIENT.decode(b64).map_err(|source| {
+  let raw = decode_base64_lenient(b64).map_err(|source| {
     NarInfoError::InvalidPublicKeyBase64 {
       input: input.to_string(),
       source,
@@ -147,12 +127,25 @@ pub fn parse_public_key(
   let bytes: [u8; 32] = raw.try_into().map_err(|raw: Vec<u8>| {
     NarInfoError::InvalidPublicKeySize { got: raw.len() }
   })?;
-  let key = VerifyingKey::from_bytes(&bytes).map_err(|_| {
+  let key = PublicKey::new(bytes);
+  key.validate().map_err(|_| {
     NarInfoError::InvalidPublicKeyEncoding {
       input: input.to_string(),
     }
   })?;
   Ok((name.to_string(), key))
+}
+
+/// Decodes standard base64 with or without trailing `=` padding. Nix's
+/// `trusted-public-keys` format and the keys emitted by tools like `atticd`
+/// are not consistent about padding so decoding must tolerate both.
+fn decode_base64_lenient(input: &str) -> Result<Vec<u8>, DecodeError> {
+  let encoding = if input.ends_with('=') {
+    &BASE64
+  } else {
+    &BASE64_NOPAD
+  };
+  encoding.decode(input.as_bytes())
 }
 
 impl NarInfo {
@@ -245,13 +238,13 @@ impl NarInfo {
       if name != key_name {
         continue;
       }
-      let Ok(raw) = STANDARD.decode(b64) else {
+      let Ok(raw) = BASE64.decode(b64.as_bytes()) else {
         continue;
       };
       let Ok(bytes) = <[u8; 64]>::try_from(raw.as_slice()) else {
         continue;
       };
-      let signature = Signature::from_bytes(&bytes);
+      let signature = Signature::new(bytes);
       if key.verify(fingerprint.as_bytes(), &signature).is_ok() {
         return Ok(true);
       }
@@ -262,7 +255,7 @@ impl NarInfo {
 
 #[cfg(test)]
 mod tests {
-  use ed25519_dalek::{Signer, SigningKey};
+  use ed25519_compact::{KeyPair, Seed};
 
   use super::*;
 
@@ -387,15 +380,15 @@ mod tests {
     // padding-strict `STANDARD` base64 engine and rejected 43-character
     // unpadded keys with `Invalid padding`, even though Nix accepts them.
     let seed = [7_u8; 32];
-    let signing = SigningKey::from_bytes(&seed);
-    let bytes = signing.verifying_key().to_bytes();
-    let unpadded = STANDARD.encode(bytes).trim_end_matches('=').to_string();
+    let signing = KeyPair::from_seed(Seed::new(seed));
+    let bytes = *signing.pk;
+    let unpadded = BASE64.encode(&bytes).trim_end_matches('=').to_string();
     assert_eq!(unpadded.len(), 43);
     assert!(!unpadded.ends_with('='));
 
     let (name, parsed) = parse_public_key(&format!("cache:{unpadded}"))?;
     assert_eq!(name, "cache");
-    assert_eq!(parsed.to_bytes(), bytes);
+    assert_eq!(*parsed, bytes);
     Ok(())
   }
 
@@ -403,26 +396,26 @@ mod tests {
   fn parse_public_key_accepts_padded_and_unpadded() -> Result<(), NarInfoError>
   {
     // Generate a real keypair so the verifying key is guaranteed to be a
-    // valid ed25519 curve point (ed25519-dalek's `from_bytes` rejects
+    // valid ed25519 curve point (`PublicKey::validate` rejects
     // arbitrary 32-byte inputs that don't decode to a point on the curve).
     let seed = [7_u8; 32];
-    let signing = SigningKey::from_bytes(&seed);
-    let bytes = signing.verifying_key().to_bytes();
-    let padded = STANDARD.encode(bytes);
+    let signing = KeyPair::from_seed(Seed::new(seed));
+    let bytes = *signing.pk;
+    let padded = BASE64.encode(&bytes);
     let unpadded = padded.trim_end_matches('=').to_string();
     assert_eq!(padded.len(), 44);
     assert_eq!(unpadded.len(), 43);
 
     let (_, k_padded) = parse_public_key(&format!("name:{padded}"))?;
     let (_, k_unpadded) = parse_public_key(&format!("name:{unpadded}"))?;
-    assert_eq!(k_padded.to_bytes(), k_unpadded.to_bytes());
+    assert_eq!(k_padded, k_unpadded);
     Ok(())
   }
 
   #[test]
   fn verifies_roundtrip_signature() -> Result<(), NarInfoError> {
     let key_bytes = [7_u8; 32];
-    let signing = SigningKey::from_bytes(&key_bytes);
+    let signing = KeyPair::from_seed(Seed::new(key_bytes));
     let mut ni = NarInfo {
       store_path: "/nix/store/abc-test".into(),
       nar_hash: "sha256:abc".into(),
@@ -430,12 +423,9 @@ mod tests {
       references: vec!["abc-test".into()],
       ..Default::default()
     };
-    let sig = signing.sign(ni.fingerprint().as_bytes());
-    let pubkey = format!(
-      "test:{}",
-      STANDARD.encode(signing.verifying_key().to_bytes())
-    );
-    ni.sig = vec![format!("test:{}", STANDARD.encode(sig.to_bytes()))];
+    let sig = signing.sk.sign(ni.fingerprint(), None);
+    let pubkey = format!("test:{}", BASE64.encode(&*signing.pk));
+    ni.sig = vec![format!("test:{}", BASE64.encode(sig.as_ref()))];
     assert!(ni.verify(&pubkey)?);
     Ok(())
   }
@@ -444,20 +434,17 @@ mod tests {
   fn verify_with_wrong_key_returns_false() -> Result<(), NarInfoError> {
     let key1_bytes = [1u8; 32];
     let key2_bytes = [2u8; 32];
-    let signing1 = SigningKey::from_bytes(&key1_bytes);
-    let signing2 = SigningKey::from_bytes(&key2_bytes);
+    let signing1 = KeyPair::from_seed(Seed::new(key1_bytes));
+    let signing2 = KeyPair::from_seed(Seed::new(key2_bytes));
     let mut ni = NarInfo {
       store_path: "/nix/store/abc-test".into(),
       nar_hash: "sha256:abc".into(),
       nar_size: 12,
       ..Default::default()
     };
-    let sig = signing1.sign(ni.fingerprint().as_bytes());
-    ni.sig = vec![format!("test:{}", STANDARD.encode(sig.to_bytes()))];
-    let wrong_pubkey = format!(
-      "test:{}",
-      STANDARD.encode(signing2.verifying_key().to_bytes())
-    );
+    let sig = signing1.sk.sign(ni.fingerprint(), None);
+    ni.sig = vec![format!("test:{}", BASE64.encode(sig.as_ref()))];
+    let wrong_pubkey = format!("test:{}", BASE64.encode(&*signing2.pk));
     assert!(!ni.verify(&wrong_pubkey)?);
     Ok(())
   }
@@ -465,19 +452,16 @@ mod tests {
   #[test]
   fn verify_tampered_content_returns_false() -> Result<(), NarInfoError> {
     let key_bytes = [7u8; 32];
-    let signing = SigningKey::from_bytes(&key_bytes);
+    let signing = KeyPair::from_seed(Seed::new(key_bytes));
     let mut ni = NarInfo {
       store_path: "/nix/store/abc-test".into(),
       nar_hash: "sha256:abc".into(),
       nar_size: 12,
       ..Default::default()
     };
-    let sig = signing.sign(ni.fingerprint().as_bytes());
-    let pubkey = format!(
-      "test:{}",
-      STANDARD.encode(signing.verifying_key().to_bytes())
-    );
-    ni.sig = vec![format!("test:{}", STANDARD.encode(sig.to_bytes()))];
+    let sig = signing.sk.sign(ni.fingerprint(), None);
+    let pubkey = format!("test:{}", BASE64.encode(&*signing.pk));
+    ni.sig = vec![format!("test:{}", BASE64.encode(sig.as_ref()))];
     ni.nar_size = 999; // tamper after signing
     assert!(!ni.verify(&pubkey)?);
     Ok(())
