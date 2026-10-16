@@ -1,8 +1,10 @@
+use pound::Parse as _;
+
 mod cli;
 mod warn_buffer;
 
-#[tokio::main]
-async fn main() -> misstep::Result<()> {
+fn main() -> misstep::Result<()> {
+  caress::handle(cli::Args::SPEC);
   misstep::install_panic_hook();
-  cli::run().await
+  cli::run()
 }

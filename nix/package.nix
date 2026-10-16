@@ -2,6 +2,7 @@
   lib,
   stdenv,
   rustPlatform,
+  installShellFiles,
   pkg-config,
   openssl,
   cacert,
@@ -35,7 +36,7 @@ in
     useNextest = true;
     cargoLock.lockFile = "${finalAttrs.src}/Cargo.lock";
     nativeBuildInputs =
-      [pkg-config cacert]
+      [pkg-config cacert installShellFiles]
       ++ (lib.optionals hasWild [
         wild
         buildPackages.clang
@@ -57,6 +58,14 @@ in
       // lib.optionalAttrs hasWild {
         RUSTFLAGS = "-Clinker=${clangExe} -Clink-arg=--ld-path=wild";
       };
+
+    postInstall = lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+      installShellCompletion --cmd ncro \
+        --bash    <(COMPLETE=bash $out/bin/ncro) \
+        --zsh     <(COMPLETE=zsh  $out/bin/ncro)  \
+        --fish    <(COMPLETE=fish $out/bin/ncro) \
+        --nushell <(COMPLETE=nu   $out/bin/ncro)
+    '';
 
     meta = {
       homepage = "https://github.com/feel-co/ncro";

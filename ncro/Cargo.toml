@@ -10,6 +10,7 @@ readme.workspace      = true
 
 [dependencies]
 axum.workspace          = true
+caress.workspace        = true
 data-encoding.workspace = true
 flub.workspace          = true
 misstep                 = { workspace = true, features = [ "color", "location", "panic-hook" ] }

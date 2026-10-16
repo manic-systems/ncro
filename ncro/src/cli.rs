@@ -6,7 +6,7 @@ use std::{
   mem,
   net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
   os::unix::{ffi::OsStringExt, io::FromRawFd, net::UnixDatagram},
-  path::Path,
+  path::{Path, PathBuf},
   process,
   time::Duration,
 };
@@ -177,39 +177,40 @@ fn sd_notify_ready() {
 /// Nix Cache Route Optimizer
 pub struct Args {
   /// Path to the configuration file.
-  #[pound(short, long, env = "NCRO_CONFIG")]
-  pub config: Option<String>,
+  #[pound(short, long, env = "NCRO_CONFIG", value_name = "PATH")]
+  pub config: Option<PathBuf>,
 
   /// Create or read a mesh private key and print its public key.
-  #[pound(long)]
-  pub generate_mesh_key: Option<String>,
+  #[pound(
+    long,
+    exclusive,
+    value_name = "PATH",
+    validate = |path: &PathBuf| if path.as_os_str().is_empty() {
+      Err("path is empty")
+    } else {
+      Ok(())
+    }
+  )]
+  pub generate_mesh_key: Option<PathBuf>,
 
   /// Validate the config file and exit.
-  #[pound(long)]
+  #[pound(long, requires = config)]
   pub check: bool,
 }
 
 enum Command {
-  Serve { config: Option<String> },
-  Check { config: String },
-  GenerateMeshKey { path: String },
+  Serve { config: Option<PathBuf> },
+  Check { config: PathBuf },
+  GenerateMeshKey { path: PathBuf },
 }
 
 impl TryFrom<Args> for Command {
   type Error = Report;
 
   fn try_from(args: Args) -> Result<Self, Self::Error> {
-    let config = args.config.filter(|path| !path.is_empty());
+    let config = args.config.filter(|path| !path.as_os_str().is_empty());
 
     if let Some(path) = args.generate_mesh_key {
-      if config.is_some() || args.check {
-        bail!(
-          "--generate-mesh-key cannot be combined with --config or --check"
-        );
-      }
-      if path.is_empty() {
-        bail!("--generate-mesh-key requires a non-empty path");
-      }
       return Ok(Self::GenerateMeshKey { path });
     }
 
@@ -222,6 +223,7 @@ impl TryFrom<Args> for Command {
   }
 }
 
+#[tokio::main]
 pub async fn run() -> misstep::Result<()> {
   match Command::try_from(Args::parse())? {
     Command::Serve { config } => serve(config.as_deref()).await,
@@ -241,7 +243,7 @@ pub async fn run() -> misstep::Result<()> {
   }
 }
 
-async fn serve(config: Option<&str>) -> misstep::Result<()> {
+async fn serve(config: Option<&Path>) -> misstep::Result<()> {
   // Config loading happens before we know the configured log level/format, so
   // buffer any diagnostics it emits and replay them once logging is set up.
   let buffer = BufferLayer::default();
@@ -382,7 +384,8 @@ async fn serve(config: Option<&str>) -> misstep::Result<()> {
   }
 
   if cfg.mesh.enabled {
-    let node = ncro_mesh::Node::new(&cfg.mesh.private_key_path).await?;
+    let node =
+      ncro_mesh::Node::new(Path::new(&cfg.mesh.private_key_path)).await?;
     tracing::info!(
       node_id = node.id(),
       public_key = HEXLOWER.encode(&node.public_key()),

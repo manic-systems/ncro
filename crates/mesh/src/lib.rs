@@ -85,16 +85,15 @@ impl Node {
   /// # Errors
   ///
   /// Returns [`MeshError`] if the key file exists but cannot be read, is the
-  /// wrong size, or a new key cannot be written to `key_path`.
-  pub async fn new(key_path: &str) -> Result<Self, MeshError> {
-    if key_path.is_empty() {
+  /// wrong size, or a new key cannot be written to `path`.
+  pub async fn new(path: &Path) -> Result<Self, MeshError> {
+    if path.as_os_str().is_empty() {
       return Ok(Self {
         key_pair: Arc::new(KeyPair::try_from_seed(Seed::new(
           random_key_bytes()?,
         ))?),
       });
     }
-    let path = Path::new(key_path);
     match fs::read(path).await {
       Ok(data) => {
         if data.len() != 32 && data.len() != 64 {
@@ -386,13 +385,12 @@ mod tests {
       process::id(),
       SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
-    let path = path.to_string_lossy();
 
     let generated = Node::new(&path).await?;
     let reloaded = Node::new(&path).await?;
 
     assert_eq!(generated.public_key(), reloaded.public_key());
-    let metadata = fs::metadata(path.as_ref()).await?;
+    let metadata = fs::metadata(&path).await?;
     assert_eq!(metadata.len(), 32);
     #[cfg(unix)]
     {
@@ -400,7 +398,7 @@ mod tests {
       let mode = metadata.permissions().mode();
       assert_eq!(mode & 0o777, 0o600);
     }
-    fs::remove_file(path.as_ref()).await?;
+    fs::remove_file(&path).await?;
     Ok(())
   }
 
