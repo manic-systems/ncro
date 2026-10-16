@@ -1,6 +1,5 @@
 use std::{
   collections::{BTreeMap, HashMap},
-  num::NonZeroUsize,
   str,
   sync::{Arc, Mutex as StdMutex, PoisonError},
   time::{Duration, Instant},
@@ -166,15 +165,16 @@ pub struct RouterTuning {
 
 /// A bounded LRU whose entries expire `ttl` after insertion.
 struct TtlCache<V> {
-  entries: StdMutex<LruCache<String, (Instant, V)>>,
-  ttl:     Duration,
+  entries:  StdMutex<LruCache<String, (Instant, V)>>,
+  capacity: usize,
+  ttl:      Duration,
 }
 
 impl<V: Clone> TtlCache<V> {
   fn new(capacity: usize, ttl: Duration) -> Self {
-    let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
     Self {
-      entries: StdMutex::new(LruCache::new(capacity)),
+      entries: StdMutex::new(LruCache::unbounded()),
+      capacity: capacity.max(1),
       ttl,
     }
   }
@@ -194,6 +194,9 @@ impl<V: Clone> TtlCache<V> {
     let mut entries =
       self.entries.lock().unwrap_or_else(PoisonError::into_inner);
     entries.put(key, (Instant::now(), value));
+    if entries.len() > self.capacity {
+      entries.pop_lru();
+    }
   }
 
   fn invalidate(&self, key: &str) {
