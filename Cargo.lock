@@ -1849,6 +1849,7 @@ dependencies = [
  "caress",
  "data-encoding",
  "flub",
+ "libc",
  "misstep",
  "ncro-config",
  "ncro-db",
