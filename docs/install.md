@@ -67,6 +67,14 @@ out to the repository, and use Cargo to build it. You'll need Rust 1.95 or
 above. Most distributions should package this version already. You may, of
 course, prefer to package the built releases if you'd like.
 
+### Shell Completions
+
+The Nix package installs completions for bash, zsh, fish and nushell, so flags
+and config paths complete on TAB with no setup. Elsewhere, ncro prints the
+script for your shell when `COMPLETE` names it, as in
+`source <(COMPLETE=bash ncro)` or `COMPLETE=fish ncro | source`. Every TAB asks
+ncro itself, so the completions always match the installed binary.
+
 ## Running Locally
 
 ```bash

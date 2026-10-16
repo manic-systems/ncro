@@ -5,7 +5,7 @@ use std::{
   io,
   iter,
   net::SocketAddr,
-  path::PathBuf,
+  path::{Path, PathBuf},
   str::FromStr,
   time::Duration,
 };
@@ -23,13 +23,13 @@ use url::Url;
 #[derive(Debug, Error)]
 pub enum ConfigError {
   #[error("read config {path:?}")]
-  Read { path: String, source: io::Error },
+  Read { path: PathBuf, source: io::Error },
   #[error("read password_file {path:?}")]
   PasswordFile { path: String, source: io::Error },
   #[error("read netrc {path:?}")]
   Netrc { path: PathBuf, source: NetrcError },
   #[error("parse config {path:?}")]
-  Parse { path: String, source: TomlError },
+  Parse { path: PathBuf, source: TomlError },
   #[error("{0}")]
   Validation(String),
 }
@@ -688,7 +688,6 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       ),
     )?;
 
-    let config_path = config_path.to_string_lossy();
     let cfg = Config::load(Some(&config_path))?;
 
     assert_eq!(cfg.upstreams[0].password.as_deref(), Some("secret"));
@@ -709,7 +708,6 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
       ),
     )?;
 
-    let config_path = config_path.to_string_lossy();
     let cfg = Config::load(Some(&config_path))?;
 
     assert_eq!(cfg.upstreams[0].password.as_deref(), Some(" secret "));
@@ -1298,7 +1296,7 @@ impl Config {
   ///
   /// Returns [`ConfigError::Read`] if the config file cannot be read, or
   /// [`ConfigError::Parse`] if the TOML is malformed.
-  pub fn load(path: Option<&str>) -> Result<Self, ConfigError> {
+  pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
     let mut cfg = match path {
       Some(path) => Self::parse(path)?,
       None => Self::default(),
@@ -1350,11 +1348,11 @@ impl Config {
   /// # Errors
   ///
   /// Same as [`Config::load`] and [`Config::validate`].
-  pub fn check(path: &str) -> Result<(), ConfigError> {
+  pub fn check(path: &Path) -> Result<(), ConfigError> {
     Self::parse(path)?.validate()
   }
 
-  fn parse(path: &str) -> Result<Self, ConfigError> {
+  fn parse(path: &Path) -> Result<Self, ConfigError> {
     let data = fs::read_to_string(path).map_err(|source| {
       ConfigError::Read {
         path: path.to_owned(),
