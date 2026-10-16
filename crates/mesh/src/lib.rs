@@ -4,7 +4,14 @@ use std::{
   sync::Arc,
 };
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use data_encoding::HEXLOWER;
+use ed25519_compact::{
+  Error as Ed25519Error,
+  KeyPair,
+  PublicKey,
+  Seed,
+  Signature,
+};
 use flub::Error;
 use jiff::Timestamp;
 use misstep::Report;
@@ -45,6 +52,13 @@ pub enum MeshError {
   InvalidSignature,
   #[error("mesh key {path:?} is {got} bytes, want 32 or 64")]
   InvalidKeyFileSize { path: PathBuf, got: usize },
+  #[error("mesh key {path:?} holds an invalid seed")]
+  InvalidKeySeed {
+    path:   PathBuf,
+    source: Ed25519Error,
+  },
+  #[error("derive mesh key")]
+  Derive(#[from] Ed25519Error),
   #[error("read system entropy")]
   Entropy(#[from] getrandom::Error),
 }
@@ -64,7 +78,7 @@ pub struct Message {
 
 #[derive(Clone)]
 pub struct Node {
-  signing_key: Arc<SigningKey>,
+  key_pair: Arc<KeyPair>,
 }
 
 impl Node {
@@ -75,7 +89,9 @@ impl Node {
   pub async fn new(key_path: &str) -> Result<Self, MeshError> {
     if key_path.is_empty() {
       return Ok(Self {
-        signing_key: Arc::new(SigningKey::from_bytes(&random_key_bytes()?)),
+        key_pair: Arc::new(KeyPair::try_from_seed(Seed::new(
+          random_key_bytes()?,
+        ))?),
       });
     }
     let path = Path::new(key_path);
@@ -87,10 +103,16 @@ impl Node {
             got:  data.len(),
           });
         }
-        let bytes = <[u8; 32]>::try_from(&data[..32])
-          .map_err(|_| MeshError::InvalidSignature)?;
+        let key_pair = Seed::from_slice(&data[..32])
+          .and_then(KeyPair::try_from_seed)
+          .map_err(|source| {
+            MeshError::InvalidKeySeed {
+              path: path.to_owned(),
+              source,
+            }
+          })?;
         return Ok(Self {
-          signing_key: Arc::new(SigningKey::from_bytes(&bytes)),
+          key_pair: Arc::new(key_pair),
         });
       },
       Err(err) if err.kind() == ErrorKind::NotFound => {},
@@ -101,30 +123,27 @@ impl Node {
         });
       },
     }
-    let key = SigningKey::from_bytes(&random_key_bytes()?);
-    write_new_key(path, &key.to_bytes()).await?;
+    let key_pair = KeyPair::try_from_seed(Seed::new(random_key_bytes()?))?;
+    write_new_key(path, &key_pair.sk.seed()).await?;
     Ok(Self {
-      signing_key: Arc::new(key),
+      key_pair: Arc::new(key_pair),
     })
   }
 
   #[must_use]
   pub fn id(&self) -> String {
-    hex::encode(&self.public_key()[..8])
+    HEXLOWER.encode(&self.public_key()[..8])
   }
   #[must_use]
   pub fn public_key(&self) -> [u8; 32] {
-    self.signing_key.verifying_key().to_bytes()
+    *self.key_pair.pk
   }
   /// # Errors
   ///
   /// Returns [`MeshError`] if the message cannot be serialized.
   pub fn sign(&self, msg: &Message) -> Result<(Vec<u8>, Vec<u8>), MeshError> {
     let body = rmp_serde::to_vec(msg)?;
-    Ok((
-      body.clone(),
-      self.signing_key.sign(&body).to_bytes().to_vec(),
-    ))
+    Ok((body.clone(), self.key_pair.sk.sign(&body, None).to_vec()))
   }
 }
 
@@ -165,7 +184,7 @@ async fn write_new_key(
 
 fn temporary_key_path(key_path: &Path) -> Result<PathBuf, MeshError> {
   let mut path = key_path.as_os_str().to_os_string();
-  path.push(format!(".{}.tmp", hex::encode(random_key_bytes()?)));
+  path.push(format!(".{}.tmp", HEXLOWER.encode(&random_key_bytes()?)));
   Ok(path.into())
 }
 
@@ -180,13 +199,12 @@ fn random_key_bytes() -> Result<[u8; 32], getrandom::Error> {
 /// Returns [`MeshError::InvalidSignature`] if the key, signature, or body
 /// fails verification.
 pub fn verify(pubkey: &[u8], body: &[u8], sig: &[u8]) -> Result<(), MeshError> {
-  let pubkey: [u8; 32] =
-    pubkey.try_into().map_err(|_| MeshError::InvalidSignature)?;
-  let sig: [u8; 64] =
-    sig.try_into().map_err(|_| MeshError::InvalidSignature)?;
-  VerifyingKey::from_bytes(&pubkey)
-    .map_err(|_| MeshError::InvalidSignature)?
-    .verify(body, &Signature::from_bytes(&sig))
+  let pubkey =
+    PublicKey::from_slice(pubkey).map_err(|_| MeshError::InvalidSignature)?;
+  let sig =
+    Signature::from_slice(sig).map_err(|_| MeshError::InvalidSignature)?;
+  pubkey
+    .verify(body, &sig)
     .map_err(|_| MeshError::InvalidSignature)
 }
 

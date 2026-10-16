@@ -1395,8 +1395,8 @@ mod tests {
   #![expect(clippy::unwrap_used, reason = "Fine in tests")]
   use std::{slice, sync::Arc, time::Duration};
 
-  use base64::{Engine as _, engine::general_purpose::STANDARD};
-  use ed25519_dalek::{Signer, SigningKey};
+  use data_encoding::BASE64;
+  use ed25519_compact::{KeyPair, Seed};
   use jiff::{SignedDuration, Timestamp};
   use ncro_config::{NarUrlMode, UpstreamConfig};
   use ncro_db::{Db, RouteEntry};
@@ -1527,7 +1527,7 @@ mod tests {
 
   fn signed_narinfo(key_name: &str) -> (NarInfo, String) {
     let key_bytes = [7_u8; 32];
-    let signing = SigningKey::from_bytes(&key_bytes);
+    let signing = KeyPair::from_seed(Seed::new(key_bytes));
     let mut narinfo = NarInfo {
       store_path: "/nix/store/abc123-test".to_string(),
       nar_hash: "sha256:abc".to_string(),
@@ -1535,13 +1535,9 @@ mod tests {
       references: vec![],
       ..Default::default()
     };
-    let sig = signing.sign(narinfo.fingerprint().as_bytes());
-    narinfo.sig =
-      vec![format!("{key_name}:{}", STANDARD.encode(sig.to_bytes()))];
-    let public_key = format!(
-      "{key_name}:{}",
-      STANDARD.encode(signing.verifying_key().to_bytes())
-    );
+    let sig = signing.sk.sign(narinfo.fingerprint(), None);
+    narinfo.sig = vec![format!("{key_name}:{}", BASE64.encode(sig.as_ref()))];
+    let public_key = format!("{key_name}:{}", BASE64.encode(&*signing.pk));
     (narinfo, public_key)
   }
 

@@ -8,16 +8,16 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-flub.workspace       = true
-hex.workspace        = true
-jiff.workspace       = true
-misstep.workspace    = true
-rust-netrc.workspace = true
-serde                = { workspace = true, features = [ "derive" ] }
-toml.workspace       = true
-tracing.workspace    = true
-tracing-subscriber   = { workspace = true, features = [ "env-filter" ] }
-url.workspace        = true
+data-encoding.workspace = true
+flub.workspace          = true
+jiff.workspace          = true
+misstep.workspace       = true
+rust-netrc.workspace    = true
+serde                   = { workspace = true, features = [ "derive" ] }
+toml.workspace          = true
+tracing.workspace       = true
+tracing-subscriber      = { workspace = true, features = [ "env-filter" ] }
+url.workspace           = true
 
 [lints]
 workspace = true

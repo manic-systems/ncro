@@ -8,17 +8,17 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-ed25519-dalek.workspace = true
-flub.workspace          = true
-getrandom.workspace     = true
-hex.workspace           = true
-jiff.workspace          = true
-misstep.workspace       = true
-ncro-db.workspace       = true
-rmp-serde.workspace     = true
-serde                   = { workspace = true, features = [ "derive" ] }
-tokio                   = { workspace = true, features = [ "fs", "io-util", "macros", "net", "rt", "sync", "time" ] }
-tracing.workspace       = true
+data-encoding.workspace   = true
+ed25519-compact.workspace = true
+flub.workspace            = true
+getrandom.workspace       = true
+jiff.workspace            = true
+misstep.workspace         = true
+ncro-db.workspace         = true
+rmp-serde.workspace       = true
+serde                     = { workspace = true, features = [ "derive" ] }
+tokio                     = { workspace = true, features = [ "fs", "io-util", "macros", "net", "rt", "sync", "time" ] }
+tracing.workspace         = true
 
 [lints]
 workspace = true
