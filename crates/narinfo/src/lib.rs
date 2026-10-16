@@ -25,7 +25,7 @@ const STANDARD_LENIENT: GeneralPurpose = GeneralPurpose::new(
     .with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use thiserror::Error;
+use flub::Error;
 
 #[derive(Debug, Error)]
 pub enum NarInfoError {

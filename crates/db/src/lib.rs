@@ -8,6 +8,7 @@ use std::{
   time::Duration,
 };
 
+use flub::Error;
 use jiff::Timestamp;
 use sqlx::{
   ConnectOptions,
@@ -21,7 +22,6 @@ use sqlx::{
     SqliteSynchronous,
   },
 };
-use thiserror::Error;
 use tokio::{fs as tokio_fs, sync::Mutex};
 
 #[derive(Debug, Error)]

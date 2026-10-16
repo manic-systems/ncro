@@ -5,12 +5,12 @@ use std::{
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use flub::Error;
 use jiff::Timestamp;
 use misstep::Report;
 use ncro_db::{Db, RouteEntry};
 use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::{
   fs::{self, OpenOptions},
   io::AsyncWriteExt,

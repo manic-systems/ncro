@@ -9,6 +9,7 @@ repository.workspace  = true
 
 [dependencies]
 ed25519-dalek.workspace = true
+flub.workspace          = true
 getrandom.workspace     = true
 hex.workspace           = true
 jiff.workspace          = true
@@ -16,7 +17,6 @@ misstep.workspace       = true
 ncro-db.workspace       = true
 rmp-serde.workspace     = true
 serde                   = { workspace = true, features = [ "derive" ] }
-thiserror.workspace     = true
 tokio                   = { workspace = true, features = [ "fs", "io-util", "macros", "net", "rt", "sync", "time" ] }
 tracing.workspace       = true
 

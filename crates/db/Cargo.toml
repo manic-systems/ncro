@@ -8,12 +8,12 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-jiff                = { workspace = true, features = [ "serde" ] }
-log.workspace       = true
-serde               = { workspace = true, features = [ "derive" ] }
-sqlx                = { workspace = true, features = [ "runtime-tokio", "sqlite" ] }
-thiserror.workspace = true
-tokio               = { workspace = true, features = [ "fs", "sync" ] }
+flub.workspace = true
+jiff           = { workspace = true, features = [ "serde" ] }
+log.workspace  = true
+serde          = { workspace = true, features = [ "derive" ] }
+sqlx           = { workspace = true, features = [ "runtime-tokio", "sqlite" ] }
+tokio          = { workspace = true, features = [ "fs", "sync" ] }
 
 [dev-dependencies]
 misstep.workspace = true

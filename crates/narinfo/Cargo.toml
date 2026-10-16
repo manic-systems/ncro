@@ -10,8 +10,8 @@ repository.workspace  = true
 [dependencies]
 base64.workspace        = true
 ed25519-dalek.workspace = true
+flub.workspace          = true
 hex.workspace           = true
-thiserror.workspace     = true
 
 [lints]
 workspace = true

@@ -13,10 +13,10 @@ aws-sdk-s3.workspace             = true
 aws-smithy-http-client.workspace = true
 bytes.workspace                  = true
 dashmap.workspace                = true
+flub.workspace                   = true
 futures-util.workspace           = true
 misstep.workspace                = true
 ncro-config.workspace            = true
-thiserror.workspace              = true
 
 [lints]
 workspace = true
