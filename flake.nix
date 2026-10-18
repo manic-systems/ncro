@@ -17,6 +17,8 @@
         lib,
         ...
       }: {
+        _file = "${self}#nixosModules.ncro";
+        key = "${self}#nixosModules.ncro";
         imports = [./nix/module.nix];
         services.ncro.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix {});
       };
