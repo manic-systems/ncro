@@ -20,7 +20,11 @@
         _file = "${self}#nixosModules.ncro";
         key = "${self}#nixosModules.ncro";
         imports = [./nix/module.nix];
-        services.ncro.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix {});
+        services.ncro.package = lib.mkDefault (
+          if lib.systems.equals pkgs.stdenv.buildPlatform pkgs.stdenv.hostPlatform
+          then self.packages.${pkgs.stdenv.hostPlatform.system}.ncro
+          else pkgs.callPackage ./nix/package.nix {}
+        );
       };
 
       default = self.nixosModules.ncro;
