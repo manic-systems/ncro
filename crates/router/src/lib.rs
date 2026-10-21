@@ -609,7 +609,17 @@ impl Router {
       )
       .await
     {
-      CachedFilterCheck::Cached => {},
+      CachedFilterCheck::Cached if entry.narinfo_bytes.is_some() => {},
+      CachedFilterCheck::Cached => {
+        let Ok((Some(bytes), _)) = self
+          .fetch_narinfo(&entry.upstream_url, store_hash, hop)
+          .await
+        else {
+          return Ok(None);
+        };
+        entry.narinfo_bytes = Some(bytes);
+        self.inner.db.set_route(&entry).await?;
+      },
       CachedFilterCheck::Fetched(bytes) => {
         entry.narinfo_bytes = Some(bytes);
         self.inner.db.set_route(&entry).await?;
