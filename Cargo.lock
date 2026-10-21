@@ -1571,6 +1571,7 @@ dependencies = [
  "ncro-metrics",
  "ncro-router",
  "ncro-server",
+ "ncro-upstream",
  "pound",
  "socket2",
  "tokio",
@@ -1624,9 +1625,8 @@ version = "2.4.0"
 dependencies = [
  "misstep",
  "ncro-config",
- "ncro-s3",
+ "ncro-upstream",
  "reqwest",
- "rustls",
  "tokio",
  "tracing",
 ]
@@ -1680,29 +1680,10 @@ dependencies = [
  "ncro-health",
  "ncro-metrics",
  "ncro-narinfo",
- "ncro-s3",
+ "ncro-upstream",
  "reqwest",
- "rustls",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "ncro-s3"
-version = "2.4.0"
-dependencies = [
- "aws-config",
- "aws-credential-types",
- "aws-sigv4",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "bytes",
- "dashmap",
- "flub",
- "futures-util",
- "ncro-config",
- "reqwest",
- "tokio",
 ]
 
 [[package]]
@@ -1718,14 +1699,31 @@ dependencies = [
  "ncro-metrics",
  "ncro-narinfo",
  "ncro-router",
- "ncro-s3",
+ "ncro-upstream",
  "reqwest",
- "rustls",
  "serde",
  "tokio",
  "tower-http 0.7.1",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "ncro-upstream"
+version = "2.4.0"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "bytes",
+ "dashmap",
+ "flub",
+ "ncro-config",
+ "reqwest",
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ use ncro_db::{Db, HealthRow};
 use ncro_discovery::Discovery;
 use ncro_health::Prober;
 use ncro_router::{Router, RouterTuning};
+use ncro_upstream::Upstreams;
 use pound::Parse;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
@@ -274,7 +275,15 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
     cfg.cache.slow_statement_threshold.0,
   )
   .await?;
-  let prober = Prober::new(cfg.cache.latency_alpha)?;
+  let upstreams = Upstreams::new()?;
+  for upstream in &cfg.upstreams {
+    upstreams.register(upstream);
+  }
+  if cfg.fallback_cache.enabled {
+    upstreams.register(&cfg.fallback_cache.upstream);
+  }
+
+  let prober = Prober::new(cfg.cache.latency_alpha, upstreams.clone());
   prober.init_upstreams(&cfg.upstreams).await;
   for row in db.load_all_health().await.unwrap_or_default() {
     prober
@@ -308,6 +317,7 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
   let router = Router::new(
     db.clone(),
     prober.clone(),
+    upstreams.clone(),
     cfg.cache.ttl.0,
     Duration::from_secs(5),
     cfg.cache.negative_ttl.0,
@@ -317,7 +327,7 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
       in_memory_negative_ttl:    cfg.cache.mass_query.in_memory_negative_ttl.0,
       upstream_cooldown:         cfg.cache.mass_query.upstream_cooldown.0,
     },
-  )?;
+  );
 
   for upstream in &cfg.upstreams {
     router.register_upstream(upstream).await?;
@@ -438,18 +448,19 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
     ));
   }
 
-  let app = ncro_server::app(router, prober, db, ncro_server::AppConfig {
-    upstreams:       cfg.upstreams.clone(),
-    fallback_cache:  cfg
-      .fallback_cache
-      .enabled
-      .then_some(cfg.fallback_cache.upstream.clone()),
-    nar_hedging:     cfg.cache.nar_hedging.clone(),
-    cache_priority:  cfg.server.cache_priority,
-    want_mass_query: cfg.server.want_mass_query,
-    read_timeout:    cfg.server.read_timeout.0,
-    write_timeout:   cfg.server.write_timeout.0,
-  })?;
+  let app =
+    ncro_server::app(router, prober, db, upstreams, ncro_server::AppConfig {
+      upstreams:       cfg.upstreams.clone(),
+      fallback_cache:  cfg
+        .fallback_cache
+        .enabled
+        .then_some(cfg.fallback_cache.upstream.clone()),
+      nar_hedging:     cfg.cache.nar_hedging.clone(),
+      cache_priority:  cfg.server.cache_priority,
+      want_mass_query: cfg.server.want_mass_query,
+      read_timeout:    cfg.server.read_timeout.0,
+      write_timeout:   cfg.server.write_timeout.0,
+    });
   let listeners = bind_listeners(cfg.server.listen).await?;
   tracing::info!(
     addrs = ?listeners

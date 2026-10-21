@@ -8,21 +8,20 @@ homepage.workspace    = true
 repository.workspace  = true
 
 [dependencies]
-dashmap.workspace      = true
-flub.workspace         = true
-jiff.workspace         = true
-lru.workspace          = true
-misstep.workspace      = true
-ncro-config.workspace  = true
-ncro-db.workspace      = true
-ncro-health.workspace  = true
-ncro-metrics.workspace = true
-ncro-narinfo.workspace = true
-ncro-s3.workspace      = true
-reqwest                = { workspace = true, features = [ "rustls-no-provider" ] }
-rustls.workspace       = true
-tokio                  = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
-tracing.workspace      = true
+dashmap.workspace       = true
+flub.workspace          = true
+jiff.workspace          = true
+lru.workspace           = true
+misstep.workspace       = true
+ncro-config.workspace   = true
+ncro-db.workspace       = true
+ncro-health.workspace   = true
+ncro-metrics.workspace  = true
+ncro-narinfo.workspace  = true
+ncro-upstream.workspace = true
+reqwest.workspace       = true
+tokio                   = { workspace = true, features = [ "macros", "sync", "time", "rt" ] }
+tracing.workspace       = true
 
 [dev-dependencies]
 data-encoding.workspace   = true
