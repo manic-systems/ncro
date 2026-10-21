@@ -104,6 +104,32 @@ impl S3Config {
   }
 }
 
+/// How ncro reaches an upstream, derived from the scheme of its URL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Location {
+  #[default]
+  Http,
+  S3(S3Config),
+}
+
+impl Location {
+  fn parse(url: &str, label: &str) -> Result<Self, ConfigError> {
+    let parsed = Url::parse(url).map_err(|err| {
+      ConfigError::Validation(format!("{label}: invalid URL {url:?}: {err}"))
+    })?;
+    match parsed.scheme() {
+      "http" | "https" => Ok(Self::Http),
+      "s3" => parse_s3_url(url).map(Self::S3),
+      scheme => {
+        Err(ConfigError::Validation(format!(
+          "{label}: unsupported scheme {scheme:?} in {url:?}, expected http, \
+           https or s3"
+        )))
+      },
+    }
+  }
+}
+
 /// Parses a Nix-style `s3://bucket?...` URL into the settings needed by the
 /// native S3 client.
 ///
@@ -222,18 +248,13 @@ fn apply_netrc<'a>(
 ) {
   for upstream in upstreams {
     // Skip s3 and explicitly configured credentials
-    if !upstream.username.is_empty() || upstream.s3.is_some() {
+    if !upstream.username.is_empty() || upstream.location != Location::Http {
       continue;
     }
 
-    // Skip non-HTTP(S) URLs
     let Ok(parsed) = Url::parse(&upstream.url) else {
       continue;
     };
-
-    if !matches!(parsed.scheme(), "http" | "https") {
-      continue;
-    }
 
     let Some(host) = parsed.host_str() else {
       continue;
@@ -552,12 +573,13 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
 "#;
     let cfg: Config = toml::from_str(toml)?;
     let mut cfg = cfg;
-    if cfg.fallback_cache.upstream.url.starts_with("s3://") {
-      cfg.fallback_cache.upstream.s3 =
-        Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
-    }
+    cfg.fallback_cache.upstream.location =
+      Location::parse(&cfg.fallback_cache.upstream.url, "fallback_cache")?;
     assert!(cfg.fallback_cache.enabled);
-    assert!(cfg.fallback_cache.upstream.s3.is_some());
+    assert!(matches!(
+      cfg.fallback_cache.upstream.location,
+      Location::S3(_)
+    ));
     Ok(())
   }
 
@@ -638,7 +660,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
   fn netrc_skips_s3_upstreams() {
     let nrc = netrc("machine my-cache login alice password secret\n");
     let mut up = upstream("s3://my-cache?endpoint=s3.example.com");
-    up.s3 = Some(parse_s3_url(&up.url).expect("valid s3 url"));
+    up.location = Location::parse(&up.url, "upstream").expect("valid s3 url");
     apply_netrc(iter::once(&mut up), &nrc);
     assert!(up.username.is_empty());
     assert!(up.password.is_none());
@@ -888,10 +910,9 @@ pub struct UpstreamConfig {
   /// Whether this upstream may be started as an additional NAR hedge.
   #[serde(default = "default_allow_hedging")]
   pub allow_hedging:   bool,
-  /// Parsed S3 configuration derived from `url` when the scheme is `s3://`.
-  /// Not set directly in config, but populated automatically at load time.
+  /// Derived from the scheme of `url` at load time, not set in config.
   #[serde(skip)]
-  pub s3:              Option<S3Config>,
+  pub location:        Location,
 }
 
 impl Default for UpstreamConfig {
@@ -909,7 +930,7 @@ impl Default for UpstreamConfig {
       narinfo_timeout: None,
       nar_timeout:     None,
       allow_hedging:   true,
-      s3:              None,
+      location:        Location::default(),
     }
   }
 }
@@ -929,7 +950,7 @@ impl fmt::Debug for UpstreamConfig {
       .field("narinfo_timeout", &self.narinfo_timeout)
       .field("nar_timeout", &self.nar_timeout)
       .field("allow_hedging", &self.allow_hedging)
-      .field("s3", &self.s3)
+      .field("location", &self.location)
       .finish()
   }
 }
@@ -1366,14 +1387,13 @@ impl Config {
       }
     })?;
 
-    for upstream in &mut cfg.upstreams {
-      if upstream.url.starts_with("s3://") {
-        upstream.s3 = Some(parse_s3_url(&upstream.url)?);
-      }
+    for (i, upstream) in cfg.upstreams.iter_mut().enumerate() {
+      upstream.location =
+        Location::parse(&upstream.url, &format!("upstream[{i}]"))?;
     }
-    if cfg.fallback_cache.upstream.url.starts_with("s3://") {
-      cfg.fallback_cache.upstream.s3 =
-        Some(parse_s3_url(&cfg.fallback_cache.upstream.url)?);
+    if cfg.fallback_cache.enabled {
+      cfg.fallback_cache.upstream.location =
+        Location::parse(&cfg.fallback_cache.upstream.url, "fallback_cache")?;
     }
 
     Ok(cfg)

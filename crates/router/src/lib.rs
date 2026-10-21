@@ -14,6 +14,7 @@ use ncro_config::{
   FilterAction,
   FilterField,
   FilterRule,
+  Location,
   NarUrlMode,
   S3Config,
   UpstreamConfig,
@@ -107,7 +108,10 @@ impl RouterUpstream for UpstreamConfig {
   }
 
   fn s3(&self) -> Option<&S3Config> {
-    self.s3.as_ref()
+    match &self.location {
+      Location::Http => None,
+      Location::S3(config) => Some(config),
+    }
   }
 }
 
