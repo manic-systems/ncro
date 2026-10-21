@@ -24,7 +24,7 @@ const fn backoff_interval(base: Duration, consecutive_fails: u32) -> Duration {
   base.saturating_mul(multiplier)
 }
 
-use ncro_config::UpstreamConfig;
+use ncro_config::{Location, UpstreamConfig};
 use ncro_s3::S3ClientPool;
 use rustls::crypto::ring;
 use tokio::{
@@ -128,7 +128,7 @@ impl Prober {
     {
       let mut table = self.inner.table.write().await;
       for upstream in upstreams {
-        if let Some(s3) = &upstream.s3 {
+        if let Location::S3(s3) = &upstream.location {
           self.inner.s3.register(upstream.url.clone(), s3.clone());
         }
         table.entry(upstream.url.clone()).or_insert_with(|| {

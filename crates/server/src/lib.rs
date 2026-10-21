@@ -23,7 +23,7 @@ use axum::{
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use misstep::Report;
-use ncro_config::{NarHedgingConfig, UpstreamConfig};
+use ncro_config::{Location, NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_narinfo::{NarInfo, is_store_hash};
@@ -150,12 +150,12 @@ pub fn app(
   } = config;
   let s3 = S3ClientPool::default();
   for upstream in &upstreams {
-    if let Some(config) = &upstream.s3 {
+    if let Location::S3(config) = &upstream.location {
       s3.register(upstream.url.clone(), config.clone());
     }
   }
   if let Some(upstream) = &fallback_cache
-    && let Some(config) = &upstream.s3
+    && let Location::S3(config) = &upstream.location
   {
     s3.register(upstream.url.clone(), config.clone());
   }
