@@ -29,6 +29,7 @@ ncro-mesh.workspace      = true
 ncro-metrics.workspace   = true
 ncro-router.workspace    = true
 ncro-server.workspace    = true
+ncro-upstream.workspace  = true
 
 [lints]
 workspace = true

@@ -14,20 +14,17 @@ use ncro_config::{
   FilterAction,
   FilterField,
   FilterRule,
-  Location,
   NarUrlMode,
-  S3Config,
   UpstreamConfig,
 };
 use ncro_db::{Db, DbError, RouteEntry};
 use ncro_health::{Prober, Status};
 use ncro_narinfo::{NarInfo, NarInfoError, is_store_hash, parse_public_key};
-use ncro_s3::{S3ClientPool, S3Error};
+use ncro_upstream::{BackendError, Upstreams};
 use reqwest::{
-  StatusCode,
+  Method,
   header::{HeaderMap, HeaderName, HeaderValue},
 };
-use rustls::crypto::ring;
 use tokio::{
   sync::{Mutex, RwLock, Semaphore},
   task::JoinSet,
@@ -45,9 +42,7 @@ pub enum RouterError {
   #[error("narinfo signature verification failed")]
   SignatureVerificationFailed,
   #[error("fetch narinfo")]
-  FetchNarinfo(#[from] reqwest::Error),
-  #[error(transparent)]
-  S3(#[from] S3Error),
+  Backend(#[from] BackendError),
   #[error("parse narinfo")]
   ParseNarinfo(#[from] NarInfoError),
   #[error(transparent)]
@@ -58,20 +53,15 @@ pub enum RouterError {
 pub enum UpstreamRegistrationError {
   #[error("invalid upstream public key")]
   PublicKey(#[from] NarInfoError),
-  #[error("build upstream HTTP client")]
-  HttpClient(#[from] reqwest::Error),
 }
 
 pub trait RouterUpstream {
   fn url(&self) -> &str;
   fn public_key(&self) -> &str;
   fn public_keys(&self) -> &[String];
-  fn username(&self) -> &str;
-  fn password(&self) -> Option<&str>;
   fn filters(&self) -> &[FilterRule];
   fn nar_url_mode(&self) -> NarUrlMode;
   fn narinfo_timeout(&self) -> Option<Duration>;
-  fn s3(&self) -> Option<&S3Config>;
 }
 
 impl RouterUpstream for UpstreamConfig {
@@ -87,14 +77,6 @@ impl RouterUpstream for UpstreamConfig {
     &self.public_keys
   }
 
-  fn username(&self) -> &str {
-    &self.username
-  }
-
-  fn password(&self) -> Option<&str> {
-    self.password.as_deref()
-  }
-
   fn filters(&self) -> &[FilterRule] {
     &self.filters
   }
@@ -105,13 +87,6 @@ impl RouterUpstream for UpstreamConfig {
 
   fn narinfo_timeout(&self) -> Option<Duration> {
     self.narinfo_timeout.as_ref().map(|timeout| timeout.0)
-  }
-
-  fn s3(&self) -> Option<&S3Config> {
-    match &self.location {
-      Location::Http => None,
-      Location::S3(config) => Some(config),
-    }
   }
 }
 
@@ -216,11 +191,9 @@ struct RouterInner {
   route_ttl:                Duration,
   race_timeout:             Duration,
   negative_ttl:             Duration,
-  client:                   reqwest::Client,
-  upstream_clients:         RwLock<HashMap<String, reqwest::Client>>,
-  s3:                       S3ClientPool,
+  upstreams:                Upstreams,
+  narinfo_timeouts:         RwLock<HashMap<String, Duration>>,
   upstream_keys:            RwLock<HashMap<String, Vec<String>>>,
-  upstream_auth:            RwLock<HashMap<String, (String, Option<String>)>>,
   upstream_filters:         RwLock<HashMap<String, Vec<FilterRule>>>,
   upstream_nar_url_modes:   RwLock<HashMap<String, NarUrlMode>>,
   inflight:                 DashMap<String, Arc<Mutex<()>>>,
@@ -287,32 +260,26 @@ impl Drop for InflightGuard<'_> {
 
 impl Router {
   /// Create a router backed by the database and health prober.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if the HTTP client cannot be constructed.
+  #[must_use]
   pub fn new(
     db: Db,
     prober: Prober,
+    upstreams: Upstreams,
     route_ttl: Duration,
     race_timeout: Duration,
     negative_ttl: Duration,
     tuning: RouterTuning,
-  ) -> Result<Self, reqwest::Error> {
-    let _ = ring::default_provider().install_default();
-
-    Ok(Self {
+  ) -> Self {
+    Self {
       inner: Arc::new(RouterInner {
         db,
         prober,
         route_ttl,
         race_timeout,
         negative_ttl,
-        client: reqwest::Client::builder().timeout(race_timeout).build()?,
-        upstream_clients: RwLock::new(HashMap::new()),
-        s3: S3ClientPool::default(),
+        upstreams,
+        narinfo_timeouts: RwLock::new(HashMap::new()),
         upstream_keys: RwLock::new(HashMap::new()),
-        upstream_auth: RwLock::new(HashMap::new()),
         upstream_filters: RwLock::new(HashMap::new()),
         upstream_nar_url_modes: RwLock::new(HashMap::new()),
         inflight: DashMap::new(),
@@ -326,7 +293,7 @@ impl Router {
         upstream_cooldown: DashMap::new(),
         upstream_cooldown_window: tuning.upstream_cooldown,
       }),
-    })
+    }
   }
 
   /// # Errors
@@ -338,9 +305,6 @@ impl Router {
     upstream: &(impl RouterUpstream + Sync + ?Sized),
   ) -> Result<(), UpstreamRegistrationError> {
     let url = upstream.url().to_string();
-    if let Some(s3) = upstream.s3() {
-      self.inner.s3.register(url.clone(), s3.clone());
-    }
     self
       .register_upstream_keys(
         url.clone(),
@@ -349,13 +313,6 @@ impl Router {
       )
       .await?;
     self
-      .register_upstream_auth(
-        url.clone(),
-        upstream.username().to_string(),
-        upstream.password().map(str::to_string),
-      )
-      .await;
-    self
       .register_upstream_filters(url.clone(), upstream.filters().to_vec())
       .await;
     self
@@ -363,7 +320,7 @@ impl Router {
       .await;
     self
       .register_upstream_narinfo_timeout(url, upstream.narinfo_timeout())
-      .await?;
+      .await;
     Ok(())
   }
 
@@ -389,20 +346,6 @@ impl Router {
     }
     drop(map);
     Ok(())
-  }
-
-  async fn register_upstream_auth(
-    &self,
-    url: String,
-    username: String,
-    password: Option<String>,
-  ) {
-    let mut map = self.inner.upstream_auth.write().await;
-    if username.is_empty() {
-      map.remove(&url);
-    } else {
-      map.insert(url, (username, password));
-    }
   }
 
   pub(crate) async fn register_upstream_filters(
@@ -432,26 +375,18 @@ impl Router {
       .insert(url, mode);
   }
 
-  /// Build and register a per-upstream HTTP client with a custom narinfo
-  /// timeout. When set, this client is used in place of the default
-  /// race-timeout client for HEAD races and GET fetches against `url`.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if the per-upstream client cannot be built.
+  /// Overrides the race timeout for HEAD races and GET fetches against `url`.
   async fn register_upstream_narinfo_timeout(
     &self,
     url: String,
     timeout: Option<Duration>,
-  ) -> Result<(), reqwest::Error> {
-    let mut map = self.inner.upstream_clients.write().await;
+  ) {
+    let mut map = self.inner.narinfo_timeouts.write().await;
     if let Some(timeout) = timeout {
-      map.insert(url, reqwest::Client::builder().timeout(timeout).build()?);
+      map.insert(url, timeout);
     } else {
       map.remove(&url);
     }
-    drop(map);
-    Ok(())
   }
 
   /// Resolve through a last-resort fallback cache without using route cache,
@@ -768,56 +703,34 @@ impl Router {
     group: &[String],
     hop: Hop,
   ) -> (Result<RaceResult, RaceGroupError>, u32) {
-    let auth_snapshot = self.inner.upstream_auth.read().await.clone();
-    let clients_snapshot = self.inner.upstream_clients.read().await.clone();
+    let timeouts = self.inner.narinfo_timeouts.read().await.clone();
     let mut handles = JoinSet::new();
     for upstream in group {
       let upstream = upstream.clone();
-      let store_hash = store_hash.to_string();
-      let client = clients_snapshot
+      let path = format!("/{store_hash}.narinfo");
+      let backend = self.inner.upstreams.get(&upstream);
+      let timeout = timeouts
         .get(&upstream)
-        .cloned()
-        .unwrap_or_else(|| self.inner.client.clone());
-      let s3 = self.inner.s3.clone();
+        .copied()
+        .unwrap_or(self.inner.race_timeout);
       let gate = self.upstream_gate(&upstream, hop);
-      let auth = auth_snapshot.get(&upstream).cloned();
       handles.spawn(async move {
         let Ok(_permit) = gate.acquire_owned().await else {
           return RaceAttempt::NetworkError { upstream };
         };
         let start = Instant::now();
-        if s3.contains(&upstream) {
-          match s3
-            .head_object(&upstream, &format!("{store_hash}.narinfo"))
-            .await
-          {
-            Ok(true) => {
-              RaceAttempt::Winner(RaceResult {
-                url:        upstream,
-                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
-              })
-            },
-            Ok(false) => RaceAttempt::NotFound,
-            Err(_) => RaceAttempt::NetworkError { upstream },
-          }
-        } else {
-          let mut req = client
-            .head(format!("{upstream}/{store_hash}.narinfo"))
-            .header(HOP_HEADER, hop.outgoing());
-          if let Some((user, pass)) = auth {
-            req = req.basic_auth(user, pass);
-          }
-          let res = req.send().await;
-          match res {
-            Ok(resp) if resp.status().is_success() => {
-              RaceAttempt::Winner(RaceResult {
-                url:        upstream,
-                latency_ms: start.elapsed().as_secs_f64() * 1000.0,
-              })
-            },
-            Ok(resp) if is_miss_status(resp.status()) => RaceAttempt::NotFound,
-            Ok(_) | Err(_) => RaceAttempt::NetworkError { upstream },
-          }
+        match backend
+          .send(Method::HEAD, &path, hop_headers(hop), Some(timeout))
+          .await
+        {
+          Ok(Some(_)) => {
+            RaceAttempt::Winner(RaceResult {
+              url:        upstream,
+              latency_ms: start.elapsed().as_secs_f64() * 1000.0,
+            })
+          },
+          Ok(None) => RaceAttempt::NotFound,
+          Err(_) => RaceAttempt::NetworkError { upstream },
         }
       });
     }
@@ -1148,35 +1061,26 @@ impl Router {
     store_hash: &str,
     hop: Hop,
   ) -> Result<(Option<Vec<u8>>, NarInfo), RouterError> {
-    let body = if self.inner.s3.contains(upstream) {
-      self
-        .inner
-        .s3
-        .get_object_bytes(upstream, &format!("{store_hash}.narinfo"))
-        .await?
-        .ok_or(RouterError::NotFound)?
-    } else {
-      let auth = self.inner.upstream_auth.read().await.get(upstream).cloned();
-      let client = self
-        .inner
-        .upstream_clients
-        .read()
-        .await
-        .get(upstream)
-        .cloned()
-        .unwrap_or_else(|| self.inner.client.clone());
-      let mut req = client
-        .get(format!("{upstream}/{store_hash}.narinfo"))
-        .header(HOP_HEADER, hop.outgoing());
-      if let Some((user, pass)) = auth {
-        req = req.basic_auth(user, pass);
-      }
-      let resp = req.send().await?;
-      if is_miss_status(resp.status()) {
-        return Err(RouterError::NotFound);
-      }
-      resp.error_for_status()?.bytes().await?.to_vec()
-    };
+    let timeout = self
+      .inner
+      .narinfo_timeouts
+      .read()
+      .await
+      .get(upstream)
+      .copied()
+      .unwrap_or(self.inner.race_timeout);
+    let body = self
+      .inner
+      .upstreams
+      .get(upstream)
+      .get_bytes(
+        &format!("/{store_hash}.narinfo"),
+        hop_headers(hop),
+        Some(timeout),
+      )
+      .await?
+      .ok_or(RouterError::NotFound)?
+      .to_vec();
     let parsed = NarInfo::parse(body.as_slice())?;
     if let Some(public_keys) =
       self.inner.upstream_keys.read().await.get(upstream)
@@ -1347,12 +1251,8 @@ fn filter_rule_matches(rule: &FilterRule, narinfo: &NarInfo) -> bool {
   }
 }
 
-/// The statuses Nix's HTTP binary cache store also treats as a missing file.
-const fn is_miss_status(status: StatusCode) -> bool {
-  matches!(
-    status,
-    StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE
-  )
+fn hop_headers(hop: Hop) -> HeaderMap {
+  HeaderMap::from_iter([(HOP_HEADER, hop.outgoing())])
 }
 
 const fn commit_error_is_retryable(err: &RouterError) -> bool {
@@ -1361,13 +1261,12 @@ const fn commit_error_is_retryable(err: &RouterError) -> bool {
     RouterError::NotFound
       | RouterError::SignatureVerificationFailed
       | RouterError::ParseNarinfo(_)
-      | RouterError::FetchNarinfo(_)
-      | RouterError::S3(_)
+      | RouterError::Backend(_)
   )
 }
 
 const fn commit_error_is_network_like(err: &RouterError) -> bool {
-  matches!(err, RouterError::FetchNarinfo(_) | RouterError::S3(_))
+  matches!(err, RouterError::Backend(_))
 }
 
 fn store_path_name(store_path: &str) -> &str {
@@ -1434,6 +1333,7 @@ mod tests {
     Router,
     RouterError,
     RouterTuning,
+    Upstreams,
     canonical_nar_url,
     filter_rule_matches,
     narinfo_verifies_any_key,
@@ -1454,11 +1354,16 @@ mod tests {
     let db = Db::open(":memory:", 100, Duration::from_secs(1))
       .await
       .unwrap();
-    let prober = Prober::new(0.3).unwrap();
+    let registry = Upstreams::new().unwrap();
+    for upstream in upstreams {
+      registry.register(upstream);
+    }
+    let prober = Prober::new(0.3, registry.clone());
     prober.init_upstreams(upstreams).await;
     Router::new(
       db,
       prober,
+      registry,
       Duration::from_hours(1),
       Duration::from_secs(5),
       Duration::from_mins(10),
@@ -1469,7 +1374,6 @@ mod tests {
         upstream_cooldown:         cooldown,
       },
     )
-    .unwrap()
   }
 
   async fn spawn_narinfo_server(get_status: u16, store_name: &str) -> String {

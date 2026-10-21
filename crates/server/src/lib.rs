@@ -16,6 +16,8 @@ use axum::{
     Method,
     Request,
     StatusCode,
+    header::{ACCEPT, ACCEPT_ENCODING, RANGE},
+    response::Builder as ResponseBuilder,
     uri::PathAndQuery,
   },
   response::{IntoResponse, Response},
@@ -23,7 +25,7 @@ use axum::{
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use misstep::Report;
-use ncro_config::{Location, NarHedgingConfig, UpstreamConfig};
+use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
 use ncro_narinfo::{NarInfo, is_store_hash};
@@ -35,8 +37,7 @@ use ncro_router::{
   compression_for_nar_url,
   store_hash_from_canonical_nar_url,
 };
-use ncro_s3::S3ClientPool;
-use rustls::crypto::ring;
+use ncro_upstream::{Backend, Upstreams};
 use serde::Serialize;
 use tokio::{
   task::JoinSet,
@@ -97,9 +98,7 @@ pub struct AppState {
   db:                  Db,
   upstreams:           Vec<UpstreamConfig>,
   fallback_cache:      Option<UpstreamConfig>,
-  s3:                  S3ClientPool,
-  nar_client:          reqwest::Client,
-  narinfo_client:      reqwest::Client,
+  backends:            Upstreams,
   nar_timeouts:        HashMap<String, Duration>,
   default_nar_timeout: Duration,
   nar_hedging:         NarHedgingConfig,
@@ -129,16 +128,13 @@ pub struct AppConfig {
 }
 
 /// Build the HTTP application router.
-///
-/// # Errors
-///
-/// Returns an error if the proxy HTTP client cannot be constructed.
 pub fn app(
   router: Router,
   prober: Prober,
   db: Db,
+  backends: Upstreams,
   config: AppConfig,
-) -> Result<AxumRouter, reqwest::Error> {
+) -> AxumRouter {
   let AppConfig {
     upstreams,
     fallback_cache,
@@ -148,29 +144,11 @@ pub fn app(
     read_timeout,
     write_timeout,
   } = config;
-  let s3 = S3ClientPool::default();
-  for upstream in &upstreams {
-    if let Location::S3(config) = &upstream.location {
-      s3.register(upstream.url.clone(), config.clone());
-    }
-  }
-  if let Some(upstream) = &fallback_cache
-    && let Location::S3(config) = &upstream.location
-  {
-    s3.register(upstream.url.clone(), config.clone());
-  }
-
   let mut nar_timeouts = HashMap::new();
   for upstream in upstreams.iter().chain(fallback_cache.iter()) {
     let timeout = upstream.nar_timeout.as_ref().map_or(read_timeout, |t| t.0);
     nar_timeouts.entry(upstream.url.clone()).or_insert(timeout);
   }
-
-  let _ = ring::default_provider().install_default();
-  let nar_client = reqwest::Client::builder().build()?;
-  let narinfo_client = reqwest::Client::builder()
-    .read_timeout(read_timeout)
-    .build()?;
 
   let state = AppState {
     router,
@@ -178,9 +156,7 @@ pub fn app(
     db,
     upstreams,
     fallback_cache,
-    s3,
-    nar_client,
-    narinfo_client,
+    backends,
     nar_timeouts,
     default_nar_timeout: read_timeout,
     nar_hedging,
@@ -188,21 +164,19 @@ pub fn app(
     want_mass_query,
     started: Instant::now(),
   };
-  Ok(
-    AxumRouter::new()
-      .merge(
-        AxumRouter::new()
-          .route("/nix-cache-info", get(cache_info).head(cache_info))
-          .route("/health", get(health))
-          .route("/status", get(status_endpoint))
-          .route("/metrics", get(metrics_endpoint))
-          .route("/{hash_narinfo}", get(narinfo).head(narinfo))
-          .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
-      )
-      .merge(AxumRouter::new().route("/nar/{*path}", get(nar).head(nar)))
-      .layer(RequestBodyTimeoutLayer::new(read_timeout))
-      .with_state(Arc::new(state)),
-  )
+  AxumRouter::new()
+    .merge(
+      AxumRouter::new()
+        .route("/nix-cache-info", get(cache_info).head(cache_info))
+        .route("/health", get(health))
+        .route("/status", get(status_endpoint))
+        .route("/metrics", get(metrics_endpoint))
+        .route("/{hash_narinfo}", get(narinfo).head(narinfo))
+        .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
+    )
+    .merge(AxumRouter::new().route("/nar/{*path}", get(nar).head(nar)))
+    .layer(RequestBodyTimeoutLayer::new(read_timeout))
+    .with_state(Arc::new(state))
 }
 
 /// Render the `/nix-cache-info` body. `WantMassQuery` is `1` when
@@ -345,13 +319,8 @@ async fn status_endpoint(State(state): State<Arc<AppState>>) -> Response {
   let upstreams = sorted
     .into_iter()
     .map(|h| {
-      let kind = if state.s3.contains(&h.url) {
-        "s3"
-      } else {
-        "http"
-      };
-      let authenticated = upstream_auth(&state, &h.url).is_some();
-      upstream_status_full(h, now, kind, authenticated)
+      let backend = state.backends.get(&h.url);
+      upstream_status_full(h, now, backend.kind(), backend.is_authenticated())
     })
     .collect();
 
@@ -364,13 +333,13 @@ async fn status_endpoint(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or_else(|| {
           UpstreamHealth::new(fallback.url.clone(), fallback.priority)
         });
-    let kind = if state.s3.contains(&fallback.url) {
-      "s3"
-    } else {
-      "http"
-    };
-    let authenticated = upstream_auth(&state, &fallback.url).is_some();
-    Some(upstream_status_full(health, now, kind, authenticated))
+    let backend = state.backends.get(&fallback.url);
+    Some(upstream_status_full(
+      health,
+      now,
+      backend.kind(),
+      backend.is_authenticated(),
+    ))
   } else {
     None
   };
@@ -444,12 +413,11 @@ async fn narinfo(
       }
       with_provenance(
         proxy(
-          &state.narinfo_client,
+          &state,
+          &result.url,
           req.method().clone(),
-          req.headers(),
-          format!("{}{}", result.url, req.uri().path()),
-          upstream_auth(&state, &result.url),
-          hop,
+          req.uri().path(),
+          forwarded_headers(req.headers(), Some(hop)),
         )
         .await,
         &result.url,
@@ -503,14 +471,12 @@ fn spawn_nar_attempt(
     let response = timeout(
       response_timeout,
       try_nar_upstream(NarUpstreamRequest {
-        client: &state.nar_client,
-        s3: &state.s3,
+        backend: &state.backends.get(&candidate.upstream),
         method,
         headers: &headers,
         upstream: &candidate.upstream,
         path: &candidate.path,
         route: candidate.route,
-        auth: upstream_auth(&state, &candidate.upstream),
       }),
     )
     .await
@@ -751,14 +717,12 @@ async fn nar(
     && let Ok(Some(resp)) = timeout(
       state.nar_timeout(&fallback.url),
       try_nar_upstream(NarUpstreamRequest {
-        client:   &state.nar_client,
-        s3:       &state.s3,
+        backend:  &state.backends.get(&fallback.url),
         method:   req.method().clone(),
         headers:  req.headers(),
         upstream: &fallback.url,
         path:     &path_and_query,
         route:    RouteKind::Fallback,
-        auth:     upstream_auth(&state, &fallback.url),
       }),
     )
     .await
@@ -805,12 +769,11 @@ async fn try_fallback_narinfo(
       }
       Some(with_provenance(
         proxy(
-          &state.narinfo_client,
+          state,
+          &result.url,
           req.method().clone(),
-          req.headers(),
-          format!("{}{}", result.url, req.uri().path()),
-          upstream_auth(state, &result.url),
-          hop,
+          req.uri().path(),
+          forwarded_headers(req.headers(), Some(hop)),
         )
         .await,
         &result.url,
@@ -831,18 +794,6 @@ async fn try_fallback_narinfo(
   }
 }
 
-fn upstream_auth(
-  state: &AppState,
-  url: &str,
-) -> Option<(String, Option<String>)> {
-  state
-    .upstreams
-    .iter()
-    .chain(state.fallback_cache.iter())
-    .find(|u| u.url == url && !u.username.is_empty())
-    .map(|u| (u.username.clone(), u.password.clone()))
-}
-
 async fn upstream_urls(state: &AppState) -> Vec<String> {
   let urls = state
     .prober
@@ -860,77 +811,66 @@ async fn upstream_urls(state: &AppState) -> Vec<String> {
 }
 
 struct NarUpstreamRequest<'a> {
-  client:   &'a reqwest::Client,
-  s3:       &'a S3ClientPool,
+  backend:  &'a Backend,
   method:   Method,
   headers:  &'a HeaderMap,
   upstream: &'a str,
   path:     &'a str,
   route:    RouteKind,
-  auth:     Option<(String, Option<String>)>,
 }
 
 async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
   let NarUpstreamRequest {
-    client,
-    s3,
+    backend,
     method,
     headers,
     upstream,
     path,
     route,
-    auth,
   } = req;
-  if s3.contains(upstream) {
-    let key = path.trim_start_matches('/');
-    if method == Method::HEAD {
-      let metadata = s3.head_object_metadata(upstream, key).await.ok()??;
-      return Some(with_provenance(
-        response_from_s3_head(metadata),
-        upstream,
-        route,
-      ));
-    }
-    if method != Method::GET {
-      return None;
-    }
-    let range = headers.get("range").and_then(|value| value.to_str().ok());
-    let object = s3.get_object(upstream, key, range).await.ok()??;
-    let response = response_from_s3_first_byte(object).await?;
-    return Some(with_provenance(response, upstream, route));
-  }
-  let resp = upstream_request(
-    client,
-    method.clone(),
-    headers,
-    format!("{upstream}{path}"),
-    auth,
-    None,
-  )
-  .await
-  .ok()?;
-  if !resp.status().is_success() {
-    return None;
-  }
-  if method == Method::HEAD {
-    let status = StatusCode::from_u16(resp.status().as_u16()).ok()?;
-    let response = response_from_headers(status, resp.headers(), Body::empty());
-    return Some(with_provenance(response, upstream, route));
-  }
-  let response = response_from_reqwest_first_byte(resp).await?;
+  let head = method == Method::HEAD;
+  let resp = backend
+    .send(method, path, forwarded_headers(headers, None), None)
+    .await
+    .ok()??;
+  let builder = response_builder(&resp)?;
+  let response = if head {
+    builder.body(Body::empty()).ok()?
+  } else {
+    let mut stream = Box::pin(resp.bytes_stream().map_err(io::Error::other));
+    let first = stream.try_next().await.ok()??;
+    builder
+      .body(Body::from_stream(
+        stream::once(async move { Ok(first) }).chain(stream),
+      ))
+      .ok()?
+  };
   Some(with_provenance(response, upstream, route))
 }
 
 async fn proxy(
-  client: &reqwest::Client,
+  state: &AppState,
+  upstream: &str,
   method: Method,
-  headers: &HeaderMap,
-  url: String,
-  auth: Option<(String, Option<String>)>,
-  hop: Hop,
+  path: &str,
+  headers: HeaderMap,
 ) -> Response {
-  match upstream_request(client, method, headers, url, auth, Some(hop)).await {
-    Ok(resp) => response_from_reqwest(resp),
+  let result = state
+    .backends
+    .get(upstream)
+    .send(method, path, headers, Some(state.default_nar_timeout))
+    .await;
+  match result {
+    Ok(Some(resp)) => {
+      let Some(builder) = response_builder(&resp) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+      };
+      let stream = resp.bytes_stream().map_err(io::Error::other);
+      builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    },
+    Ok(None) => StatusCode::NOT_FOUND.into_response(),
     Err(err) => {
       tracing::warn!(error = %Report::new(err), "upstream request failed");
       (StatusCode::BAD_GATEWAY, "upstream error").into_response()
@@ -938,35 +878,22 @@ async fn proxy(
   }
 }
 
-async fn upstream_request(
-  client: &reqwest::Client,
-  method: Method,
-  headers: &HeaderMap,
-  url: String,
-  auth: Option<(String, Option<String>)>,
-  hop: Option<Hop>,
-) -> reqwest::Result<reqwest::Response> {
-  let mut req = client.request(method, url);
-  if let Some((user, pass)) = auth {
-    req = req.basic_auth(user, pass);
-  }
-  if let Some(hop) = hop {
-    req = req.header(HOP_HEADER, hop.outgoing());
-  }
-  for name in ["accept", "accept-encoding", "range"] {
-    if let Some(value) = headers.get(name) {
-      req = req.header(name, value);
+fn forwarded_headers(headers: &HeaderMap, hop: Option<Hop>) -> HeaderMap {
+  let mut out = HeaderMap::new();
+  for name in [ACCEPT, ACCEPT_ENCODING, RANGE] {
+    if let Some(value) = headers.get(&name) {
+      out.insert(name, value.clone());
     }
   }
-  req.send().await
+  if let Some(hop) = hop {
+    out.insert(HOP_HEADER, hop.outgoing());
+  }
+  out
 }
 
-fn response_from_headers(
-  status: StatusCode,
-  headers: &HeaderMap,
-  body: Body,
-) -> Response {
-  let mut out = Response::builder().status(status);
+fn response_builder(resp: &reqwest::Response) -> Option<ResponseBuilder> {
+  let mut out = Response::builder()
+    .status(StatusCode::from_u16(resp.status().as_u16()).ok()?);
   for name in [
     "accept-ranges",
     "content-type",
@@ -978,88 +905,11 @@ fn response_from_headers(
     "cache-control",
     "last-modified",
   ] {
-    if let Some(value) = headers.get(name)
-      && let (Ok(header_name), Ok(header_value)) = (
-        HeaderName::from_bytes(name.as_bytes()),
-        HeaderValue::from_bytes(value.as_bytes()),
-      )
-    {
-      out = out.header(header_name, header_value);
-    }
-  }
-  out
-    .body(body)
-    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-fn response_from_reqwest(resp: reqwest::Response) -> Response {
-  let status = StatusCode::from_u16(resp.status().as_u16())
-    .unwrap_or(StatusCode::BAD_GATEWAY);
-  let headers = resp.headers().clone();
-  let stream = resp.bytes_stream().map_err(io::Error::other);
-  response_from_headers(status, &headers, Body::from_stream(stream))
-}
-
-async fn response_from_reqwest_first_byte(
-  resp: reqwest::Response,
-) -> Option<Response> {
-  let status = StatusCode::from_u16(resp.status().as_u16()).ok()?;
-  let headers = resp.headers().clone();
-  let mut stream = Box::pin(resp.bytes_stream().map_err(io::Error::other));
-  let first = stream.try_next().await.ok()??;
-  let body =
-    Body::from_stream(stream::once(async move { Ok(first) }).chain(stream));
-  Some(response_from_headers(status, &headers, body))
-}
-
-async fn response_from_s3_first_byte(
-  object: ncro_s3::S3Object,
-) -> Option<Response> {
-  let mut stream = Box::pin(S3ClientPool::body_stream(object.body));
-  let first = stream.try_next().await.ok()??;
-  let mut out =
-    Response::builder().status(StatusCode::from_u16(object.status).ok()?);
-  for (name, value) in [
-    ("accept-ranges", object.accept_ranges),
-    ("content-type", object.content_type),
-    (
-      "content-length",
-      object.content_length.map(|value| value.to_string()),
-    ),
-    ("content-range", object.content_range),
-    ("etag", object.etag),
-    ("last-modified", object.last_modified),
-  ] {
-    if let Some(value) = value {
+    if let Some(value) = resp.headers().get(name) {
       out = out.header(name, value);
     }
   }
-  out
-    .body(Body::from_stream(
-      stream::once(async move { Ok(first) }).chain(stream),
-    ))
-    .ok()
-}
-
-fn response_from_s3_head(metadata: ncro_s3::S3ObjectHead) -> Response {
-  let mut out = Response::builder().status(StatusCode::OK);
-  for (name, value) in [
-    ("accept-ranges", metadata.accept_ranges),
-    ("content-type", metadata.content_type),
-    (
-      "content-length",
-      metadata.content_length.map(|value| value.to_string()),
-    ),
-    ("etag", metadata.etag),
-    ("last-modified", metadata.last_modified),
-  ] {
-    if let Some(value) = value {
-      out = out.header(name, value);
-    }
-  }
-  out
-    .body(Body::empty())
-    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+  Some(out)
 }
 
 #[cfg(test)]

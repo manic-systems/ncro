@@ -1,5 +1,5 @@
 [package]
-name                  = "ncro-s3"
+name                  = "ncro-upstream"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
@@ -16,9 +16,9 @@ aws-smithy-types.workspace       = true
 bytes.workspace                  = true
 dashmap.workspace                = true
 flub.workspace                   = true
-futures-util.workspace           = true
 ncro-config.workspace            = true
 reqwest                          = { workspace = true, features = [ "rustls-no-provider", "stream" ] }
+rustls.workspace                 = true
 tokio                            = { workspace = true, features = [ "sync", "time" ] }
 
 [lints]

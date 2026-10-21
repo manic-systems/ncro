@@ -24,9 +24,9 @@ const fn backoff_interval(base: Duration, consecutive_fails: u32) -> Duration {
   base.saturating_mul(multiplier)
 }
 
-use ncro_config::{Location, UpstreamConfig};
-use ncro_s3::S3ClientPool;
-use rustls::crypto::ring;
+use ncro_config::UpstreamConfig;
+use ncro_upstream::Upstreams;
+use reqwest::{Method, StatusCode, header::HeaderMap};
 use tokio::{
   sync::{RwLock, watch},
   task::JoinHandle,
@@ -92,31 +92,22 @@ pub struct Prober {
 struct ProberInner {
   alpha:          f64,
   table:          RwLock<HashMap<String, UpstreamHealth>>,
-  auth:           RwLock<HashMap<String, (String, Option<String>)>>,
-  s3:             S3ClientPool,
-  client:         reqwest::Client,
+  upstreams:      Upstreams,
   persist_health: RwLock<Option<PersistHealth>>,
 }
 
 impl Prober {
   /// Create a prober with the given exponential moving average alpha.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error if the HTTP client cannot be constructed.
-  pub fn new(alpha: f64) -> Result<Self, reqwest::Error> {
-    let _ = ring::default_provider().install_default();
-
-    Ok(Self {
+  #[must_use]
+  pub fn new(alpha: f64, upstreams: Upstreams) -> Self {
+    Self {
       inner: Arc::new(ProberInner {
         alpha,
         table: RwLock::new(HashMap::new()),
-        auth: RwLock::new(HashMap::new()),
-        s3: S3ClientPool::default(),
-        client: reqwest::Client::builder().timeout(PROBE_TIMEOUT).build()?,
+        upstreams,
         persist_health: RwLock::new(None),
       }),
-    })
+    }
   }
 
   #[must_use]
@@ -125,26 +116,11 @@ impl Prober {
   }
 
   pub async fn init_upstreams(&self, upstreams: &[UpstreamConfig]) {
-    {
-      let mut table = self.inner.table.write().await;
-      for upstream in upstreams {
-        if let Location::S3(s3) = &upstream.location {
-          self.inner.s3.register(upstream.url.clone(), s3.clone());
-        }
-        table.entry(upstream.url.clone()).or_insert_with(|| {
-          UpstreamHealth::new(upstream.url.clone(), upstream.priority)
-        });
-      }
-    }
-    {
-      let mut auth = self.inner.auth.write().await;
-      for upstream in upstreams {
-        if !upstream.username.is_empty() {
-          auth.entry(upstream.url.clone()).or_insert_with(|| {
-            (upstream.username.clone(), upstream.password.clone())
-          });
-        }
-      }
+    let mut table = self.inner.table.write().await;
+    for upstream in upstreams {
+      table.entry(upstream.url.clone()).or_insert_with(|| {
+        UpstreamHealth::new(upstream.url.clone(), upstream.priority)
+      });
     }
   }
 
@@ -272,63 +248,26 @@ impl Prober {
     if !self.inner.table.read().await.contains_key(&url) {
       return;
     }
-    let auth = self.inner.auth.read().await.get(&url).cloned();
+    let backend = self.inner.upstreams.get(&url);
     let start = Instant::now();
-    let ok = if self.inner.s3.contains(&url) {
-      let probe = async {
-        match self.inner.s3.head_object(&url, "nix-cache-info").await {
-          Ok(true) => true,
-          Ok(false) => false,
-          Err(head_error) => {
-            tracing::debug!(
-              upstream = %url,
-              error = %head_error,
-              "S3 HEAD probe failed, trying GET"
-            );
-            match self.inner.s3.get_object(&url, "nix-cache-info", None).await {
-              Ok(Some(object)) => {
-                drop(object.body);
-                true
-              },
-              Ok(None) => false,
-              Err(get_error) => {
-                tracing::debug!(
-                  upstream = %url,
-                  error = %get_error,
-                  "S3 GET probe failed"
-                );
-                false
-              },
-            }
+    let probe = async {
+      for method in [Method::HEAD, Method::GET] {
+        match backend
+          .send(method, "/nix-cache-info", HeaderMap::new(), None)
+          .await
+        {
+          Ok(Some(resp)) if resp.status() == StatusCode::OK => return true,
+          Ok(_) => {},
+          Err(err) => {
+            tracing::debug!(upstream = %url, error = %err, "probe failed");
           },
         }
-      };
-      tokio_time::timeout(PROBE_TIMEOUT, probe)
-        .await
-        .unwrap_or(false)
-    } else {
-      let url_path = format!("{url}/nix-cache-info");
-      let mut head_req = self.inner.client.head(&url_path);
-      if let Some((user, pass)) = auth.clone() {
-        head_req = head_req.basic_auth(user, pass);
       }
-      let head_ok = head_req
-        .send()
-        .await
-        .is_ok_and(|resp| resp.status().as_u16() == 200);
-      if head_ok {
-        true
-      } else {
-        let mut get_req = self.inner.client.get(&url_path);
-        if let Some((user, pass)) = auth {
-          get_req = get_req.basic_auth(user, pass);
-        }
-        get_req
-          .send()
-          .await
-          .is_ok_and(|resp| resp.status().as_u16() == 200)
-      }
+      false
     };
+    let ok = tokio_time::timeout(PROBE_TIMEOUT, probe)
+      .await
+      .unwrap_or(false);
     if ok {
       self
         .record_latency(&url, start.elapsed().as_secs_f64() * 1000.0)
@@ -423,7 +362,7 @@ mod tests {
 
   #[tokio::test]
   async fn ema_and_status_progression() -> misstep::Result<()> {
-    let p = Prober::new(0.3)?;
+    let p = Prober::new(0.3, Upstreams::new()?);
     p.add_upstream("https://example.com".into(), 1).await;
     p.record_latency("https://example.com", 100.0).await;
     p.record_latency("https://example.com", 50.0).await;
@@ -468,7 +407,7 @@ mod tests {
 
   #[tokio::test]
   async fn first_record_latency_sets_exact_ema() -> misstep::Result<()> {
-    let p = Prober::new(0.3)?;
+    let p = Prober::new(0.3, Upstreams::new()?);
     p.add_upstream("https://example.com".into(), 1).await;
     p.record_latency("https://example.com", 42.0).await;
     let h = p
@@ -486,7 +425,7 @@ mod tests {
 
   #[tokio::test]
   async fn record_latency_resets_consecutive_fails() -> misstep::Result<()> {
-    let p = Prober::new(0.3)?;
+    let p = Prober::new(0.3, Upstreams::new()?);
     p.add_upstream("https://example.com".into(), 1).await;
     for _ in 0..5 {
       p.record_failure("https://example.com").await;
@@ -511,7 +450,7 @@ mod tests {
   #[tokio::test]
   async fn sorted_by_latency_down_goes_last() -> misstep::Result<()> {
     use ncro_config::UpstreamConfig;
-    let p = Prober::new(0.3)?;
+    let p = Prober::new(0.3, Upstreams::new()?);
     p.init_upstreams(&[
       UpstreamConfig {
         url: "https://fast.com".into(),
@@ -539,7 +478,7 @@ mod tests {
   async fn sorted_by_latency_priority_within_10pct_window()
   -> misstep::Result<()> {
     use ncro_config::UpstreamConfig;
-    let p = Prober::new(0.3)?;
+    let p = Prober::new(0.3, Upstreams::new()?);
     p.init_upstreams(&[
       UpstreamConfig {
         url: "https://high-priority.com".into(),

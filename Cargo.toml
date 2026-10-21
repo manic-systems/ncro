@@ -22,8 +22,8 @@ ncro-mesh      = { path = "./crates/mesh", version = "2.4.0" }
 ncro-metrics   = { path = "./crates/metrics", version = "2.4.0" }
 ncro-narinfo   = { path = "./crates/narinfo", version = "2.4.0" }
 ncro-router    = { path = "./crates/router", version = "2.4.0" }
-ncro-s3        = { path = "./crates/s3", version = "2.4.0" }
 ncro-server    = { path = "./crates/server", version = "2.4.0" }
+ncro-upstream  = { path = "./crates/upstream", version = "2.4.0" }
 
 # Other deps
 axum               = "0.8.9"
