@@ -9,14 +9,17 @@ repository.workspace  = true
 
 [dependencies]
 aws-config.workspace             = true
-aws-sdk-s3.workspace             = true
-aws-smithy-http-client.workspace = true
+aws-credential-types.workspace   = true
+aws-sigv4.workspace              = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace       = true
 bytes.workspace                  = true
 dashmap.workspace                = true
 flub.workspace                   = true
 futures-util.workspace           = true
-misstep.workspace                = true
 ncro-config.workspace            = true
+reqwest                          = { workspace = true, features = [ "rustls-no-provider", "stream" ] }
+tokio                            = { workspace = true, features = [ "sync", "time" ] }
 
 [lints]
 workspace = true
