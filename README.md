@@ -278,7 +278,7 @@ Environment overrides are useful for containerized or Systemd deployments where
 you want a fixed config file but still need to tweak one or two settings.
 
 > [!NOTE]
-> `logging.level` uses tracing's `EnvFilter` syntax. A single level such as
+> `logging.level` uses tracing's `Targets` syntax. A single level such as
 > `debug`, `info`, `warn`, or `error` applies globally; directives such as
 > `ncro=debug,tower_http=warn` can tune individual modules or dependencies.
 > `logging.timestamps` defaults to `true` so standalone logs remain

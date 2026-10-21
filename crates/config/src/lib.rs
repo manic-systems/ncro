@@ -17,7 +17,7 @@ use misstep::Report;
 use netrc::{Error as NetrcError, Netrc};
 use serde::{Deserialize, Deserializer, de};
 use toml::de::Error as TomlError;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::Targets;
 use url::Url;
 
 #[derive(Debug, Error)]
@@ -1467,7 +1467,7 @@ impl Config {
         "logging.level must not be empty".to_string(),
       ));
     }
-    EnvFilter::try_new(&self.logging.level).map_err(|err| {
+    self.logging.level.parse::<Targets>().map_err(|err| {
       ConfigError::Validation(format!(
         "logging.level must be a valid tracing filter directive, got {:?}: \
          {err}",

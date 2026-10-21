@@ -16,7 +16,7 @@ rust-netrc.workspace    = true
 serde                   = { workspace = true, features = [ "derive" ] }
 toml.workspace          = true
 tracing.workspace       = true
-tracing-subscriber      = { workspace = true, features = [ "env-filter" ] }
+tracing-subscriber      = { workspace = true, features = [ "std" ] }
 url.workspace           = true
 
 [lints]
