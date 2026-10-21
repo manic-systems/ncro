@@ -29,7 +29,11 @@ use tokio::{
   time,
 };
 use tracing::subscriber::set_default;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{
+  filter::{LevelFilter, Targets},
+  fmt,
+  prelude::*,
+};
 
 use crate::warn_buffer::BufferLayer;
 
@@ -499,16 +503,18 @@ async fn flush_health(
 }
 
 fn init_logging(level: &str, format: LogFormat, timestamps: bool) {
-  let filter =
-    EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+  let filter = level
+    .parse::<Targets>()
+    .unwrap_or_else(|_| Targets::new().with_default(LevelFilter::INFO));
+  let registry = tracing_subscriber::registry().with(filter);
   match (format, timestamps) {
-    (LogFormat::Json, true) => fmt().json().with_env_filter(filter).init(),
+    (LogFormat::Json, true) => registry.with(fmt::layer().json()).init(),
     (LogFormat::Json, false) => {
-      fmt().json().without_time().with_env_filter(filter).init();
+      registry.with(fmt::layer().json().without_time()).init();
     },
-    (LogFormat::Text, true) => fmt().with_env_filter(filter).init(),
+    (LogFormat::Text, true) => registry.with(fmt::layer()).init(),
     (LogFormat::Text, false) => {
-      fmt().without_time().with_env_filter(filter).init();
+      registry.with(fmt::layer().without_time()).init();
     },
   }
 }

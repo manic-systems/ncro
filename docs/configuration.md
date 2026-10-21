@@ -322,7 +322,7 @@ Generate a persistent key with
 
 | Key          | Default  | Meaning                                                                                                         |
 | ------------ | -------- | --------------------------------------------------------------------------------------------------------------- |
-| `level`      | `"info"` | A tracing `EnvFilter` directive, for example `"debug"` or `"ncro=debug,tower_http=warn"`. It must not be empty. |
+| `level`      | `"info"` | A tracing `Targets` filter, for example `"debug"` or `"ncro=debug,tower_http=warn"`. It must not be empty. |
 | `format`     | `"json"` | `json` or `text`.                                                                                               |
 | `timestamps` | `true`   | Include timestamps in ncro's log output. Disable under journald if its timestamps are sufficient.               |
 

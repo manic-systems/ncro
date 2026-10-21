@@ -19,7 +19,7 @@ pound.workspace         = true
 socket2.workspace       = true
 tokio                   = { workspace = true, features = [ "macros", "rt-multi-thread", "signal", "time", "net", "fs" ] }
 tracing.workspace       = true
-tracing-subscriber      = { workspace = true, features = [ "env-filter", "json" ] }
+tracing-subscriber      = { workspace = true, features = [ "ansi", "fmt", "json", "smallvec", "tracing-log" ] }
 
 ncro-config.workspace    = true
 ncro-db.workspace        = true
