@@ -38,7 +38,7 @@ getrandom          = "0.4.2"
 jiff               = { version = "0.2.38", default-features = false, features = [ "std" ] }
 libc               = "0.2.186"
 log                = "0.4.34"
-lru                = { version = "0.18.3", default-features = false }
+lru                = { version = "0.19.0", default-features = false }
 mdns-sd            = "0.21.0"
 misstep            = "0.4.1"
 pound              = "0.5.2"
