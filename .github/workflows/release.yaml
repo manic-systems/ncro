@@ -21,7 +21,7 @@ jobs:
       id-token: write
       attestations: write
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    uses: manic-systems/workflows/.github/workflows/rust-release.yml@06a950a6ef1291d634844fef482d44c6b3852f64 # v2.2.0
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@4d2d4a73ac933d23f00fb7a17dd39569f8e1c1dc # v2.3.2
     with:
       stage: prepare
 
@@ -41,7 +41,7 @@ jobs:
             suffix: linux-amd64
           - os: ubuntu-26.04-arm
             suffix: linux-arm64
-    uses: manic-systems/workflows/.github/workflows/rust-build.yml@06a950a6ef1291d634844fef482d44c6b3852f64 # v2.2.0
+    uses: manic-systems/workflows/.github/workflows/rust-build.yml@4d2d4a73ac933d23f00fb7a17dd39569f8e1c1dc # v2.3.2
     with:
       upload: true
       version: ${{ needs.prepare.outputs.version }}
@@ -59,7 +59,7 @@ jobs:
       attestations: write
     needs: [prepare, build]
     if: ${{ needs.prepare.outputs.skip != 'true' && needs.build.result == 'success' }}
-    uses: manic-systems/workflows/.github/workflows/rust-release.yml@06a950a6ef1291d634844fef482d44c6b3852f64 # v2.2.0
+    uses: manic-systems/workflows/.github/workflows/rust-release.yml@4d2d4a73ac933d23f00fb7a17dd39569f8e1c1dc # v2.3.2
     with:
       stage: finalize
       version: ${{ needs.prepare.outputs.version }}
