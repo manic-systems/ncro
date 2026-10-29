@@ -16,6 +16,7 @@ use flub::Error;
 use jiff::Timestamp;
 use misstep::Report;
 use ncro_db::{Db, RouteEntry};
+use ncro_router::Router;
 use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -29,6 +30,7 @@ use tokio::{
 const MAX_PACKET_SIZE: usize = 1_400;
 const HEADER_SIZE: usize = 96;
 const MAX_GOSSIP_ROUTES: i64 = 25;
+const MAX_BUILT_PER_PACKET: usize = 32;
 
 type DecodedPacket<'a> = (&'a [u8], &'a [u8], &'a [u8], Message);
 
@@ -63,17 +65,18 @@ pub enum MeshError {
   Entropy(#[from] getrandom::Error),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MsgType {
-  Announce = 1,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Payload {
+  Announce(Vec<RouteEntry>),
+  /// Store hashes the sender just built.
+  Built(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-  pub r#type:    MsgType,
   pub node_id:   String,
   pub timestamp: i64,
-  pub routes:    Vec<RouteEntry>,
+  pub payload:   Payload,
 }
 
 #[derive(Clone)]
@@ -94,36 +97,43 @@ impl Node {
         ))?),
       });
     }
-    match fs::read(path).await {
-      Ok(data) => {
-        if data.len() != 32 && data.len() != 64 {
-          return Err(MeshError::InvalidKeyFileSize {
-            path: path.to_owned(),
-            got:  data.len(),
-          });
-        }
-        let key_pair = Seed::from_slice(&data[..32])
-          .and_then(KeyPair::try_from_seed)
-          .map_err(|source| {
-            MeshError::InvalidKeySeed {
-              path: path.to_owned(),
-              source,
-            }
-          })?;
-        return Ok(Self {
-          key_pair: Arc::new(key_pair),
-        });
-      },
-      Err(err) if err.kind() == ErrorKind::NotFound => {},
-      Err(source) => {
-        return Err(MeshError::ReadKey {
-          path: path.to_owned(),
-          source,
-        });
-      },
+    match Self::load(path).await {
+      Err(MeshError::ReadKey { source, .. })
+        if source.kind() == ErrorKind::NotFound => {},
+      loaded => return loaded,
     }
     let key_pair = KeyPair::try_from_seed(Seed::new(random_key_bytes()?))?;
     write_new_key(path, &key_pair.sk.seed()).await?;
+    Ok(Self {
+      key_pair: Arc::new(key_pair),
+    })
+  }
+
+  /// # Errors
+  ///
+  /// Returns [`MeshError`] if the key file is missing, unreadable, or the
+  /// wrong size.
+  pub async fn load(path: &Path) -> Result<Self, MeshError> {
+    let data = fs::read(path).await.map_err(|source| {
+      MeshError::ReadKey {
+        path: path.to_owned(),
+        source,
+      }
+    })?;
+    if data.len() != 32 && data.len() != 64 {
+      return Err(MeshError::InvalidKeyFileSize {
+        path: path.to_owned(),
+        got:  data.len(),
+      });
+    }
+    let key_pair = Seed::from_slice(&data[..32])
+      .and_then(KeyPair::try_from_seed)
+      .map_err(|source| {
+        MeshError::InvalidKeySeed {
+          path: path.to_owned(),
+          source,
+        }
+      })?;
     Ok(Self {
       key_pair: Arc::new(key_pair),
     })
@@ -213,6 +223,7 @@ pub fn verify(pubkey: &[u8], body: &[u8], sig: &[u8]) -> Result<(), MeshError> {
 pub async fn listen_and_serve(
   addr: &str,
   db: Db,
+  router: Router,
   allowed_keys: Vec<[u8; 32]>,
   stop: watch::Receiver<bool>,
 ) -> Result<(), MeshError> {
@@ -246,8 +257,13 @@ pub async fn listen_and_serve(
                           tracing::warn!(?src, error = %err, "mesh: signature verification failed");
                           continue;
                       }
-                      if msg.r#type == MsgType::Announce && !msg.routes.is_empty() {
-                          merge_routes(&db, msg.routes).await;
+                      match msg.payload {
+                          Payload::Announce(routes) => merge_routes(&db, routes).await,
+                          Payload::Built(store_hashes) => {
+                              if let Err(err) = router.forget_misses(&store_hashes).await {
+                                  tracing::warn!(error = %Report::new(err), "mesh: clearing negative cache failed");
+                              }
+                          }
                       }
                   }
                   Err(err) => tracing::warn!(?src, error = %Report::new(err), "mesh: malformed packet"),
@@ -294,12 +310,37 @@ pub async fn announce(
   node: &Node,
   routes: Vec<RouteEntry>,
 ) -> Result<(), MeshError> {
+  send(peer_addr, node, Payload::Announce(routes)).await
+}
+
+/// Tell a peer that `store_hashes` were built locally, so it stops serving
+/// its remembered misses for them.
+///
+/// # Errors
+///
+/// Returns [`MeshError`] if a message cannot be signed, the socket cannot
+/// be bound, or a packet fails to send.
+pub async fn announce_built(
+  peer_addr: &str,
+  node: &Node,
+  store_hashes: &[String],
+) -> Result<(), MeshError> {
+  for chunk in store_hashes.chunks(MAX_BUILT_PER_PACKET) {
+    send(peer_addr, node, Payload::Built(chunk.to_vec())).await?;
+  }
+  Ok(())
+}
+
+async fn send(
+  peer_addr: &str,
+  node: &Node,
+  payload: Payload,
+) -> Result<(), MeshError> {
   let msg = Message {
-    r#type: MsgType::Announce,
     node_id: node.id(),
     timestamp: i64::try_from(Timestamp::now().as_nanosecond())
       .unwrap_or_default(),
-    routes,
+    payload,
   };
   let packet = encode_packet(node, &msg)?;
   let send_error = |source| {

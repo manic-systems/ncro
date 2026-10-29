@@ -644,6 +644,24 @@ Unix. Configure the same path as `mesh.private_key` and share only the printed
 public key with peers. ncro also logs the public key on startup in the
 `mesh node identity` log line.
 
+Gossip only shares routes that ncro fetched from an upstream itself, so peers
+don't automatically learn about paths built locally on another machine. If your
+builders substitute from each other and a peer checks for a path before the
+build finishes, it'll cache that 404 for `cache.negative_ttl` and end up
+building the path again itself. You can avoid this with a Nix `post-build-hook`
+that tells peers to clear any cached misses as soon as a build finishes.
+
+```bash
+#!/bin/sh
+# A failing post-build-hook stops Nix from starting further builds.
+ncro --config /etc/ncro/config.toml --announce-built $OUT_PATHS || true
+```
+
+`--announce-built` loads `mesh.private_key` from disk to sign the packet, so it
+won't work with an ephemeral key. You'll also want to set
+`narinfo-cache-negative-ttl = 0` in `nix.conf` on those builders, since Nix
+caches negative narinfo lookups on its own for an hour by default.
+
 > [!TIP]
 > Keep mesh traffic on a private network. The gossip protocol is signed, but it
 > is still meant for trusted peers. ncro's mesh network feature was designed
