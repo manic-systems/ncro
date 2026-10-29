@@ -1,4 +1,5 @@
 use std::{
+  collections::HashMap,
   io::{self, ErrorKind},
   path::{Path, PathBuf},
   sync::Arc,
@@ -28,6 +29,7 @@ use tokio::{
 };
 
 const MAX_PACKET_SIZE: usize = 1_400;
+const MAX_CLOCK_SKEW_NANOS: i128 = 60_000_000_000;
 const HEADER_SIZE: usize = 96;
 const MAX_GOSSIP_ROUTES: i64 = 25;
 const MAX_BUILT_PER_PACKET: usize = 32;
@@ -236,6 +238,7 @@ pub async fn listen_and_serve(
   tokio::spawn(async move {
     let mut stop = stop;
     let mut buf = vec![0; MAX_PACKET_SIZE];
+    let mut seen: HashMap<Vec<u8>, i128> = HashMap::new();
     loop {
       tokio::select! {
           _ = stop.changed() => return,
@@ -255,6 +258,17 @@ pub async fn listen_and_serve(
                       }
                       if let Err(err) = verify(pubkey, body, sig) {
                           tracing::warn!(?src, error = %err, "mesh: signature verification failed");
+                          continue;
+                      }
+                      let now = Timestamp::now().as_nanosecond();
+                      let skew = now - i128::from(msg.timestamp);
+                      if skew.abs() > MAX_CLOCK_SKEW_NANOS {
+                          tracing::warn!(?src, node = msg.node_id, skew_secs = skew / 1_000_000_000, "mesh: dropping packet outside the clock skew window, check time sync on both nodes");
+                          continue;
+                      }
+                      seen.retain(|_, sent| (now - *sent).abs() <= MAX_CLOCK_SKEW_NANOS);
+                      if seen.insert(sig.to_vec(), i128::from(msg.timestamp)).is_some() {
+                          tracing::warn!(?src, node = msg.node_id, "mesh: dropping replayed packet");
                           continue;
                       }
                       match msg.payload {
