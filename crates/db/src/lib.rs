@@ -300,6 +300,25 @@ impl Db {
   /// # Errors
   ///
   /// Returns [`DbError`] on `SQLite` write failure.
+  pub async fn clear_negatives(
+    &self,
+    store_paths: &[String],
+  ) -> Result<(), DbError> {
+    let _guard = self.write_lock.lock().await;
+    let mut tx = self.pool.begin().await?;
+    for store_path in store_paths {
+      sqlx::query("DELETE FROM negative_cache WHERE store_path = ?")
+        .bind(store_path)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+  }
+
+  /// # Errors
+  ///
+  /// Returns [`DbError`] on `SQLite` write failure.
   pub async fn expire_negatives(&self) -> Result<(), DbError> {
     let _guard = self.write_lock.lock().await;
     sqlx::query("DELETE FROM negative_cache WHERE expires_at < ?")

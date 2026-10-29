@@ -199,6 +199,7 @@ struct RouterInner {
   inflight:                 DashMap<String, Arc<Mutex<()>>>,
   lru:                      TtlCache<Arc<ResolveResult>>,
   miss_lru:                 TtlCache<()>,
+  built_at:                 TtlCache<Instant>,
   race_semaphore:           Arc<Semaphore>,
   per_upstream_limit:       u32,
   upstream_semaphores:      DashMap<(String, Hop), Arc<Semaphore>>,
@@ -285,6 +286,7 @@ impl Router {
         inflight: DashMap::new(),
         lru: TtlCache::new(1024, route_ttl),
         miss_lru: TtlCache::new(32_768, tuning.in_memory_negative_ttl),
+        built_at: TtlCache::new(4096, negative_ttl),
         race_semaphore: Arc::new(Semaphore::new(
           usize::try_from(tuning.max_concurrent_races).unwrap_or(64),
         )),
@@ -415,6 +417,23 @@ impl Router {
     })
   }
 
+  /// Drop remembered misses so the next lookup races upstreams again.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`DbError`] if the persisted negative cache cannot be updated.
+  pub async fn forget_misses(
+    &self,
+    store_hashes: &[String],
+  ) -> Result<(), DbError> {
+    let now = Instant::now();
+    for store_hash in store_hashes {
+      self.inner.miss_lru.invalidate(store_hash);
+      self.inner.built_at.insert(store_hash.clone(), now);
+    }
+    self.inner.db.clear_negatives(store_hashes).await
+  }
+
   /// Resolve a narinfo hash to an upstream URL by checking the route cache
   /// then racing all candidates.
   ///
@@ -466,8 +485,18 @@ impl Router {
       return Ok(result);
     }
 
+    let race_start = Instant::now();
     let result = self.race(store_hash, candidates, hop).await;
-    if hop == Hop::Client && matches!(result, Err(RouterError::NotFound)) {
+    let built_during_race = self
+      .inner
+      .built_at
+      .get(store_hash)
+      .is_some_and(|built| built >= race_start);
+
+    if hop == Hop::Client
+      && !built_during_race
+      && matches!(result, Err(RouterError::NotFound))
+    {
       self.inner.miss_lru.insert(store_hash.to_string(), ());
       let _ = self
         .inner
@@ -475,6 +504,7 @@ impl Router {
         .set_negative(store_hash, self.inner.negative_ttl)
         .await;
     }
+
     result
   }
 

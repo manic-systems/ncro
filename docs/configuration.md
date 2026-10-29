@@ -314,6 +314,11 @@ public_key = "a1b2c3..." # 32-byte ed25519 key, hex encoded
 Generate a persistent key with
 `ncro --generate-mesh-key /var/lib/ncro/node.key`.
 
+Builders that serve their stores to each other should run
+`ncro --config <path> --announce-built $OUT_PATHS || true` as a Nix
+`post-build-hook`. It tells peers to drop their cached miss for each built path,
+so they find it on the builder instead of building it again.
+
 ## Logging and response provenance
 
 `[logging]` controls tracing output:
