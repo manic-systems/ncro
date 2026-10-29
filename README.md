@@ -662,6 +662,12 @@ won't work with an ephemeral key. You'll also want to set
 `narinfo-cache-negative-ttl = 0` in `nix.conf` on those builders, since Nix
 caches negative narinfo lookups on its own for an hour by default.
 
+Packets are timestamped, and peers drop anything more than 60 seconds off from
+their local clock so captured packets can't be replayed. Keep clocks in sync
+across nodes with something like `chrony` or `systemd-timesyncd`. If a node's
+clock drifts too far, it won't log any errors itself, and you'll only see
+`mesh: dropping packet outside the clock skew window` on its peers.
+
 > [!TIP]
 > Keep mesh traffic on a private network. The gossip protocol is signed, but it
 > is still meant for trusted peers. ncro's mesh network feature was designed
