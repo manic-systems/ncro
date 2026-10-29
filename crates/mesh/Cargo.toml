@@ -15,6 +15,7 @@ getrandom.workspace       = true
 jiff.workspace            = true
 misstep.workspace         = true
 ncro-db.workspace         = true
+ncro-router.workspace     = true
 rmp-serde.workspace       = true
 serde                     = { workspace = true, features = [ "derive" ] }
 tokio                     = { workspace = true, features = [ "fs", "io-util", "macros", "net", "rt", "sync", "time" ] }
