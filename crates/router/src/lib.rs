@@ -487,10 +487,13 @@ impl Router {
       ncro_metrics::get().narinfo_memory_negative_hits.inc();
       return Err(RouterError::NotFound);
     }
+    if let Some(result) = self.valid_cached_route(store_hash, hop).await? {
+      return Ok(Some(result));
+    }
     if self.inner.db.is_negative(store_hash).await? {
       return Err(RouterError::NotFound);
     }
-    self.valid_cached_route(store_hash, hop).await
+    Ok(None)
   }
 
   async fn valid_cached_route(
