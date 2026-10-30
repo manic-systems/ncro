@@ -7,6 +7,8 @@ use data_encoding::{BASE64, BASE64_NOPAD, DecodeError, HEXLOWER_PERMISSIVE};
 use ed25519_compact::{PublicKey, Signature};
 use flub::Error;
 
+pub mod realisation;
+
 #[derive(Debug, Error)]
 pub enum NarInfoError {
   #[error("read narinfo")]
@@ -229,28 +231,37 @@ impl NarInfo {
   /// Returns [`NarInfoError`] if `public_key` cannot be parsed (see
   /// [`parse_public_key`]).
   pub fn verify(&self, public_key: &str) -> Result<bool, NarInfoError> {
-    let (key_name, key) = parse_public_key(public_key)?;
-    let fingerprint = self.fingerprint();
-    for sig_line in &self.sig {
-      let Some((name, b64)) = sig_line.split_once(':') else {
-        continue;
-      };
-      if name != key_name {
-        continue;
-      }
-      let Ok(raw) = BASE64.decode(b64.as_bytes()) else {
-        continue;
-      };
-      let Ok(bytes) = <[u8; 64]>::try_from(raw.as_slice()) else {
-        continue;
-      };
-      let signature = Signature::new(bytes);
-      if key.verify(fingerprint.as_bytes(), &signature).is_ok() {
-        return Ok(true);
-      }
-    }
-    Ok(false)
+    verify_fingerprint(&self.fingerprint(), &self.sig, public_key)
   }
+}
+
+/// Whether any `name:base64` signature in `signatures` is `public_key`'s
+/// signature over `fingerprint`.
+fn verify_fingerprint(
+  fingerprint: &str,
+  signatures: &[String],
+  public_key: &str,
+) -> Result<bool, NarInfoError> {
+  let (key_name, key) = parse_public_key(public_key)?;
+  for sig_line in signatures {
+    let Some((name, b64)) = sig_line.split_once(':') else {
+      continue;
+    };
+    if name != key_name {
+      continue;
+    }
+    let Ok(raw) = BASE64.decode(b64.as_bytes()) else {
+      continue;
+    };
+    let Ok(bytes) = <[u8; 64]>::try_from(raw.as_slice()) else {
+      continue;
+    };
+    let signature = Signature::new(bytes);
+    if key.verify(fingerprint.as_bytes(), &signature).is_ok() {
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 #[cfg(test)]

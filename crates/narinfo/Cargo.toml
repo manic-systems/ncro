@@ -11,6 +11,8 @@ repository.workspace  = true
 data-encoding.workspace   = true
 ed25519-compact.workspace = true
 flub.workspace            = true
+serde                     = { workspace = true, features = [ "derive" ] }
+serde_json.workspace      = true
 
 [lints]
 workspace = true

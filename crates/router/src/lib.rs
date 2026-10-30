@@ -401,6 +401,12 @@ impl Router {
       .unwrap_or(self.inner.race_timeout)
   }
 
+  /// The keys `upstream`'s signatures must verify against, or [`None`] when it
+  /// has none configured and is trusted as is.
+  pub async fn public_keys(&self, upstream: &str) -> Option<Vec<String>> {
+    self.inner.upstream_keys.read().await.get(upstream).cloned()
+  }
+
   /// Resolve through a last-resort fallback cache without using route cache,
   /// health, priority, cooldown, filters, or route persistence.
   ///
