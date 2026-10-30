@@ -389,6 +389,12 @@ impl Router {
     }
   }
 
+  /// How long a confirmed miss is remembered.
+  #[must_use]
+  pub fn negative_ttl(&self) -> Duration {
+    self.inner.negative_ttl
+  }
+
   /// The timeout for a narinfo-sized fetch from `upstream`.
   pub async fn narinfo_timeout(&self, upstream: &str) -> Duration {
     self

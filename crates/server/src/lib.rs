@@ -512,12 +512,18 @@ async fn realisation(
   id: DrvOutput<'_>,
   hop: Hop,
 ) -> Response {
-  if hop == Hop::PeerOfPeer {
+  if hop == Hop::PeerOfPeer
+    || matches!(state.db.is_negative(path).await, Ok(true))
+  {
     return StatusCode::NOT_FOUND.into_response();
   }
 
   let mut attempts = JoinSet::new();
   for upstream in upstream_urls(state).await {
+    if !serves_realisations(state, &upstream) {
+      continue;
+    }
+
     let limit = state.router.narinfo_timeout(&upstream).await;
     let backend = state.backends.get(&upstream);
     let path = path.to_string();
@@ -536,6 +542,8 @@ async fn realisation(
     });
   }
 
+  let mut asked = attempts.len();
+  let mut misses = 0;
   while let Some(joined) = attempts.join_next().await {
     match joined {
       Ok((upstream, Ok(Ok(Some(found))))) => {
@@ -549,15 +557,21 @@ async fn realisation(
       Ok((upstream, Err(_))) => {
         tracing::debug!(upstream, path, "realisation fetch timed out");
       },
-      Ok((_, Ok(Ok(None)))) | Err(_) => {},
+      Ok((_, Ok(Ok(None)))) => misses += 1,
+      Err(_) => {},
     }
   }
 
-  if let Some(fallback) = &state.fallback_cache {
+  if let Some(fallback) = state
+    .fallback_cache
+    .as_ref()
+    .filter(|fallback| fallback.realisations)
+  {
     let limit = state.router.narinfo_timeout(&fallback.url).await;
     let backend = state.backends.get(&fallback.url);
 
-    if let Ok(Ok(Some(found))) = timeout(
+    asked += 1;
+    match timeout(
       limit,
       fetch_realisation(
         &backend,
@@ -566,13 +580,37 @@ async fn realisation(
       ),
     )
     .await
-      && realisation_trusted(state, &fallback.url, path, id, &found.1).await
     {
-      return realisation_response(found, &fallback.url, RouteKind::Fallback);
+      Ok(Ok(Some(found))) => {
+        if realisation_trusted(state, &fallback.url, path, id, &found.1).await {
+          return realisation_response(
+            found,
+            &fallback.url,
+            RouteKind::Fallback,
+          );
+        }
+      },
+      Ok(Ok(None)) => misses += 1,
+      Ok(Err(_)) | Err(_) => {},
     }
   }
 
+  if hop == Hop::Client && misses == asked {
+    let _ = state
+      .db
+      .set_negative(path, state.router.negative_ttl())
+      .await;
+  }
+
   StatusCode::NOT_FOUND.into_response()
+}
+
+fn serves_realisations(state: &AppState, url: &str) -> bool {
+  state
+    .upstreams
+    .iter()
+    .find(|upstream| upstream.url == url)
+    .is_none_or(|upstream| upstream.realisations)
 }
 
 /// Nix fails the build on a realisation no trusted key signed.

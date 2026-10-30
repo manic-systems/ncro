@@ -30,6 +30,7 @@ url      = "https://nix-community.cachix.org"
 # narinfo_timeout = "10s"  # overrides the router's race timeout for narinfo
 # nar_timeout     = "60s"  # timeout for NAR response headers and first byte
 # allow_hedging   = false  # do not launch this upstream as an additional NAR hedge
+# realisations    = false  # this cache publishes no CA realisations, skip it for them
 # username        = "ncro"
 # password_file   = "/run/secrets/ncro-upstream-password"
 

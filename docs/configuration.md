@@ -99,6 +99,7 @@ nar_timeout = "60s"
 | `narinfo_timeout` | `"5s"`                | Timeout for this upstream's narinfo HEAD race and GET fetches.                                                                                    |
 | `nar_timeout`     | `server.read_timeout` | Time allowed to receive successful NAR response headers and the first body chunk. Streaming continues after this deadline.                       |
 | `allow_hedging`   | `true`                | Permit this upstream to be launched as an additional NAR hedge. Set false for metered or residential sources; it may still be the initial source. |
+| `realisations`    | `true`                | Whether this upstream publishes CA realisations. Set false for caches without them, so build trace lookups skip it.                              |
 | `nar_url_mode`    | `"to_self"`           | How the narinfo `URL:` field is returned; described below.                                                                                        |
 | `filters`         | `[]`                  | Narinfo path filters, described below.                                                                                                            |
 
