@@ -26,7 +26,7 @@ use axum::{
   response::{IntoResponse, Response},
   routing::get,
 };
-use futures_util::{Stream, StreamExt, TryStreamExt, stream};
+use futures_util::{Stream, StreamExt, TryStreamExt, future::join_all, stream};
 use misstep::Report;
 use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
@@ -782,33 +782,35 @@ async fn hedge_candidates(
     by_priority.entry(health.priority).or_default().push(health);
   }
   let expected_compression = compression_for_nar_url(path);
-  let mut candidates = Vec::new();
-  for group in by_priority.into_values() {
-    for health in group {
-      let candidate_path = if let Some(store_hash) = store_hash {
-        let Ok(candidate_path) = state
-          .router
-          .upstream_nar_path(
-            &health.url,
-            store_hash,
-            expected_narinfo,
-            expected_compression,
-          )
-          .await
-        else {
-          continue;
-        };
-        candidate_path
-      } else {
-        path.to_string()
+  let lookups = by_priority.into_values().flatten().map(|health| {
+    async move {
+      let candidate_path = match store_hash {
+        Some(store_hash) => {
+          state
+            .router
+            .upstream_nar_path(
+              &health.url,
+              store_hash,
+              expected_narinfo,
+              expected_compression,
+            )
+            .await
+            .ok()?
+        },
+        None => path.to_string(),
       };
-      candidates.push(NarCandidate {
+      Some(NarCandidate {
         upstream: health.url,
         path:     candidate_path,
         route:    RouteKind::Hedge,
-      });
+      })
     }
-  }
+  });
+  let mut candidates = join_all(lookups)
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
   candidates.reverse();
   candidates
 }
