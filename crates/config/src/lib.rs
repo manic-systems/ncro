@@ -910,6 +910,9 @@ pub struct UpstreamConfig {
   /// Whether this upstream may be started as an additional NAR hedge.
   #[serde(default = "default_allow_hedging")]
   pub allow_hedging:   bool,
+  /// Whether this upstream publishes CA realisations. When false, build
+  /// trace lookups skip it.
+  pub realisations:    bool,
   /// Derived from the scheme of `url` at load time, not set in config.
   #[serde(skip)]
   pub location:        Location,
@@ -930,6 +933,7 @@ impl Default for UpstreamConfig {
       narinfo_timeout: None,
       nar_timeout:     None,
       allow_hedging:   true,
+      realisations:    true,
       location:        Location::default(),
     }
   }
@@ -950,6 +954,7 @@ impl fmt::Debug for UpstreamConfig {
       .field("narinfo_timeout", &self.narinfo_timeout)
       .field("nar_timeout", &self.nar_timeout)
       .field("allow_hedging", &self.allow_hedging)
+      .field("realisations", &self.realisations)
       .field("location", &self.location)
       .finish()
   }
