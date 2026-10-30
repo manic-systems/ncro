@@ -389,6 +389,18 @@ impl Router {
     }
   }
 
+  /// The timeout for a narinfo-sized fetch from `upstream`.
+  pub async fn narinfo_timeout(&self, upstream: &str) -> Duration {
+    self
+      .inner
+      .narinfo_timeouts
+      .read()
+      .await
+      .get(upstream)
+      .copied()
+      .unwrap_or(self.inner.race_timeout)
+  }
+
   /// Resolve through a last-resort fallback cache without using route cache,
   /// health, priority, cooldown, filters, or route persistence.
   ///
@@ -1061,14 +1073,7 @@ impl Router {
     store_hash: &str,
     hop: Hop,
   ) -> Result<(Option<Vec<u8>>, NarInfo), RouterError> {
-    let timeout = self
-      .inner
-      .narinfo_timeouts
-      .read()
-      .await
-      .get(upstream)
-      .copied()
-      .unwrap_or(self.inner.race_timeout);
+    let timeout = self.narinfo_timeout(upstream).await;
     let body = self
       .inner
       .upstreams

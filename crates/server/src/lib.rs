@@ -16,6 +16,7 @@ use axum::{
     Method,
     Request,
     StatusCode,
+    Uri,
     header::{ACCEPT, ACCEPT_ENCODING, RANGE},
     response::Builder as ResponseBuilder,
     uri::PathAndQuery,
@@ -37,7 +38,7 @@ use ncro_router::{
   compression_for_nar_url,
   store_hash_from_canonical_nar_url,
 };
-use ncro_upstream::{Backend, Upstreams};
+use ncro_upstream::{Backend, BackendError, Upstreams};
 use serde::Serialize;
 use tokio::{
   task::JoinSet,
@@ -172,6 +173,8 @@ pub fn app(
         .route("/status", get(status_endpoint))
         .route("/metrics", get(metrics_endpoint))
         .route("/{hash_narinfo}", get(narinfo).head(narinfo))
+        .route("/build-trace-v2/{drv}/{output}", get(build_trace))
+        .route("/realisations/{id}", get(legacy_realisation))
         .route_layer(ResponseBodyTimeoutLayer::new(write_timeout)),
     )
     .merge(AxumRouter::new().route("/nar/{*path}", get(nar).head(nar)))
@@ -450,6 +453,122 @@ async fn narinfo(
       (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
     },
   }
+}
+
+async fn build_trace(
+  State(state): State<Arc<AppState>>,
+  Path((drv, output)): Path<(String, String)>,
+  uri: Uri,
+  headers: HeaderMap,
+) -> Response {
+  if !has_extension(&drv, "drv") || !has_extension(&output, "doi") {
+    return StatusCode::NOT_FOUND.into_response();
+  }
+
+  realisation(&state, uri.path(), Hop::from_headers(&headers)).await
+}
+
+async fn legacy_realisation(
+  State(state): State<Arc<AppState>>,
+  Path(id): Path<String>,
+  uri: Uri,
+  headers: HeaderMap,
+) -> Response {
+  if !has_extension(&id, "doi") {
+    return StatusCode::NOT_FOUND.into_response();
+  }
+
+  realisation(&state, uri.path(), Hop::from_headers(&headers)).await
+}
+
+/// Nix store paths are case-sensitive, so the extension is too.
+fn has_extension(name: &str, extension: &str) -> bool {
+  name
+    .rsplit_once('.')
+    .is_some_and(|(_, found)| found == extension)
+}
+
+/// Serve a CA realisation from the first upstream that has it.
+async fn realisation(state: &AppState, path: &str, hop: Hop) -> Response {
+  if hop == Hop::PeerOfPeer {
+    return StatusCode::NOT_FOUND.into_response();
+  }
+
+  let mut attempts = JoinSet::new();
+  for upstream in upstream_urls(state).await {
+    let limit = state.router.narinfo_timeout(&upstream).await;
+    let backend = state.backends.get(&upstream);
+    let path = path.to_string();
+
+    attempts.spawn(async move {
+      let found = timeout(
+        limit,
+        fetch_realisation(
+          &backend,
+          &path,
+          HeaderMap::from_iter([(HOP_HEADER, hop.outgoing())]),
+        ),
+      )
+      .await;
+      (upstream, found)
+    });
+  }
+
+  while let Some(joined) = attempts.join_next().await {
+    match joined {
+      Ok((upstream, Ok(Ok(Some(resp))))) => {
+        return with_provenance(resp, &upstream, RouteKind::Race);
+      },
+      Ok((upstream, Ok(Err(err)))) => {
+        tracing::debug!(upstream, path, error = %Report::new(err), "realisation fetch failed");
+      },
+      Ok((upstream, Err(_))) => {
+        tracing::debug!(upstream, path, "realisation fetch timed out");
+      },
+      Ok((_, Ok(Ok(None)))) | Err(_) => {},
+    }
+  }
+
+  if let Some(fallback) = &state.fallback_cache {
+    let limit = state.router.narinfo_timeout(&fallback.url).await;
+    let backend = state.backends.get(&fallback.url);
+
+    if let Ok(Ok(Some(resp))) = timeout(
+      limit,
+      fetch_realisation(
+        &backend,
+        path,
+        HeaderMap::from_iter([(HOP_HEADER, hop.outgoing())]),
+      ),
+    )
+    .await
+    {
+      return with_provenance(resp, &fallback.url, RouteKind::Fallback);
+    }
+  }
+
+  StatusCode::NOT_FOUND.into_response()
+}
+
+async fn fetch_realisation(
+  backend: &Backend,
+  path: &str,
+  headers: HeaderMap,
+) -> Result<Option<Response>, BackendError> {
+  let Some(resp) = backend.send(Method::GET, path, headers, None).await? else {
+    return Ok(None);
+  };
+  let content_type = resp.headers().get("content-type").cloned();
+  let url = resp.url().to_string();
+  let body = resp
+    .bytes()
+    .await
+    .map_err(|source| BackendError::Body { url, source })?;
+  let mut out = Response::new(Body::from(body));
+  if let Some(content_type) = content_type {
+    out.headers_mut().insert("content-type", content_type);
+  }
+  Ok(Some(out))
 }
 
 #[derive(Clone)]
