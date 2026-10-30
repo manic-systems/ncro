@@ -29,7 +29,11 @@ use misstep::Report;
 use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
 use ncro_health::{Prober, Status, UpstreamHealth};
-use ncro_narinfo::{NarInfo, is_store_hash};
+use ncro_narinfo::{
+  NarInfo,
+  is_store_hash,
+  realisation::{DrvOutput, Realisation},
+};
 use ncro_router::{
   HOP_HEADER,
   Hop,
@@ -461,11 +465,18 @@ async fn build_trace(
   uri: Uri,
   headers: HeaderMap,
 ) -> Response {
-  if !has_extension(&drv, "drv") || !has_extension(&output, "doi") {
+  let Some(output_name) = output.strip_suffix(".doi") else {
+    return StatusCode::NOT_FOUND.into_response();
+  };
+  if !has_extension(&drv, "drv") {
     return StatusCode::NOT_FOUND.into_response();
   }
+  let id = DrvOutput::BuildTrace {
+    drv_path: &drv,
+    output_name,
+  };
 
-  realisation(&state, uri.path(), Hop::from_headers(&headers)).await
+  realisation(&state, uri.path(), id, Hop::from_headers(&headers)).await
 }
 
 async fn legacy_realisation(
@@ -478,7 +489,13 @@ async fn legacy_realisation(
     return StatusCode::NOT_FOUND.into_response();
   }
 
-  realisation(&state, uri.path(), Hop::from_headers(&headers)).await
+  realisation(
+    &state,
+    uri.path(),
+    DrvOutput::Legacy,
+    Hop::from_headers(&headers),
+  )
+  .await
 }
 
 /// Nix store paths are case-sensitive, so the extension is too.
@@ -489,7 +506,12 @@ fn has_extension(name: &str, extension: &str) -> bool {
 }
 
 /// Serve a CA realisation from the first upstream that has it.
-async fn realisation(state: &AppState, path: &str, hop: Hop) -> Response {
+async fn realisation(
+  state: &AppState,
+  path: &str,
+  id: DrvOutput<'_>,
+  hop: Hop,
+) -> Response {
   if hop == Hop::PeerOfPeer {
     return StatusCode::NOT_FOUND.into_response();
   }
@@ -516,8 +538,10 @@ async fn realisation(state: &AppState, path: &str, hop: Hop) -> Response {
 
   while let Some(joined) = attempts.join_next().await {
     match joined {
-      Ok((upstream, Ok(Ok(Some(resp))))) => {
-        return with_provenance(resp, &upstream, RouteKind::Race);
+      Ok((upstream, Ok(Ok(Some(found))))) => {
+        if realisation_trusted(state, &upstream, path, id, &found.1).await {
+          return realisation_response(found, &upstream, RouteKind::Race);
+        }
       },
       Ok((upstream, Ok(Err(err)))) => {
         tracing::debug!(upstream, path, error = %Report::new(err), "realisation fetch failed");
@@ -533,7 +557,7 @@ async fn realisation(state: &AppState, path: &str, hop: Hop) -> Response {
     let limit = state.router.narinfo_timeout(&fallback.url).await;
     let backend = state.backends.get(&fallback.url);
 
-    if let Ok(Ok(Some(resp))) = timeout(
+    if let Ok(Ok(Some(found))) = timeout(
       limit,
       fetch_realisation(
         &backend,
@@ -542,19 +566,44 @@ async fn realisation(state: &AppState, path: &str, hop: Hop) -> Response {
       ),
     )
     .await
+      && realisation_trusted(state, &fallback.url, path, id, &found.1).await
     {
-      return with_provenance(resp, &fallback.url, RouteKind::Fallback);
+      return realisation_response(found, &fallback.url, RouteKind::Fallback);
     }
   }
 
   StatusCode::NOT_FOUND.into_response()
 }
 
+/// Nix fails the build on a realisation no trusted key signed.
+async fn realisation_trusted(
+  state: &AppState,
+  upstream: &str,
+  path: &str,
+  id: DrvOutput<'_>,
+  body: &[u8],
+) -> bool {
+  let Some(public_keys) = state.router.public_keys(upstream).await else {
+    return true;
+  };
+  let trusted = Realisation::parse(body, id).is_ok_and(|realisation| {
+    public_keys
+      .iter()
+      .any(|public_key| realisation.verify(public_key).unwrap_or(false))
+  });
+  if !trusted {
+    tracing::warn!(upstream, path, "realisation signature verification failed");
+  }
+  trusted
+}
+
+type FetchedRealisation = (Option<HeaderValue>, Bytes);
+
 async fn fetch_realisation(
   backend: &Backend,
   path: &str,
   headers: HeaderMap,
-) -> Result<Option<Response>, BackendError> {
+) -> Result<Option<FetchedRealisation>, BackendError> {
   let Some(resp) = backend.send(Method::GET, path, headers, None).await? else {
     return Ok(None);
   };
@@ -564,11 +613,19 @@ async fn fetch_realisation(
     .bytes()
     .await
     .map_err(|source| BackendError::Body { url, source })?;
+  Ok(Some((content_type, body)))
+}
+
+fn realisation_response(
+  (content_type, body): FetchedRealisation,
+  upstream: &str,
+  route: RouteKind,
+) -> Response {
   let mut out = Response::new(Body::from(body));
   if let Some(content_type) = content_type {
     out.headers_mut().insert("content-type", content_type);
   }
-  Ok(Some(out))
+  with_provenance(out, upstream, route)
 }
 
 #[derive(Clone)]
