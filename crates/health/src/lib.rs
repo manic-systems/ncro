@@ -1,7 +1,9 @@
+pub mod throughput;
+
 use std::{
   cmp::Ordering,
   collections::HashMap,
-  sync::Arc,
+  sync::{Arc, Mutex as StdMutex, PoisonError},
   time::{Duration, Instant},
 };
 
@@ -27,6 +29,7 @@ const fn backoff_interval(base: Duration, consecutive_fails: u32) -> Duration {
 use ncro_config::UpstreamConfig;
 use ncro_upstream::Upstreams;
 use reqwest::{Method, StatusCode, header::HeaderMap};
+use throughput::{Throughput, TransferSample};
 use tokio::{
   sync::{RwLock, watch},
   task::JoinHandle,
@@ -63,6 +66,9 @@ pub struct UpstreamHealth {
   pub consecutive_fails: u32,
   pub total_queries:     u64,
   pub status:            Status,
+  pub throughput:        Option<Throughput>,
+  /// NAR transfers in flight to this upstream.
+  pub inflight:          u32,
 }
 
 impl UpstreamHealth {
@@ -78,11 +84,13 @@ impl UpstreamHealth {
       consecutive_fails: 0,
       total_queries: 0,
       status: Status::Active,
+      throughput: None,
+      inflight: 0,
     }
   }
 }
 
-type PersistHealth = Arc<dyn Fn(String, f64, u32, u64) + Send + Sync>;
+type PersistHealth = Arc<dyn Fn(&UpstreamHealth) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Prober {
@@ -92,8 +100,29 @@ pub struct Prober {
 struct ProberInner {
   alpha:          f64,
   table:          RwLock<HashMap<String, UpstreamHealth>>,
+  inflight:       StdMutex<HashMap<String, u32>>,
   upstreams:      Upstreams,
   persist_health: RwLock<Option<PersistHealth>>,
+}
+
+/// Counts one NAR transfer as in flight to its upstream until dropped.
+pub struct TransferGuard {
+  prober: Prober,
+  url:    String,
+}
+
+impl Drop for TransferGuard {
+  fn drop(&mut self) {
+    let mut inflight = self
+      .prober
+      .inner
+      .inflight
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    if let Some(count) = inflight.get_mut(&self.url) {
+      *count = count.saturating_sub(1);
+    }
+  }
 }
 
 impl Prober {
@@ -104,6 +133,7 @@ impl Prober {
       inner: Arc::new(ProberInner {
         alpha,
         table: RwLock::new(HashMap::new()),
+        inflight: StdMutex::new(HashMap::new()),
         upstreams,
         persist_health: RwLock::new(None),
       }),
@@ -131,6 +161,7 @@ impl Prober {
     ema_latency: f64,
     consecutive_fails: i64,
     total_queries: i64,
+    throughput: Option<Throughput>,
   ) {
     {
       let mut table = self.inner.table.write().await;
@@ -143,12 +174,13 @@ impl Prober {
       health.consecutive_fails =
         u32::try_from(consecutive_fails.max(0)).unwrap_or(u32::MAX);
       health.status = compute_status(health.consecutive_fails);
+      health.throughput = throughput;
     }
   }
 
   pub async fn set_health_persistence<F>(&self, f: F)
   where
-    F: Fn(String, f64, u32, u64) + Send + Sync + 'static,
+    F: Fn(&UpstreamHealth) + Send + Sync + 'static,
   {
     *self.inner.persist_health.write().await = Some(Arc::new(f));
   }
@@ -172,16 +204,30 @@ impl Prober {
       health.total_queries += 1;
       health.status = Status::Active;
       health.last_probe = Some(Instant::now());
-      (
-        health.url.clone(),
-        health.ema_latency,
-        health.consecutive_fails,
-        health.total_queries,
-      )
+      health.clone()
     };
+    self.persist(&snapshot).await;
+  }
+
+  /// Fold a proxied NAR transfer from `url` into its throughput estimate.
+  #[allow(clippy::significant_drop_tightening)]
+  pub async fn record_throughput(&self, url: &str, sample: TransferSample) {
+    let snapshot = {
+      let mut table = self.inner.table.write().await;
+      let Some(health) = table.get_mut(url) else {
+        return;
+      };
+      health.throughput =
+        Throughput::update(health.throughput, sample, Instant::now());
+      health.clone()
+    };
+    self.persist(&snapshot).await;
+  }
+
+  async fn persist(&self, health: &UpstreamHealth) {
     let callback = self.inner.persist_health.read().await.clone();
     if let Some(callback) = callback {
-      callback(snapshot.0, snapshot.1, snapshot.2, snapshot.3);
+      callback(health);
     }
   }
 
@@ -194,21 +240,42 @@ impl Prober {
       };
       health.consecutive_fails += 1;
       health.status = compute_status(health.consecutive_fails);
-      (
-        health.url.clone(),
-        health.ema_latency,
-        health.consecutive_fails,
-        health.total_queries,
-      )
+      health.clone()
     };
-    let callback = self.inner.persist_health.read().await.clone();
-    if let Some(callback) = callback {
-      callback(snapshot.0, snapshot.1, snapshot.2, snapshot.3);
-    }
+    self.persist(&snapshot).await;
   }
 
   pub async fn get_health(&self, url: &str) -> Option<UpstreamHealth> {
-    self.inner.table.read().await.get(url).cloned()
+    let mut health = self.inner.table.read().await.get(url).cloned()?;
+    health.inflight = self.inflight(url);
+    Some(health)
+  }
+
+  /// Count a NAR transfer to `url` as in flight while the guard lives.
+  #[must_use]
+  pub fn begin_transfer(&self, url: &str) -> TransferGuard {
+    *self
+      .inner
+      .inflight
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .entry(url.to_string())
+      .or_default() += 1;
+    TransferGuard {
+      prober: self.clone(),
+      url:    url.to_string(),
+    }
+  }
+
+  fn inflight(&self, url: &str) -> u32 {
+    self
+      .inner
+      .inflight
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .get(url)
+      .copied()
+      .unwrap_or_default()
   }
 
   pub async fn sorted_by_latency(&self) -> Vec<UpstreamHealth> {
@@ -466,8 +533,8 @@ mod tests {
       },
     ])
     .await;
-    p.seed("https://fast.com", 10.0, 0, 5).await;
-    p.seed("https://down.com", 5.0, 10, 5).await; // faster but Down
+    p.seed("https://fast.com", 10.0, 0, 5, None).await;
+    p.seed("https://down.com", 5.0, 10, 5, None).await; // faster but Down
     let sorted = p.sorted_by_latency().await;
     let last = sorted.last().context("sorted list must not be empty")?;
     assert_eq!(last.url, "https://down.com");
@@ -495,8 +562,9 @@ mod tests {
     ])
     .await;
     // Latencies within 10% of each other: high-priority slightly slower
-    p.seed("https://high-priority.com", 100.0, 0, 10).await;
-    p.seed("https://low-priority.com", 103.0, 0, 10).await;
+    p.seed("https://high-priority.com", 100.0, 0, 10, None)
+      .await;
+    p.seed("https://low-priority.com", 103.0, 0, 10, None).await;
     let sorted = p.sorted_by_latency().await;
     assert_eq!(
       sorted[0].url, "https://high-priority.com",

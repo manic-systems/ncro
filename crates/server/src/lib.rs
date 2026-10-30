@@ -1,7 +1,9 @@
 use std::{
   collections::{BTreeMap, HashMap},
   io,
+  pin::Pin,
   sync::Arc,
+  task::{Context, Poll},
   time::{Duration, Instant},
 };
 
@@ -24,11 +26,17 @@ use axum::{
   response::{IntoResponse, Response},
   routing::get,
 };
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use misstep::Report;
 use ncro_config::{NarHedgingConfig, UpstreamConfig};
 use ncro_db::Db;
-use ncro_health::{Prober, Status, UpstreamHealth};
+use ncro_health::{
+  Prober,
+  Status,
+  TransferGuard,
+  UpstreamHealth,
+  throughput::{Meter, TransferSample, pick_for_transfer},
+};
 use ncro_narinfo::{
   NarInfo,
   is_store_hash,
@@ -45,6 +53,7 @@ use ncro_router::{
 use ncro_upstream::{Backend, BackendError, Upstreams};
 use serde::Serialize;
 use tokio::{
+  runtime::Handle,
   task::JoinSet,
   time::{Instant as TokioInstant, sleep_until, timeout},
 };
@@ -56,6 +65,7 @@ enum RouteKind {
   CacheHit,
   Direct,
   Hedge,
+  Throughput,
   Fallback,
   Race,
 }
@@ -66,6 +76,7 @@ impl RouteKind {
       Self::CacheHit => "cache-hit",
       Self::Direct => "direct",
       Self::Hedge => "hedge",
+      Self::Throughput => "throughput",
       Self::Fallback => "fallback",
       Self::Race => "race",
     }
@@ -642,11 +653,15 @@ fn spawn_nar_attempt(
   headers: HeaderMap,
   candidate: NarCandidate,
 ) {
+  // Counted before spawning so a concurrent pick already sees this transfer.
+  let transfer = state.prober.begin_transfer(&candidate.upstream);
   attempts.spawn(async move {
     let response_timeout = state.nar_timeout(&candidate.upstream);
     let response = timeout(
       response_timeout,
       try_nar_upstream(NarUpstreamRequest {
+        prober: &state.prober,
+        transfer,
         backend: &state.backends.get(&candidate.upstream),
         method,
         headers: &headers,
@@ -798,6 +813,46 @@ async fn hedge_candidates(
   candidates
 }
 
+/// Start on the fastest upstream in the routed one's priority group.
+async fn order_by_throughput(
+  state: &AppState,
+  routed: NarCandidate,
+  mut candidates: Vec<NarCandidate>,
+  bytes: u64,
+) -> (NarCandidate, Vec<NarCandidate>) {
+  if !hedge_allowed(state, &routed.upstream) {
+    return (routed, candidates);
+  }
+  let Some(routed_health) = state.prober.get_health(&routed.upstream).await
+  else {
+    return (routed, candidates);
+  };
+  let mut group = vec![routed_health];
+  for candidate in &candidates {
+    if let Some(health) = state.prober.get_health(&candidate.upstream).await
+      && health.priority == group[0].priority
+    {
+      group.push(health);
+    }
+  }
+  let Some(best) = pick_for_transfer(&group, bytes, Instant::now()) else {
+    return (routed, candidates);
+  };
+  let Some(index) = candidates
+    .iter()
+    .position(|candidate| candidate.upstream == best.url)
+  else {
+    return (routed, candidates);
+  };
+  let mut chosen = candidates.remove(index);
+  chosen.route = RouteKind::Throughput;
+  candidates.push(NarCandidate {
+    route: RouteKind::Hedge,
+    ..routed
+  });
+  (chosen, candidates)
+}
+
 async fn nar(
   State(state): State<Arc<AppState>>,
   req: Request<Body>,
@@ -827,10 +882,15 @@ async fn nar(
     } else {
       &entry.upstream_nar_url
     };
-    let candidates = if let Some(Ok(expected_narinfo)) =
+    let routed = NarCandidate {
+      upstream: entry.upstream_url.clone(),
+      path:     upstream_path.clone(),
+      route:    RouteKind::CacheHit,
+    };
+    let (initial, candidates) = if let Some(Ok(expected_narinfo)) =
       entry.narinfo_bytes.as_deref().map(NarInfo::parse)
     {
-      hedge_candidates(
+      let candidates = hedge_candidates(
         &state,
         store_hash_from_canonical_nar_url(&nar_url),
         &path_and_query,
@@ -838,20 +898,22 @@ async fn nar(
         false,
         Some(&expected_narinfo),
       )
-      .await
+      .await;
+      let bytes = if expected_narinfo.file_size == 0 {
+        expected_narinfo.nar_size
+      } else {
+        expected_narinfo.file_size
+      };
+      order_by_throughput(&state, routed, candidates, bytes).await
     } else {
-      Vec::new()
+      (routed, Vec::new())
     };
     normal_attempted = true;
     if let Some(resp) = hedged_nar(
       Arc::clone(&state),
       req.method().clone(),
       req.headers().clone(),
-      NarCandidate {
-        upstream: entry.upstream_url.clone(),
-        path:     upstream_path.clone(),
-        route:    RouteKind::CacheHit,
-      },
+      initial,
       candidates,
     )
     .await
@@ -893,6 +955,8 @@ async fn nar(
     && let Ok(Some(resp)) = timeout(
       state.nar_timeout(&fallback.url),
       try_nar_upstream(NarUpstreamRequest {
+        prober:   &state.prober,
+        transfer: state.prober.begin_transfer(&fallback.url),
         backend:  &state.backends.get(&fallback.url),
         method:   req.method().clone(),
         headers:  req.headers(),
@@ -987,6 +1051,8 @@ async fn upstream_urls(state: &AppState) -> Vec<String> {
 }
 
 struct NarUpstreamRequest<'a> {
+  prober:   &'a Prober,
+  transfer: TransferGuard,
   backend:  &'a Backend,
   method:   Method,
   headers:  &'a HeaderMap,
@@ -997,6 +1063,8 @@ struct NarUpstreamRequest<'a> {
 
 async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
   let NarUpstreamRequest {
+    prober,
+    transfer,
     backend,
     method,
     headers,
@@ -1015,13 +1083,84 @@ async fn try_nar_upstream(req: NarUpstreamRequest<'_>) -> Option<Response> {
   } else {
     let mut stream = Box::pin(resp.bytes_stream().map_err(io::Error::other));
     let first = stream.try_next().await.ok()??;
+    let metered = MeteredBody {
+      inner:         stream,
+      prober:        prober.clone(),
+      upstream:      upstream.to_string(),
+      meter:         Meter::new(Instant::now()),
+      waiting_since: None,
+      _transfer:     transfer,
+    };
     builder
       .body(Body::from_stream(
-        stream::once(async move { Ok(first) }).chain(stream),
+        stream::once(async move { Ok(first) }).chain(metered),
       ))
       .ok()?
   };
   Some(with_provenance(response, upstream, route))
+}
+
+/// Pending polls are time spent waiting on the upstream.
+struct MeteredBody<S> {
+  inner:         S,
+  prober:        Prober,
+  upstream:      String,
+  meter:         Meter,
+  waiting_since: Option<Instant>,
+  _transfer:     TransferGuard,
+}
+
+impl<S> MeteredBody<S> {
+  fn report(&self, sample: TransferSample) {
+    let Ok(runtime) = Handle::try_current() else {
+      return;
+    };
+    let prober = self.prober.clone();
+    let upstream = self.upstream.clone();
+    runtime.spawn(async move {
+      prober.record_throughput(&upstream, sample).await;
+    });
+  }
+}
+
+impl<S: Stream<Item = io::Result<Bytes>> + Unpin> Stream for MeteredBody<S> {
+  type Item = io::Result<Bytes>;
+
+  fn poll_next(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+  ) -> Poll<Option<Self::Item>> {
+    let this = &mut *self;
+    let poll = Pin::new(&mut this.inner).poll_next(cx);
+    let Poll::Ready(item) = &poll else {
+      this.waiting_since.get_or_insert_with(Instant::now);
+      return poll;
+    };
+    let now = Instant::now();
+    let waited = this
+      .waiting_since
+      .take()
+      .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+    let sample = match item {
+      Some(Ok(chunk)) => {
+        let bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        this.meter.record(bytes, waited, now)
+      },
+      Some(Err(_)) | None => this.meter.finish(now),
+    };
+    if let Some(sample) = sample {
+      this.report(sample);
+    }
+    poll
+  }
+}
+
+impl<S> Drop for MeteredBody<S> {
+  fn drop(&mut self) {
+    if let Some(sample) = self.meter.finish(Instant::now()) {
+      self.report(sample);
+    }
+  }
 }
 
 async fn proxy(

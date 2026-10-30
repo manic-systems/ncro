@@ -67,6 +67,14 @@ pub struct HealthRow {
   pub ema_latency:       f64,
   pub consecutive_fails: i64,
   pub total_queries:     i64,
+  pub throughput:        Option<HealthThroughput>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HealthThroughput {
+  pub bytes_per_sec: f64,
+  /// How long ago the estimate was last updated.
+  pub age:           Duration,
 }
 
 #[derive(Clone)]
@@ -320,17 +328,24 @@ impl Db {
     let mut tx = self.pool.begin().await?;
     for row in rows {
       sqlx::query(
-            r"INSERT INTO upstream_health (url, ema_latency, consecutive_fails, total_queries)
-               VALUES (?, ?, ?, ?)
+            r"INSERT INTO upstream_health (url, ema_latency, consecutive_fails, total_queries, bytes_per_sec, throughput_measured_at)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(url) DO UPDATE SET
                  ema_latency = excluded.ema_latency,
                  consecutive_fails = excluded.consecutive_fails,
-                 total_queries = excluded.total_queries",
+                 total_queries = excluded.total_queries,
+                 bytes_per_sec = excluded.bytes_per_sec,
+                 throughput_measured_at = excluded.throughput_measured_at",
         )
         .bind(&row.url)
         .bind(row.ema_latency)
         .bind(row.consecutive_fails)
         .bind(row.total_queries)
+        .bind(row.throughput.map(|t| t.bytes_per_sec))
+        .bind(row.throughput.map(|t| {
+          let age = i64::try_from(t.age.as_secs()).unwrap_or(i64::MAX);
+          Timestamp::now().as_second().saturating_sub(age)
+        }))
         .execute(&mut *tx)
         .await?;
     }
@@ -343,8 +358,8 @@ impl Db {
   /// Returns [`DbError`] on `SQLite` query failure.
   pub async fn load_all_health(&self) -> Result<Vec<HealthRow>, DbError> {
     let rows = sqlx::query(
-      "SELECT url, ema_latency, consecutive_fails, total_queries FROM \
-       upstream_health",
+      "SELECT url, ema_latency, consecutive_fails, total_queries, \
+       bytes_per_sec, throughput_measured_at FROM upstream_health",
     )
     .fetch_all(&self.pool)
     .await?;
@@ -352,11 +367,26 @@ impl Db {
       rows
         .into_iter()
         .map(|row| {
+          let bytes_per_sec: Option<f64> = row.get("bytes_per_sec");
+          let measured_at: Option<i64> = row.get("throughput_measured_at");
+          let throughput = bytes_per_sec.zip(measured_at).map(
+            |(bytes_per_sec, measured_at)| {
+              let age =
+                Timestamp::now().as_second().saturating_sub(measured_at);
+              HealthThroughput {
+                bytes_per_sec,
+                age: Duration::from_secs(
+                  u64::try_from(age).unwrap_or_default(),
+                ),
+              }
+            },
+          );
           HealthRow {
-            url:               row.get("url"),
-            ema_latency:       row.get("ema_latency"),
+            url: row.get("url"),
+            ema_latency: row.get("ema_latency"),
             consecutive_fails: row.get("consecutive_fails"),
-            total_queries:     row.get("total_queries"),
+            total_queries: row.get("total_queries"),
+            throughput,
           }
         })
         .collect(),
@@ -464,6 +494,15 @@ async fn migrate(pool: &SqlitePool) -> Result<(), DbError> {
     "routes",
     "upstream_nar_url",
     "TEXT NOT NULL DEFAULT ''",
+  )
+  .await?;
+  add_column_if_missing(pool, "upstream_health", "bytes_per_sec", "REAL")
+    .await?;
+  add_column_if_missing(
+    pool,
+    "upstream_health",
+    "throughput_measured_at",
+    "INTEGER",
   )
   .await?;
   Ok(())
@@ -659,6 +698,7 @@ mod tests {
             ema_latency:       1.0,
             consecutive_fails: 0,
             total_queries:     1,
+            throughput:        None,
           }])
           .await?;
           Ok::<_, DbError>(())

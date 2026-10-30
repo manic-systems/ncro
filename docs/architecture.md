@@ -127,6 +127,19 @@ this prevents project-specific caches from becoming winners for unrelated paths.
 Fallback cache traffic bypasses these router features and does not update health
 or routing state.
 
+A routed NAR can also go to a different upstream in the same priority group,
+because latency only predicts how fast a narinfo arrives. A 40 ms cache that
+sends 2 MB/s loses to a 120 ms one that sends 50 MB/s on any NAR over 170 KB.
+ncro times every NAR it proxies and keeps a throughput estimate per upstream,
+and it starts each routed NAR on the upstream with the lowest expected latency
+plus size over throughput. Nix decompresses while it downloads, so a transfer
+only counts as an upstream measurement when ncro spent most of it waiting on the
+upstream. Otherwise it only raises the estimate. Each transfer reports once a
+second while it streams, so an upstream that slows down under load is noticed
+before its NARs finish. NARs between 1 and 16 MiB go to an idle upstream without
+a measurement first, so every cache gets measured without risking a large NAR,
+or many at once, on an unknown one.
+
 > [!NOTE]
 > Persistence is intentionally narrow. SQLite stores two kinds of data so a
 > restart does not force ncro to relearn everything from scratch.
@@ -134,10 +147,11 @@ or routing state.
 First type of stored data is **route entries**, a mapping from narinfo hash to
 the winning upstream URL, stored with a creation timestamp and TTL. When the
 cache exceeds `max_entries`, the least recently used entry is evicted first.
-**Health snapshots** on another hand are per-upstream EMA latency estimates and
-failure counts, refreshed by the background probe loop. Fallback-cache responses
-are (intentionally) not stored as route entries, so normal upstreams become
-active again as soon as they recover.
+**Health snapshots** on another hand are per-upstream EMA latency estimates,
+NAR throughput estimates and failure counts, refreshed by the background probe
+loop and by proxied NARs. Fallback-cache responses are (intentionally) not
+stored as route entries, so normal upstreams become active again as soon as
+they recover.
 
 Discovery and mesh are optional extensions. Discovery can add peers from the
 local network, while mesh gossip shares recent route decisions across trusted

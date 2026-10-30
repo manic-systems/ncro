@@ -8,16 +8,19 @@ use std::{
   os::unix::{ffi::OsStringExt, io::FromRawFd, net::UnixDatagram},
   path::{Path, PathBuf},
   process,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use data_encoding::HEXLOWER;
 use flub::Error;
 use misstep::{OptionExt, Report, ResultExt, bail};
 use ncro_config::{Config, ListenAddr, LogFormat};
-use ncro_db::{Db, HealthRow};
+use ncro_db::{Db, HealthRow, HealthThroughput};
 use ncro_discovery::Discovery;
-use ncro_health::Prober;
+use ncro_health::{
+  Prober,
+  throughput::{Pace, Throughput},
+};
 use ncro_router::{Router, RouterTuning};
 use ncro_upstream::Upstreams;
 use pound::Parse;
@@ -292,17 +295,31 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
         row.ema_latency,
         row.consecutive_fails,
         row.total_queries,
+        row.throughput.and_then(|persisted| {
+          Some(Throughput {
+            bytes_per_sec: persisted.bytes_per_sec,
+            pace:          Pace::Client,
+            measured_at:   Instant::now().checked_sub(persisted.age)?,
+          })
+        }),
       )
       .await;
   }
   let (health_tx, mut health_rx) = mpsc::unbounded_channel();
   prober
-    .set_health_persistence(move |url, ema, fails, queries| {
+    .set_health_persistence(move |health| {
       let _ = health_tx.send(HealthRow {
-        url,
-        ema_latency: ema,
-        consecutive_fails: i64::from(fails),
-        total_queries: i64::try_from(queries).unwrap_or(i64::MAX),
+        url:               health.url.clone(),
+        ema_latency:       health.ema_latency,
+        consecutive_fails: i64::from(health.consecutive_fails),
+        total_queries:     i64::try_from(health.total_queries)
+          .unwrap_or(i64::MAX),
+        throughput:        health.throughput.map(|t| {
+          HealthThroughput {
+            bytes_per_sec: t.bytes_per_sec,
+            age:           t.measured_at.elapsed(),
+          }
+        }),
       });
     })
     .await;
