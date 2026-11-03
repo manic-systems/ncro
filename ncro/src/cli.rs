@@ -18,6 +18,7 @@ use ncro_config::{Config, ListenAddr, LogFormat};
 use ncro_db::{Db, HealthRow};
 use ncro_discovery::Discovery;
 use ncro_health::Prober;
+use ncro_narinfo::is_store_hash;
 use ncro_router::{Router, RouterTuning};
 use ncro_upstream::Upstreams;
 use pound::Parse;
@@ -201,12 +202,29 @@ pub struct Args {
   /// Validate the config file and exit.
   #[pound(long, requires = config)]
   pub check: bool,
+
+  /// Tell mesh peers that the store paths were just built, then exit.
+  #[pound(long, requires = config)]
+  pub announce_built: bool,
+
+  /// Store paths for `--announce-built`, such as Nix's `$OUT_PATHS`.
+  pub store_paths: Vec<PathBuf>,
 }
 
 enum Command {
-  Serve { config: Option<PathBuf> },
-  Check { config: PathBuf },
-  GenerateMeshKey { path: PathBuf },
+  Serve {
+    config: Option<PathBuf>,
+  },
+  Check {
+    config: PathBuf,
+  },
+  GenerateMeshKey {
+    path: PathBuf,
+  },
+  AnnounceBuilt {
+    config:      PathBuf,
+    store_paths: Vec<PathBuf>,
+  },
 }
 
 impl TryFrom<Args> for Command {
@@ -222,6 +240,18 @@ impl TryFrom<Args> for Command {
     if args.check {
       let config = config.context("--check requires --config")?;
       return Ok(Self::Check { config });
+    }
+
+    if args.announce_built {
+      let config = config.context("--announce-built requires --config")?;
+      return Ok(Self::AnnounceBuilt {
+        config,
+        store_paths: args.store_paths,
+      });
+    }
+
+    if !args.store_paths.is_empty() {
+      bail!("store paths are only accepted with --announce-built");
     }
 
     Ok(Self::Serve { config })
@@ -245,7 +275,55 @@ pub async fn run() -> misstep::Result<()> {
       )?;
       Ok(())
     },
+    Command::AnnounceBuilt {
+      config,
+      store_paths,
+    } => announce_built(&config, &store_paths).await,
   }
+}
+
+async fn announce_built(
+  config: &Path,
+  store_paths: &[PathBuf],
+) -> misstep::Result<()> {
+  let cfg = Config::load(Some(config))?;
+  cfg.validate()?;
+  if !cfg.mesh.enabled {
+    bail!("--announce-built requires mesh.enabled");
+  }
+  if cfg.mesh.private_key_path.is_empty() {
+    bail!("--announce-built requires a persistent mesh.private_key");
+  }
+
+  let store_hashes = store_paths
+    .iter()
+    .map(|path| {
+      path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+        .map(|(hash, _)| hash)
+        .filter(|hash| is_store_hash(hash))
+        .map(str::to_owned)
+        .with_context(|| format!("{} is not a store path", path.display()))
+    })
+    .collect::<misstep::Result<Vec<_>>>()?;
+  let node =
+    ncro_mesh::Node::load(Path::new(&cfg.mesh.private_key_path)).await?;
+
+  let mut failed = 0;
+  for peer in &cfg.mesh.peers {
+    if let Err(err) =
+      ncro_mesh::announce_built(&peer.addr, &node, &store_hashes).await
+    {
+      writeln!(io::stderr().lock(), "{:?}", Report::new(err))?;
+      failed += 1;
+    }
+  }
+  if failed > 0 {
+    bail!("{failed} of {} peers unreachable", cfg.mesh.peers.len());
+  }
+  Ok(())
 }
 
 async fn serve(config: Option<&Path>) -> misstep::Result<()> {
@@ -429,6 +507,7 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
     ncro_mesh::listen_and_serve(
       &cfg.mesh.bind_addr,
       db.clone(),
+      router.clone(),
       allowed,
       stop_rx.clone(),
     )
