@@ -14,8 +14,11 @@ flowchart LR
   race --> chosen[Chosen upstream]
   chosen --> cache
   race --> fallback[Optional fallback cache]
-  nar --> chosen
-  nar --> fallback
+  nar --> selection[Transfer estimates and first-byte hedging]
+  selection --> supervisor[Supervised byte stream]
+  supervisor --> resume[Validated Range replacement]
+  resume --> supervisor
+  selection --> fallback
 ```
 
 The routing path is simple: a narinfo lookup first checks SQLite, then falls
@@ -35,8 +38,7 @@ sequenceDiagram
   C->>N: GET /<hash>.narinfo
   N->>S: lookup route
   alt cache hit
-    S-->>N: upstream URL
-    N->>U: fetch narinfo or NAR
+    S-->>N: cached narinfo body
   else cache miss
     N->>U: race requests in parallel
     U-->>N: first success wins
@@ -68,34 +70,66 @@ retries the remaining candidates.
 > operators a direct recovery path to a known-good cache if the normal router
 > behavior or all configured upstreams are unavailable.
 
-NAR streaming, on another hand, follows a different path. There is actually no
-race and when a client requests `/nar/<hash>.nar`, ncro looks up the route for
-the corresponding narinfo hash. _If_ a route exists, it opens a connection to
-the winning upstream and streams the response body directly to the client
-without buffering to disk. If no route exists, it tries upstreams in latency
-order, falling through on 404 until one succeeds.
+NAR transfer selection is separate from narinfo routing. Within configured
+priority groups, fresh measured first-byte time and throughput estimate NAR
+completion time using the remaining compressed file size. With no usable
+measurement, the cached route and health latency provide the fallback order.
+First-byte hedging remains available. NAR transfer decisions never replace the
+narinfo route in SQLite.
+
+The body supervisor works for HTTP and S3 streams. It learns only from actively
+awaited upstream reads, not downstream polling pauses, and does not prefetch
+whole files or write NARs to disk. Transfer statistics are process-local,
+freshness-limited, and conservatively adjusted for active requests. The bounded
+registry is independent of the persisted HEAD-probe health estimates.
 
 ```mermaid
 sequenceDiagram
-  participant C as Client
-  participant N as ncro
-  participant U as Upstreams
-  participant F as Fallback cache
+  participant C as Nix client
+  participant N as ncro supervisor
+  participant U as Initial source
+  participant A as Eligible alternate
 
-  C->>N: GET /nar/<hash>.nar
-  N->>U: try upstreams in latency order
-  alt upstream has the NAR
-    U-->>N: 200 + stream
-    N-->>C: stream (zero copy)
-  else upstream returns 404
-    N->>U: try next upstream
+  C->>N: GET NAR or byte range
+  N->>U: Request selected source
+  opt First-byte deadline exceeded
+    N->>A: Hedge request
   end
-  opt all normal upstreams fail and fallback enabled
-    N->>F: proxy NAR request directly
-    F-->>N: 200 + stream
-    N-->>C: stream (zero copy)
+  U-->>N: Successful first body chunk
+  N-->>C: Original headers and streamed prefix
+  alt Stall, body error, or premature EOF
+    N->>A: Discover matching metadata; GET remaining Range
+    A-->>N: Exact 206 Content-Range and first chunk
+    N-->>C: Continue same response at committed offset
+  else Sustained slow upstream reads
+    N->>A: Discover; sample bounded remaining-range prefix
+    alt Completion-time improvement exceeds both thresholds
+      N->>U: Cancel original stream
+      N-->>C: Retained alternate prefix and remaining stream
+    else Insufficient improvement or invalid response
+      N->>A: Cancel probe
+      N-->>C: Continue original stream
+    end
   end
 ```
+
+Resuming properly requires identical compressed-file metadata, including a
+usable `FileHash` and positive `FileSize`. We cannot use a matching uncompressed
+`NarHash` alone to establish byte identity. Replacement ranges must match the
+_exact_ absolute cursor, requested end, and total size. Client status/headers
+remain those of the initial response. Missing metadata, unsafe ranges, or
+exhausted recovery terminate the body with an error rather than splice unchecked
+bytes. Nix retains its normal integrity verification.
+
+Slow-stream exploration pauses the current cursor, retains at most the
+configured probe prefix plus one transport chunk, and continues the same
+replacement connection on success. Time and attempt limits bound exploration;
+absolute and fractional savings thresholds prevent marginal switches. Each
+source can be attempted only once after the initial selection, and client
+cancellation drops all owned streams. `allow_hedging = false` excludes
+additional requests. Fallback-cache traffic is outside adaptive transfer
+measurement and recovery; it remains a last resort before downstream streaming
+starts.
 
 Background health probes keep latency estimates current by calling
 `HEAD /nix-cache-info` every 30 seconds. The health layer uses Exponentially
@@ -119,9 +153,10 @@ flowchart TD
   status --> router[Router ordering]
 ```
 
-Selection is driven by latency first. When two upstreams are effectively tied,
-`priority` breaks the tie. The router also tracks failures and probe volume so
-it can distinguish a briefly slow cache from one that is trending unhealthy.
+Narinfo selection is driven by latency first. When two upstreams are effectively
+tied, `priority` breaks the tie. The router also tracks failures and probe
+volume so it can distinguish a briefly slow cache from one trending unhealthy.
+NAR selection additionally uses its separate, expiring transfer estimates.
 Per-upstream filters can reject a candidate winner after its narinfo is fetched;
 this prevents project-specific caches from becoming winners for unrelated paths.
 Fallback cache traffic bypasses these router features and does not update health

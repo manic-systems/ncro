@@ -456,6 +456,7 @@ async fn serve(config: Option<&Path>) -> misstep::Result<()> {
         .enabled
         .then_some(cfg.fallback_cache.upstream.clone()),
       nar_hedging:     cfg.cache.nar_hedging.clone(),
+      nar_transfer:    cfg.cache.nar_transfer.clone(),
       cache_priority:  cfg.server.cache_priority,
       want_mass_query: cfg.server.want_mass_query,
       read_timeout:    cfg.server.read_timeout.0,
