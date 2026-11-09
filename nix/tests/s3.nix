@@ -54,13 +54,14 @@ in
 
         services.garage = {
           enable = true;
-          package = pkgs.garage;
+          package = pkgs.garage_2;
           settings = {
             rpc_bind_addr = "[::]:3901";
             rpc_public_addr = "127.0.0.1:3901";
             rpc_secret = garageRpcSecret;
-            # v1.x single-node mode.
-            replication_mode = "none";
+            # v2.x single-node mode.
+            replication_factor = 1;
+            consistency_mode = "consistent";
             s3_api = {
               s3_region = garageRegion;
               api_bind_addr = "[::]:3900";
@@ -73,7 +74,7 @@ in
           };
         };
 
-        environment.systemPackages = [pkgs.garage];
+        environment.systemPackages = [pkgs.garage_2];
 
         systemd.services = {
           # Bootstrap the Garage cluster, upload s3Payload as a Nix binary cache,
@@ -83,7 +84,7 @@ in
             wantedBy = ["multi-user.target"];
             after = ["garage.service" "nix-daemon.service"];
             requires = ["garage.service" "nix-daemon.service"];
-            path = [pkgs.garage pkgs.gawk pkgs.coreutils];
+            path = [pkgs.garage_2 pkgs.gawk pkgs.coreutils];
             serviceConfig = {
               Type = "oneshot";
               RemainAfterExit = true;
@@ -91,33 +92,33 @@ in
                 set -euo pipefail
 
                 # Wait until the Garage daemon accepts admin requests.
-                until ${pkgs.garage}/bin/garage status >/dev/null 2>&1; do
+                until ${pkgs.garage_2}/bin/garage status >/dev/null 2>&1; do
                   sleep 1
                 done
 
                 # Apply a single-node layout (zone dc1, 1 GiB capacity).
                 # Capture full output before filtering to avoid Garage panicking
                 # on SIGPIPE from short-reading consumers like cut/awk.
-                node_fqn=$(${pkgs.garage}/bin/garage node id)
+                node_fqn=$(${pkgs.garage_2}/bin/garage node id)
                 node_id=$(printf '%s\n' "$node_fqn" | cut -d@ -f1)
-                ${pkgs.garage}/bin/garage layout assign -z dc1 -c 1G "$node_id"
-                layout_show=$(${pkgs.garage}/bin/garage layout show)
+                ${pkgs.garage_2}/bin/garage layout assign -z dc1 -c 1G "$node_id"
+                layout_show=$(${pkgs.garage_2}/bin/garage layout show)
                 version=$(printf '%s\n' "$layout_show" \
                   | awk '/Current cluster layout version:/{print $NF+1}')
-                ${pkgs.garage}/bin/garage layout apply --version "$version"
+                ${pkgs.garage_2}/bin/garage layout apply --version "$version"
 
                 # Create the bucket and enable anonymous reads via the web endpoint.
-                ${pkgs.garage}/bin/garage bucket create ${garageBucket}
-                ${pkgs.garage}/bin/garage bucket website --allow ${garageBucket}
+                ${pkgs.garage_2}/bin/garage bucket create ${garageBucket}
+                ${pkgs.garage_2}/bin/garage bucket website --allow ${garageBucket}
 
                 # Create a deterministic key so the proxy node can use the
                 # native authenticated S3 API path.
-                ${pkgs.garage}/bin/garage key import \
+                ${pkgs.garage_2}/bin/garage key import \
                   --yes \
                   -n nix-upload \
                   ${garageAccessKey} \
                   ${garageSecretKey}
-                ${pkgs.garage}/bin/garage bucket allow \
+                ${pkgs.garage_2}/bin/garage bucket allow \
                   --read --write ${garageBucket} --key nix-upload
 
                 mkdir -p /etc/nix
