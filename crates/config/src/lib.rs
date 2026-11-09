@@ -651,7 +651,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     let nrc = netrc("machine other.example.com login alice password secret\n");
     let mut up = upstream("https://cache.example.com");
     apply_netrc(iter::once(&mut up), &nrc);
-    assert!(up.username.is_empty());
+    assert_eq!(up.username, "");
     assert!(up.password.is_none());
   }
 
@@ -662,7 +662,7 @@ url = "s3://fallback-cache?endpoint=s3.example.com"
     let mut up = upstream("s3://my-cache?endpoint=s3.example.com");
     up.location = Location::parse(&up.url, "upstream").expect("valid s3 url");
     apply_netrc(iter::once(&mut up), &nrc);
-    assert!(up.username.is_empty());
+    assert_eq!(up.username, "");
     assert!(up.password.is_none());
   }
 
