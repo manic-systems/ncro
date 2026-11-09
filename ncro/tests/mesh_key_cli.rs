@@ -22,7 +22,7 @@ fn generate_mesh_key_persists_identity_and_validates_arguments()
   assert!(first.status.success());
   assert_eq!(first.stdout, second.stdout);
   assert_eq!(first.stdout.strip_suffix(b"\n").map(<[u8]>::len), Some(64));
-  assert!(first.stderr.is_empty());
+  assert_eq!(first.stderr, b"");
   assert_eq!(fs::metadata(&key_path)?.len(), 32);
 
   let empty_path = ncro().arg("--generate-mesh-key=").output()?;
