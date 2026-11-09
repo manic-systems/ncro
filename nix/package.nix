@@ -6,6 +6,7 @@
   pkg-config,
   openssl,
   cacert,
+  sqlite,
   buildPackages,
   wild ? null,
 }: let
@@ -43,7 +44,8 @@ in
       ]);
 
     buildInputs = [
-      openssl.dev
+      openssl
+      sqlite
     ];
 
     env =
