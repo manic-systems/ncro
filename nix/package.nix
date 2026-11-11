@@ -5,6 +5,7 @@
   installShellFiles,
   pkg-config,
   openssl,
+  sqlite,
   cacert,
   buildPackages,
   wild ? null,
@@ -44,6 +45,7 @@ in
 
     buildInputs = [
       openssl.dev
+      sqlite
     ];
 
     env =
