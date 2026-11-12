@@ -1,13 +1,64 @@
-use std::time::Duration;
+use std::{
+  sync::{Arc, Mutex, PoisonError},
+  time::{Duration, Instant},
+};
 
-use reqwest::{Method, StatusCode, header::HeaderMap};
+use reqwest::{ClientBuilder, Method, StatusCode, header::HeaderMap};
 
 use crate::BackendError;
+
+const MAX_CLIENT_AGE: Duration = Duration::from_mins(1);
+
+/// A reqwest client rebuilt every [`MAX_CLIENT_AGE`].
+#[derive(Clone)]
+pub struct RotatingClient {
+  build:   fn() -> ClientBuilder,
+  current: Arc<Mutex<Built>>,
+}
+
+struct Built {
+  at:     Instant,
+  client: reqwest::Client,
+}
+
+impl RotatingClient {
+  pub fn new(build: fn() -> ClientBuilder) -> reqwest::Result<Self> {
+    let client = build().build()?;
+    Ok(Self {
+      build,
+      current: Arc::new(Mutex::new(Built {
+        at: Instant::now(),
+        client,
+      })),
+    })
+  }
+
+  pub(crate) fn client(
+    &self,
+    upstream: &str,
+  ) -> Result<reqwest::Client, BackendError> {
+    let mut current =
+      self.current.lock().unwrap_or_else(PoisonError::into_inner);
+    if current.at.elapsed() >= MAX_CLIENT_AGE {
+      let client = (self.build)().build().map_err(|source| {
+        BackendError::HttpClient {
+          upstream: upstream.to_owned(),
+          source,
+        }
+      })?;
+      *current = Built {
+        at: Instant::now(),
+        client,
+      };
+    }
+    Ok(current.client.clone())
+  }
+}
 
 /// A Nix binary cache served over HTTP, with optional basic auth.
 pub struct HttpBackend {
   url:      String,
-  client:   reqwest::Client,
+  client:   RotatingClient,
   username: String,
   password: Option<String>,
 }
@@ -15,7 +66,7 @@ pub struct HttpBackend {
 impl HttpBackend {
   pub(crate) const fn new(
     url: String,
-    client: reqwest::Client,
+    client: RotatingClient,
     username: String,
     password: Option<String>,
   ) -> Self {
@@ -38,8 +89,9 @@ impl HttpBackend {
     headers: HeaderMap,
     timeout: Option<Duration>,
   ) -> Result<Option<reqwest::Response>, BackendError> {
+    let client = self.client.client(&self.url)?;
     let url = format!("{}{path}", self.url);
-    let mut req = self.client.request(method, &url).headers(headers);
+    let mut req = client.request(method, &url).headers(headers);
     if self.is_authenticated() {
       req = req.basic_auth(&self.username, self.password.as_ref());
     }

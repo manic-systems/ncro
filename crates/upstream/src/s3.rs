@@ -40,7 +40,11 @@ use tokio::{
   time,
 };
 
-use crate::{BackendError, s3::aws_http::ReqwestHttpClient};
+use crate::{
+  BackendError,
+  http::RotatingClient,
+  s3::aws_http::ReqwestHttpClient,
+};
 
 /// The AWS SDK's default connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3100);
@@ -59,7 +63,7 @@ pub struct S3Backend {
 }
 
 struct Client {
-  http:        reqwest::Client,
+  http:        RotatingClient,
   credentials: DefaultCredentialsChain,
   cached:      Mutex<Option<(Credentials, SystemTime)>>,
 }
@@ -153,9 +157,10 @@ impl S3Backend {
     .into_parts()
     .0;
 
+    let http = client.http.client(&self.url)?;
     let mut attempt = 1;
     loop {
-      let mut req = client.http.request(method.clone(), &url);
+      let mut req = http.request(method.clone(), &url);
       for (name, value) in instructions.headers() {
         req = req.header(name, value);
       }
@@ -199,15 +204,15 @@ impl S3Backend {
       .client
       .get_or_try_init(|| {
         async {
-          let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|source| {
-              BackendError::HttpClient {
-                upstream: self.url.clone(),
-                source,
-              }
-            })?;
+          let http = RotatingClient::new(|| {
+            reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT)
+          })
+          .map_err(|source| {
+            BackendError::HttpClient {
+              upstream: self.url.clone(),
+              source,
+            }
+          })?;
           let provider_config =
             ProviderConfig::default().with_http_client(ReqwestHttpClient);
           let mut chain = DefaultCredentialsChain::builder()
