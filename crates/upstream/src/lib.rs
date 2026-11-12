@@ -15,7 +15,10 @@ use ncro_config::{Location, UpstreamConfig};
 use reqwest::{Method, StatusCode, header::HeaderMap};
 use rustls::crypto::ring;
 
-use crate::{http::HttpBackend, s3::S3Backend};
+use crate::{
+  http::{HttpBackend, RotatingClient},
+  s3::S3Backend,
+};
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -123,7 +126,7 @@ impl Backend {
 #[derive(Clone)]
 pub struct Upstreams {
   backends: Arc<DashMap<String, Arc<Backend>>>,
-  http:     reqwest::Client,
+  http:     RotatingClient,
 }
 
 impl Upstreams {
@@ -135,7 +138,7 @@ impl Upstreams {
 
     Ok(Self {
       backends: Arc::default(),
-      http:     reqwest::Client::builder().build()?,
+      http:     RotatingClient::new(reqwest::Client::builder)?,
     })
   }
 
