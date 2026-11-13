@@ -81,9 +81,11 @@ SQLite.
 The body supervisor works for HTTP and S3 streams. When Nix is the slow side,
 say while it decompresses xz, a transfer only proves the upstream is at least
 that fast, so it can raise an estimate but never lower one. It does not prefetch
-whole files or write NARs to disk. Transfer statistics are process-local,
-freshness-limited, and conservatively adjusted for active requests. The bounded
-registry is independent of the persisted HEAD-probe health estimates.
+whole files or write NARs to disk. Transfer statistics are process-local and
+freshness-limited. Rates are summed per upstream and weighed against the bytes
+its transfers still owe, so a busy fast upstream still beats an idle slow one.
+The bounded registry is independent of the persisted HEAD-probe health
+estimates.
 
 ```mermaid
 sequenceDiagram

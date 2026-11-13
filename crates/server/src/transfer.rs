@@ -26,6 +26,7 @@ use super::{
   AppState,
   NarCandidate,
   hedge_candidates,
+  nar_sample,
   open_nar_candidate,
   rank_nar_candidates,
   throughput::TransferSample,
@@ -436,10 +437,16 @@ impl Transfer {
       }
       self.attempts += 1;
       self.tried.insert(candidate.upstream.clone());
+      let sample = nar_sample(&self.state, &Method::GET, &candidate, remaining);
       let attempt = async {
-        let response =
-          open_nar_candidate(&self.state, Method::GET, &headers, &candidate)
-            .await?;
+        let response = open_nar_candidate(
+          &self.state,
+          Method::GET,
+          &headers,
+          &candidate,
+          sample,
+        )
+        .await?;
         if !span.validates(&response, cursor) {
           return None;
         }

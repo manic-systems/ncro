@@ -265,10 +265,13 @@ whole file size. Narinfo lookup races remain latency-based.
 
 Measurement windows require both minimum bytes and minimum duration. When Nix is
 the slow side, say while it decompresses xz, the window can raise an estimate
-but never lower one. Bounded streaming does not prefetch entire files. Active
-requests conservatively damp estimates under increased concurrency. Statistics
-are in memory, expire, and are capped at 1,024 upstreams; they are not persisted
-or mesh-gossiped.
+but never lower one. A transfer that finishes before its first window closes
+still counts once it passes the byte minimum, otherwise a fast upstream would
+never be measured by ordinary NARs. Bounded streaming does not prefetch entire
+files. Rates are added up across an upstream's active transfers, and a new
+request queues behind the bytes they still owe, so a busy fast upstream still
+beats an idle slow one. Statistics are in memory, expire, and are capped at
+1,024 upstreams; they are not persisted or mesh-gossiped.
 
 <!--markdownlint-disable MD013-->
 

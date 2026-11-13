@@ -49,7 +49,7 @@ use ncro_router::{
 };
 use ncro_upstream::{Backend, BackendError, Upstreams};
 use serde::Serialize;
-use throughput::ThroughputStats;
+use throughput::{ThroughputStats, TransferSample};
 use tokio::{
   task::JoinSet,
   time::{Instant as TokioInstant, sleep_until, timeout, timeout_at},
@@ -731,15 +731,26 @@ fn rank_nar_candidates(
   });
 }
 
+/// Counts the transfer against its upstream from the moment it is chosen, so
+/// requests ranked concurrently see it.
+fn nar_sample(
+  state: &AppState,
+  method: &Method,
+  candidate: &NarCandidate,
+  remaining: u64,
+) -> Option<TransferSample> {
+  (state.nar_transfer.enabled && method == Method::GET)
+    .then(|| state.throughput.start(&candidate.upstream, remaining))
+}
+
 async fn open_nar_candidate(
   state: &AppState,
   method: Method,
   headers: &HeaderMap,
   candidate: &NarCandidate,
+  sample: Option<TransferSample>,
 ) -> Option<Response> {
   let started = Instant::now();
-  let sample = (state.nar_transfer.enabled && method == Method::GET)
-    .then(|| state.throughput.start(&candidate.upstream));
   let response = timeout(
     state.nar_timeout(&candidate.upstream),
     try_nar_upstream(NarUpstreamRequest {
@@ -767,10 +778,12 @@ fn spawn_nar_attempt(
   method: Method,
   headers: HeaderMap,
   candidate: NarCandidate,
+  remaining: u64,
 ) {
+  let sample = nar_sample(&state, &method, &candidate, remaining);
   attempts.spawn(async move {
     let response =
-      open_nar_candidate(&state, method, &headers, &candidate).await;
+      open_nar_candidate(&state, method, &headers, &candidate, sample).await;
     (candidate, response)
   });
 }
@@ -792,13 +805,13 @@ async fn hedged_nar(
   if method == Method::GET && state.nar_transfer.enabled {
     headers.insert("accept-encoding", HeaderValue::from_static("identity"));
   }
+  let remaining = context.expected.as_ref().map_or(0, |info| {
+    transfer::requested_length(&headers, info.file_size)
+  });
   if method == Method::GET
     && context.expected.is_some()
     && state.nar_transfer.enabled
   {
-    let remaining = context.expected.as_ref().map_or(0, |info| {
-      transfer::requested_length(&headers, info.file_size)
-    });
     candidates.push(initial);
     rank_nar_candidates(&state, &mut candidates, remaining);
     if EXPLORE_BYTES.contains(&remaining)
@@ -822,6 +835,7 @@ async fn hedged_nar(
     method.clone(),
     headers.clone(),
     initial,
+    remaining,
   );
   if method == Method::HEAD && state.nar_hedging.enabled {
     while let Some(candidate) = candidates.pop() {
@@ -835,6 +849,7 @@ async fn hedged_nar(
         method.clone(),
         headers.clone(),
         candidate,
+        remaining,
       );
     }
   }
@@ -869,14 +884,14 @@ async fn hedged_nar(
         if let Some(candidate) = candidates.pop() {
           ncro_metrics::get().nar_hedges.with_label_values(&["started", &candidate.upstream]).inc();
           tracing::info!(upstream = candidate.upstream, "nar hedge started after failure");
-          spawn_nar_attempt(&mut attempts, Arc::clone(&state), method.clone(), headers.clone(), candidate);
+          spawn_nar_attempt(&mut attempts, Arc::clone(&state), method.clone(), headers.clone(), candidate, remaining);
         }
       }
       () = sleep_until(next_hedge), if method != Method::HEAD && state.nar_hedging.enabled && attempts.len() < max_inflight && !candidates.is_empty() => {
         if let Some(candidate) = candidates.pop() {
           ncro_metrics::get().nar_hedges.with_label_values(&["started", &candidate.upstream]).inc();
           tracing::info!(upstream = candidate.upstream, "nar hedge started");
-          spawn_nar_attempt(&mut attempts, Arc::clone(&state), method.clone(), headers.clone(), candidate);
+          spawn_nar_attempt(&mut attempts, Arc::clone(&state), method.clone(), headers.clone(), candidate, remaining);
           next_hedge = TokioInstant::now() + delay;
         }
       }
