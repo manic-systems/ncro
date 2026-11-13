@@ -455,7 +455,7 @@ impl Proxy {
       db.clone(),
       prober.clone(),
       backends.clone(),
-      Duration::from_secs(60),
+      Duration::from_mins(1),
       Duration::from_secs(3),
       Duration::from_secs(1),
       RouterTuning {

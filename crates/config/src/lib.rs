@@ -1187,7 +1187,7 @@ impl Default for NarTransferConfig {
       throughput_alpha:    0.3,
       sample_min_bytes:    262_144,
       sample_min_duration: HumanDuration(Duration::from_millis(250)),
-      stats_ttl:           HumanDuration(Duration::from_secs(300)),
+      stats_ttl:           HumanDuration(Duration::from_mins(5)),
       stall_timeout:       HumanDuration(Duration::from_secs(5)),
       slow_window:         HumanDuration(Duration::from_secs(3)),
       switch_margin:       HumanDuration(Duration::from_secs(1)),
