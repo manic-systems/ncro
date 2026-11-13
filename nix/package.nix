@@ -5,6 +5,7 @@
   installShellFiles,
   pkg-config,
   openssl,
+  zstd,
   cacert,
   sqlite,
   buildPackages,
@@ -46,6 +47,7 @@ in
     buildInputs = [
       openssl
       sqlite
+      zstd
     ];
 
     env =
