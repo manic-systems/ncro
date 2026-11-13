@@ -77,8 +77,9 @@ measurement, the cached route and health latency provide the fallback order.
 First-byte hedging remains available. NAR transfer decisions never replace the
 narinfo route in SQLite.
 
-The body supervisor works for HTTP and S3 streams. It learns only from actively
-awaited upstream reads, not downstream polling pauses, and does not prefetch
+The body supervisor works for HTTP and S3 streams. When Nix is the slow side,
+say while it decompresses xz, a transfer only proves the upstream is at least
+that fast, so it can raise an estimate but never lower one. It does not prefetch
 whole files or write NARs to disk. Transfer statistics are process-local,
 freshness-limited, and conservatively adjusted for active requests. The bounded
 registry is independent of the persisted HEAD-probe health estimates.

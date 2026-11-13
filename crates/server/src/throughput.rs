@@ -14,6 +14,9 @@ use ncro_config::NarTransferConfig;
 
 const MAX_UPSTREAMS: usize = 1024;
 
+/// Upstream wait share of a window above which the upstream set the pace.
+const UPSTREAM_PACED_WAIT: f64 = 0.5;
+
 #[derive(Clone)]
 pub struct ThroughputStats {
   shared: Arc<Shared>,
@@ -34,9 +37,19 @@ struct Entry {
   rate:          Option<Rate>,
 }
 
+/// Who set the pace of the windows behind a rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pace {
+  /// ncro mostly waited on the upstream, so the rate is the upstream's.
+  Upstream,
+  /// The client set the pace, so the upstream is at least this fast.
+  Client,
+}
+
 #[derive(Clone, Copy)]
 struct Rate {
   bytes_per_sec: f64,
+  pace:          Pace,
   concurrency:   usize,
   updated:       Instant,
 }
@@ -63,6 +76,7 @@ pub struct TransferSample {
   upstream:       Option<Arc<str>>,
   bytes:          u64,
   active_elapsed: Duration,
+  window_started: Instant,
   concurrency:    usize,
 }
 
@@ -143,6 +157,7 @@ impl ThroughputStats {
       upstream: key,
       bytes: 0,
       active_elapsed: Duration::ZERO,
+      window_started: now,
       concurrency,
     }
   }
@@ -174,7 +189,7 @@ impl ThroughputStats {
 }
 
 impl TransferSample {
-  pub(super) fn first_byte(&self, elapsed: Duration) {
+  pub(super) fn first_byte(&mut self, elapsed: Duration) {
     self.first_byte_at(elapsed, Instant::now());
   }
 
@@ -182,7 +197,8 @@ impl TransferSample {
     clippy::expect_used,
     reason = "Active entries cannot be evicted before their sample is dropped."
   )]
-  fn first_byte_at(&self, elapsed: Duration, now: Instant) {
+  fn first_byte_at(&mut self, elapsed: Duration, now: Instant) {
+    self.window_started = now;
     let Some(key) = &self.upstream else { return };
     let mut entries = self.stats.entries();
     let entry = entries.get_mut(key).expect("live upstream");
@@ -211,29 +227,48 @@ impl TransferSample {
     // requests start or finish between chunks. No concurrency normalization
     // may inflate the rate actually measured by this request.
     self.concurrency = self.concurrency.min(entry.active);
+    let wall = now
+      .saturating_duration_since(self.window_started)
+      .max(self.active_elapsed);
     if self.bytes < self.stats.shared.min_bytes
-      || self.active_elapsed < self.stats.shared.min_duration
+      || wall < self.stats.shared.min_duration
     {
       return;
     }
-    let rate = self.bytes as f64 / self.active_elapsed.as_secs_f64();
+    let (rate, pace) = if self.active_elapsed.as_secs_f64()
+      >= UPSTREAM_PACED_WAIT * wall.as_secs_f64()
+    {
+      (
+        self.bytes as f64 / self.active_elapsed.as_secs_f64(),
+        Pace::Upstream,
+      )
+    } else {
+      (self.bytes as f64 / wall.as_secs_f64(), Pace::Client)
+    };
     if valid_rate(rate) {
       let previous = entry
         .rate
         .filter(|previous| fresh(previous.updated, now, self.stats.shared.ttl));
-      let (bytes_per_sec, concurrency) =
-        previous.map_or((rate, self.concurrency), |previous| {
+      let concurrency = previous.map_or(self.concurrency, |previous| {
+        previous.concurrency.min(self.concurrency)
+      });
+      let (bytes_per_sec, pace) = match (previous, pace) {
+        (Some(previous), Pace::Upstream) if previous.pace == Pace::Upstream => {
+          let alpha = self.stats.shared.alpha;
           (
-            previous.bytes_per_sec.mul_add(
-              1.0 - self.stats.shared.alpha,
-              rate * self.stats.shared.alpha,
-            ),
-            previous.concurrency.min(self.concurrency),
+            previous.bytes_per_sec.mul_add(1.0 - alpha, rate * alpha),
+            pace,
           )
-        });
+        },
+        (Some(previous), Pace::Client) => {
+          (previous.bytes_per_sec.max(rate), previous.pace)
+        },
+        (_, pace) => (rate, pace),
+      };
       if valid_rate(bytes_per_sec) {
         entry.rate = Some(Rate {
           bytes_per_sec,
+          pace,
           concurrency,
           updated: now,
         });
@@ -241,6 +276,7 @@ impl TransferSample {
     }
     self.bytes = 0;
     self.active_elapsed = Duration::ZERO;
+    self.window_started = now;
     self.concurrency = entry.active;
     drop(entries);
   }

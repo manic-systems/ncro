@@ -263,11 +263,12 @@ retain cached-route/latency ordering and can be explored by hedging or a bounded
 slow-stream probe. Client ranges use their requested length, not the whole file
 size. Narinfo lookup races remain latency-based.
 
-Measurement windows require both minimum bytes and minimum actively awaited
-upstream time. Time between downstream body polls is not included; bounded
-streaming does not prefetch entire files. Active requests conservatively damp
-estimates under increased concurrency. Statistics are in memory, expire, and are
-capped at 1,024 upstreams; they are not persisted or mesh-gossiped.
+Measurement windows require both minimum bytes and minimum duration. When Nix is
+the slow side, say while it decompresses xz, the window can raise an estimate
+but never lower one. Bounded streaming does not prefetch entire files. Active
+requests conservatively damp estimates under increased concurrency. Statistics
+are in memory, expire, and are capped at 1,024 upstreams; they are not persisted
+or mesh-gossiped.
 
 <!--markdownlint-disable MD013-->
 

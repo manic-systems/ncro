@@ -41,7 +41,7 @@ pub struct Context {
 /// polls.
 pub fn observe(
   response: Response,
-  sample: TransferSample,
+  mut sample: TransferSample,
   first_byte: Duration,
 ) -> Response {
   sample.first_byte(first_byte);
