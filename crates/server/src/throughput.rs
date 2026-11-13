@@ -186,6 +186,18 @@ impl ThroughputStats {
       first_byte,
     })
   }
+
+  /// Whether `upstream` is idle with no rate, or only a client-paced floor.
+  pub(super) fn explorable(&self, upstream: &str) -> bool {
+    let now = Instant::now();
+    self.entries().get(upstream).is_none_or(|entry| {
+      entry.active == 0
+        && entry
+          .rate
+          .filter(|rate| fresh(rate.updated, now, self.shared.ttl))
+          .is_none_or(|rate| rate.pace == Pace::Client)
+    })
+  }
 }
 
 impl TransferSample {

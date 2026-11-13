@@ -104,7 +104,8 @@ The request flow follows two distinct paths depending on the request type:
    eligible alternates against its narinfo
 2. Within priority groups, fresh transfer measurements rank large NAR requests
    by estimated completion time; cached-route/latency ordering remains the
-   fallback when measurements are unavailable
+   fallback when measurements are unavailable, and idle unmeasured sources
+   go first for 1 to 16 MiB NARs
 3. First-byte hedging starts another eligible source if the initial request is
    slow to respond; the winner is streamed with no disk buffering
 4. A supervised body discovers alternates and resumes an identical compressed

@@ -5,6 +5,7 @@ use std::{
   cmp::Ordering,
   collections::HashMap,
   io,
+  ops::RangeInclusive,
   sync::Arc,
   time::{Duration, Instant},
 };
@@ -678,6 +679,10 @@ fn realisation_response(
   with_provenance(out, upstream, route)
 }
 
+/// NARs big enough to measure and small enough to risk on an unmeasured
+/// upstream.
+const EXPLORE_BYTES: RangeInclusive<u64> = (1 << 20)..=(16 << 20);
+
 #[derive(Clone)]
 struct NarCandidate {
   upstream:  String,
@@ -791,14 +796,21 @@ async fn hedged_nar(
     && context.expected.is_some()
     && state.nar_transfer.enabled
   {
+    let remaining = context.expected.as_ref().map_or(0, |info| {
+      transfer::requested_length(&headers, info.file_size)
+    });
     candidates.push(initial);
-    rank_nar_candidates(
-      &state,
-      &mut candidates,
-      context.expected.as_ref().map_or(0, |info| {
-        transfer::requested_length(&headers, info.file_size)
-      }),
-    );
+    rank_nar_candidates(&state, &mut candidates, remaining);
+    if EXPLORE_BYTES.contains(&remaining)
+      && let Some(priority) = candidates.first().map(|first| first.priority)
+      && let Some(index) = candidates.iter().position(|candidate| {
+        candidate.priority == priority
+          && state.throughput.explorable(&candidate.upstream)
+      })
+    {
+      let explored = candidates.remove(index);
+      candidates.insert(0, explored);
+    }
     candidates.reverse();
     initial = candidates.pop()?;
     candidates.retain(|candidate| hedge_allowed(&state, &candidate.upstream));

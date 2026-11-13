@@ -73,9 +73,10 @@ retries the remaining candidates.
 NAR transfer selection is separate from narinfo routing. Within configured
 priority groups, fresh measured first-byte time and throughput estimate NAR
 completion time using the remaining compressed file size. With no usable
-measurement, the cached route and health latency provide the fallback order.
-First-byte hedging remains available. NAR transfer decisions never replace the
-narinfo route in SQLite.
+measurement, the cached route and health latency provide the fallback order, and
+idle unmeasured sources go first for 1 to 16 MiB transfers. First-byte hedging
+remains available. NAR transfer decisions never replace the narinfo route in
+SQLite.
 
 The body supervisor works for HTTP and S3 streams. When Nix is the slow side,
 say while it decompresses xz, a transfer only proves the upstream is at least

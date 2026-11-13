@@ -259,9 +259,9 @@ disables mid-stream probes and recovery.
 Within each priority group, transfers at least `sample_min_bytes` in size prefer
 sources with fresh measurements and rank them by measured first-byte time plus
 remaining **compressed** bytes divided by observed throughput. Unknown sources
-retain cached-route/latency ordering and can be explored by hedging or a bounded
-slow-stream probe. Client ranges use their requested length, not the whole file
-size. Narinfo lookup races remain latency-based.
+retain cached-route/latency ordering, except idle unmeasured sources go first
+for 1 to 16 MiB transfers. Client ranges use their requested length, not the
+whole file size. Narinfo lookup races remain latency-based.
 
 Measurement windows require both minimum bytes and minimum duration. When Nix is
 the slow side, say while it decompresses xz, the window can raise an estimate
