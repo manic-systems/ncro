@@ -1,7 +1,7 @@
 use std::{
   collections::HashMap,
   io::{self, ErrorKind},
-  net::SocketAddr,
+  net::{Ipv4Addr, Ipv6Addr, SocketAddr},
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -21,6 +21,7 @@ use ncro_db::{Db, RouteEntry};
 use ncro_router::Router;
 use rmp_serde::{decode::Error as DecodeError, encode::Error as EncodeError};
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
   fs::{self, OpenOptions},
   io::AsyncWriteExt,
@@ -220,6 +221,31 @@ pub fn verify(pubkey: &[u8], body: &[u8], sig: &[u8]) -> Result<(), MeshError> {
     .map_err(|_| MeshError::InvalidSignature)
 }
 
+async fn bind_listener(addr: &str) -> io::Result<UdpSocket> {
+  let Ok(SocketAddr::V6(addr)) = addr.parse::<SocketAddr>() else {
+    return UdpSocket::bind(addr).await;
+  };
+  if !addr.ip().is_unspecified() {
+    return UdpSocket::bind(addr).await;
+  }
+  match bind_dual_stack(addr.port()) {
+    Ok(socket) => Ok(socket),
+    Err(error) if error.kind() == ErrorKind::AddrInUse => Err(error),
+    Err(error) => {
+      tracing::warn!(error = %Report::new(error), "IPv6 unavailable, mesh listening on 0.0.0.0 only");
+      UdpSocket::bind((Ipv4Addr::UNSPECIFIED, addr.port())).await
+    },
+  }
+}
+
+fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
+  let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+  socket.set_only_v6(false)?;
+  socket.set_nonblocking(true)?;
+  socket.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
+  UdpSocket::from_std(socket.into())
+}
+
 /// # Errors
 ///
 /// Returns [`MeshError`] if the UDP socket cannot be bound to `addr`.
@@ -230,7 +256,7 @@ pub async fn listen_and_serve(
   allowed_keys: Vec<[u8; 32]>,
   stop: watch::Receiver<bool>,
 ) -> Result<(), MeshError> {
-  let socket = UdpSocket::bind(addr).await.map_err(|source| {
+  let socket = bind_listener(addr).await.map_err(|source| {
     MeshError::Bind {
       addr: addr.to_owned(),
       source,
@@ -446,6 +472,7 @@ fn decode_packet(packet: &[u8]) -> Result<DecodedPacket<'_>, MeshError> {
 mod tests {
   use std::{
     env,
+    net::SocketAddr,
     path::Path,
     process,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -461,6 +488,7 @@ mod tests {
     Node,
     Payload,
     announce_built,
+    bind_listener,
     decode_packet,
     merge_routes,
     send_packet,
@@ -496,8 +524,12 @@ mod tests {
   async fn announce_built_reaches_ipv4_and_ipv6_peers() -> misstep::Result<()> {
     let node = Node::new(Path::new("")).await?;
     let store_hashes = vec!["0123456789abcdfghijklmnpqrsvwxyz".to_owned()];
+    let ipv6_available = UdpSocket::bind("[::1]:0").await.is_ok();
 
     for addr in ["127.0.0.1:0", "[::1]:0"] {
+      if addr == "[::1]:0" && !ipv6_available {
+        continue;
+      }
       let receiver = UdpSocket::bind(addr).await?;
       announce_built(&receiver.local_addr()?.to_string(), &node, &store_hashes)
         .await?;
@@ -515,11 +547,11 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn send_packet_falls_back_to_ipv4() -> misstep::Result<()> {
+  async fn send_packet_skips_failed_address() -> misstep::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0").await?;
-    let invalid_peer = "[::1]:0".parse()?;
+    let broadcast_peer = "255.255.255.255:7946".parse()?;
     let reachable_peer = receiver.local_addr()?;
-    let peers = [invalid_peer, reachable_peer];
+    let peers = [broadcast_peer, reachable_peer];
     send_packet(b"mesh fallback", peers.into_iter()).await?;
 
     let mut packet = [0; MAX_PACKET_SIZE];
@@ -527,6 +559,28 @@ mod tests {
       timeout(Duration::from_secs(2), receiver.recv_from(&mut packet))
         .await??;
     assert_eq!(&packet[..received_len], b"mesh fallback");
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn wildcard_listener_receives_both_address_families()
+  -> misstep::Result<()> {
+    let ipv6_available = UdpSocket::bind("[::1]:0").await.is_ok();
+    let receiver = bind_listener("[::]:0").await?;
+    let port = receiver.local_addr()?.port();
+    let mut packet = [0; MAX_PACKET_SIZE];
+
+    for host in ["127.0.0.1", "::1"] {
+      if host == "::1" && !ipv6_available {
+        continue;
+      }
+      let peer = SocketAddr::new(host.parse()?, port);
+      send_packet(b"mesh listener", [peer].into_iter()).await?;
+      let (received_len, _) =
+        timeout(Duration::from_secs(2), receiver.recv_from(&mut packet))
+          .await??;
+      assert_eq!(&packet[..received_len], b"mesh listener");
+    }
     Ok(())
   }
 
