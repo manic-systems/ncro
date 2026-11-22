@@ -28,7 +28,7 @@
   meshAddrFor = fallbackPort: settings:
     if (settings.mesh.bind_addr or "") != ""
     then settings.mesh.bind_addr
-    else "0.0.0.0:${toString fallbackPort}";
+    else "[::]:${toString fallbackPort}";
 in {
   inherit tomlType defaultServerPort defaultMeshPort;
 

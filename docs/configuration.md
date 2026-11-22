@@ -5,7 +5,8 @@
 ncro reads TOML from the file passed with `--config`. In a configuration file,
 `[[upstreams]]` must contain at least one entry; every other section and setting
 is optional and uses the defaults below. With no configuration file, ncro
-listens on `localhost:8080` and uses `https://cache.nixos.org` as its only upstream.
+listens on `localhost:8080` and uses `https://cache.nixos.org` as its only
+upstream.
 
 Start with one upstream, point Nix at ncro, then add routing, authentication, or
 network features only when they solve a concrete deployment need. See
@@ -44,9 +45,9 @@ these non-empty environment variables after reading that file:
 | `NCRO_DB_PATH`   | `cache.db_path` |
 | `NCRO_LOG_LEVEL` | `logging.level` |
 
-Unknown keys are an error. `ncro --config <file> --check` parses and validates
-a file and exits, without reading passwords or applying the overrides above, so
-it can run inside a build sandbox.
+Unknown keys are an error. `ncro --config <file> --check` parses and validates a
+file and exits, without reading passwords or applying the overrides above, so it
+can run inside a build sandbox.
 
 ## Server
 
@@ -97,9 +98,9 @@ nar_timeout = "60s"
 | `password`        | unset                 | HTTP Basic Auth password. Mutually exclusive with `password_file`.                                                                                |
 | `password_file`   | unset                 | File containing the HTTP Basic Auth password. One trailing newline is removed.                                                                    |
 | `narinfo_timeout` | `"5s"`                | Timeout for this upstream's narinfo HEAD race and GET fetches.                                                                                    |
-| `nar_timeout`     | `server.read_timeout` | Time allowed to receive successful NAR response headers and the first body chunk. Streaming continues after this deadline.                       |
+| `nar_timeout`     | `server.read_timeout` | Time allowed to receive successful NAR response headers and the first body chunk. Streaming continues after this deadline.                        |
 | `allow_hedging`   | `true`                | Permit this upstream to be launched as an additional NAR hedge. Set false for metered or residential sources; it may still be the initial source. |
-| `realisations`    | `true`                | Whether this upstream publishes CA realisations. Set false for caches without them, so build trace lookups skip it.                              |
+| `realisations`    | `true`                | Whether this upstream publishes CA realisations. Set false for caches without them, so build trace lookups skip it.                               |
 | `nar_url_mode`    | `"to_self"`           | How the narinfo `URL:` field is returned; described below.                                                                                        |
 | `filters`         | `[]`                  | Narinfo path filters, described below.                                                                                                            |
 
@@ -163,9 +164,9 @@ If those fields are empty, ncro also consults a netrc file: `NETRC` if set, or
 `~/.netrc` otherwise. The `machine` name must match the upstream hostname; a
 `default` entry is used when no machine entry matches. Explicit configuration
 credentials take precedence over netrc credentials. S3 upstreams do not use
-Basic Auth or netrc. ncro refuses to start when the file `NETRC` names cannot
-be read or parsed, so a wrong path or permission shows up at startup instead of
-as failed authentication later. A broken `~/.netrc` is skipped with a warning.
+Basic Auth or netrc. ncro refuses to start when the file `NETRC` names cannot be
+read or parsed, so a wrong path or permission shows up at startup instead of as
+failed authentication later. A broken `~/.netrc` is skipped with a warning.
 
 ### S3 upstreams
 
@@ -291,7 +292,7 @@ UDP. It is disabled by default and is intended for private networks.
 ```toml
 [mesh]
 enabled = true
-bind_addr = "0.0.0.0:7946"
+bind_addr = "[::]:7946"
 private_key = "/var/lib/ncro/node.key"
 gossip_interval = "30s"
 
@@ -302,13 +303,13 @@ public_key = "a1b2c3..." # 32-byte ed25519 key, hex encoded
 
 <!--markdownlint-disable MD013-->
 
-| Key               | Default          | Meaning                                                                                |
-| ----------------- | ---------------- | -------------------------------------------------------------------------------------- |
-| `enabled`         | `false`          | Enable mesh gossip. At least one peer is required when enabled.                        |
-| `bind_addr`       | `"0.0.0.0:7946"` | UDP address on which to receive gossip.                                                |
-| `private_key`     | empty            | Path to an ed25519 private key. Empty uses an ephemeral identity.                      |
-| `gossip_interval` | `"30s"`          | Interval between route announcements.                                                  |
-| `peers`           | `[]`             | Peer entries, each with required `addr` and hex-encoded 32-byte `public_key`.          |
+| Key               | Default       | Meaning                                                                       |
+| ----------------- | ------------- | ----------------------------------------------------------------------------- |
+| `enabled`         | `false`       | Enable mesh gossip. At least one peer is required when enabled.               |
+| `bind_addr`       | `"[::]:7946"` | UDP address on which to receive gossip.                                       |
+| `private_key`     | empty         | Path to an ed25519 private key. Empty uses an ephemeral identity.             |
+| `gossip_interval` | `"30s"`       | Interval between route announcements.                                         |
+| `peers`           | `[]`          | Peer entries, each with required `addr` and hex-encoded 32-byte `public_key`. |
 
 <!--markdownlint-enable MD013-->
 
@@ -330,11 +331,11 @@ so they find it on the builder instead of building it again.
 
 <!--markdownlint-disable MD013-->
 
-| Key          | Default  | Meaning                                                                                                         |
-| ------------ | -------- | --------------------------------------------------------------------------------------------------------------- |
+| Key          | Default  | Meaning                                                                                                    |
+| ------------ | -------- | ---------------------------------------------------------------------------------------------------------- |
 | `level`      | `"info"` | A tracing `Targets` filter, for example `"debug"` or `"ncro=debug,tower_http=warn"`. It must not be empty. |
-| `format`     | `"json"` | `json` or `text`.                                                                                               |
-| `timestamps` | `true`   | Include timestamps in ncro's log output. Disable under journald if its timestamps are sufficient.               |
+| `format`     | `"json"` | `json` or `text`.                                                                                          |
+| `timestamps` | `true`   | Include timestamps in ncro's log output. Disable under journald if its timestamps are sufficient.          |
 
 <!--markdownlint-enable MD013-->
 
