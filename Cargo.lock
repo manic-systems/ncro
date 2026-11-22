@@ -1573,6 +1573,7 @@ dependencies = [
  "ncro-router",
  "rmp-serde",
  "serde",
+ "socket2",
  "tokio",
  "tracing",
 ]
