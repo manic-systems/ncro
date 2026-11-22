@@ -1212,7 +1212,7 @@ impl Default for MeshConfig {
   fn default() -> Self {
     Self {
       enabled:          false,
-      bind_addr:        "0.0.0.0:7946".to_string(),
+      bind_addr:        "[::]:7946".to_string(),
       peers:            Vec::new(),
       private_key_path: String::new(),
       gossip_interval:  HumanDuration(Duration::from_secs(30)),
