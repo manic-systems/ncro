@@ -1,6 +1,7 @@
 use std::{
   collections::HashMap,
   io::{self, ErrorKind},
+  net::SocketAddr,
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -363,24 +364,37 @@ async fn send(
       source,
     }
   };
-  let peer = lookup_host(peer_addr)
-    .await
-    .map_err(send_error)?
-    .next()
-    .ok_or_else(|| {
-      send_error(io::Error::new(
-        ErrorKind::InvalidInput,
-        "peer address resolved to no addresses",
-      ))
-    })?;
-  let bind_addr = if peer.is_ipv4() {
-    "0.0.0.0:0"
-  } else {
-    "[::]:0"
-  };
-  let socket = UdpSocket::bind(bind_addr).await.map_err(send_error)?;
-  socket.send_to(&packet, peer).await.map_err(send_error)?;
-  Ok(())
+  let peers = lookup_host(peer_addr).await.map_err(send_error)?;
+  send_packet(&packet, peers).await.map_err(send_error)
+}
+
+async fn send_packet(
+  packet: &[u8],
+  peers: impl Iterator<Item = SocketAddr>,
+) -> io::Result<()> {
+  let mut last_error = None;
+  for peer in peers {
+    let bind_addr = if peer.is_ipv4() {
+      "0.0.0.0:0"
+    } else {
+      "[::]:0"
+    };
+    let result = async {
+      let socket = UdpSocket::bind(bind_addr).await?;
+      socket.send_to(packet, peer).await
+    }
+    .await;
+    match result {
+      Ok(_) => return Ok(()),
+      Err(error) => last_error = Some(error),
+    }
+  }
+  Err(last_error.unwrap_or_else(|| {
+    io::Error::new(
+      ErrorKind::InvalidInput,
+      "peer address resolved to no addresses",
+    )
+  }))
 }
 
 pub async fn run_gossip_loop(
@@ -449,6 +463,7 @@ mod tests {
     announce_built,
     decode_packet,
     merge_routes,
+    send_packet,
   };
 
   const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
@@ -496,6 +511,22 @@ mod tests {
         matches!(message.payload, Payload::Built(hashes) if hashes == store_hashes)
       );
     }
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn send_packet_falls_back_to_ipv4() -> misstep::Result<()> {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+    let invalid_peer = "[::1]:0".parse()?;
+    let reachable_peer = receiver.local_addr()?;
+    let peers = [invalid_peer, reachable_peer];
+    send_packet(b"mesh fallback", peers.into_iter()).await?;
+
+    let mut packet = [0; MAX_PACKET_SIZE];
+    let (received_len, _) =
+      timeout(Duration::from_secs(2), receiver.recv_from(&mut packet))
+        .await??;
+    assert_eq!(&packet[..received_len], b"mesh fallback");
     Ok(())
   }
 
