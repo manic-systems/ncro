@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
   fs::{self, OpenOptions},
   io::AsyncWriteExt,
-  net::UdpSocket,
+  net::{UdpSocket, lookup_host},
   sync::watch,
   time::{self, Duration},
 };
@@ -363,11 +363,23 @@ async fn send(
       source,
     }
   };
-  let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(send_error)?;
-  socket
-    .send_to(&packet, peer_addr)
+  let peer = lookup_host(peer_addr)
     .await
-    .map_err(send_error)?;
+    .map_err(send_error)?
+    .next()
+    .ok_or_else(|| {
+      send_error(io::Error::new(
+        ErrorKind::InvalidInput,
+        "peer address resolved to no addresses",
+      ))
+    })?;
+  let bind_addr = if peer.is_ipv4() {
+    "0.0.0.0:0"
+  } else {
+    "[::]:0"
+  };
+  let socket = UdpSocket::bind(bind_addr).await.map_err(send_error)?;
+  socket.send_to(&packet, peer).await.map_err(send_error)?;
   Ok(())
 }
 
@@ -420,6 +432,7 @@ fn decode_packet(packet: &[u8]) -> Result<DecodedPacket<'_>, MeshError> {
 mod tests {
   use std::{
     env,
+    path::Path,
     process,
     time::{Duration, SystemTime, UNIX_EPOCH},
   };
@@ -427,9 +440,16 @@ mod tests {
   use jiff::{SignedDuration, Timestamp};
   use misstep::OptionExt;
   use ncro_db::{Db, RouteEntry};
-  use tokio::fs;
+  use tokio::{fs, net::UdpSocket, time::timeout};
 
-  use super::{Node, merge_routes};
+  use super::{
+    MAX_PACKET_SIZE,
+    Node,
+    Payload,
+    announce_built,
+    decode_packet,
+    merge_routes,
+  };
 
   const SLOW_STATEMENT_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -454,6 +474,28 @@ mod tests {
       assert_eq!(mode & 0o777, 0o600);
     }
     fs::remove_file(&path).await?;
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn announce_built_reaches_ipv4_and_ipv6_peers() -> misstep::Result<()> {
+    let node = Node::new(Path::new("")).await?;
+    let store_hashes = vec!["0123456789abcdfghijklmnpqrsvwxyz".to_owned()];
+
+    for addr in ["127.0.0.1:0", "[::1]:0"] {
+      let receiver = UdpSocket::bind(addr).await?;
+      announce_built(&receiver.local_addr()?.to_string(), &node, &store_hashes)
+        .await?;
+
+      let mut packet = [0; MAX_PACKET_SIZE];
+      let (received_len, _) =
+        timeout(Duration::from_secs(2), receiver.recv_from(&mut packet))
+          .await??;
+      let (_, _, _, message) = decode_packet(&packet[..received_len])?;
+      assert!(
+        matches!(message.payload, Payload::Built(hashes) if hashes == store_hashes)
+      );
+    }
     Ok(())
   }
 
