@@ -549,9 +549,9 @@ mod tests {
   #[tokio::test]
   async fn send_packet_skips_failed_address() -> misstep::Result<()> {
     let receiver = UdpSocket::bind("127.0.0.1:0").await?;
-    let broadcast_peer = "255.255.255.255:7946".parse()?;
+    let failing_peer = "127.0.0.1:0".parse()?;
     let reachable_peer = receiver.local_addr()?;
-    let peers = [broadcast_peer, reachable_peer];
+    let peers = [failing_peer, reachable_peer];
     send_packet(b"mesh fallback", peers.into_iter()).await?;
 
     let mut packet = [0; MAX_PACKET_SIZE];
