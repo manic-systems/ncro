@@ -183,6 +183,19 @@
         }
     )
     cfg.instances;
+
+  instanceRestartTriggers =
+    mapAttrs' (
+      name: _:
+        nameValuePair "ncro@${name}" {
+          overrideStrategy = "asDropin";
+          restartTriggers = [
+            instanceEtc."ncro/${name}.toml".source
+            instanceEtc."ncro/${name}.netrc".source
+          ];
+        }
+    )
+    cfg.instances;
 in {
   options.services.ncro =
     common.options
@@ -336,64 +349,66 @@ in {
             lib.nameValuePair "ncro@${name}" (instanceSocket name instance)
         ) (lib.filterAttrs (_: instance: instance.socketActivation) cfg.instances);
 
-      services = {
-        ncro = mkIf (cfg.instances == {}) {
-          description = "Nix Cache Route Optimizer";
-          wantedBy = ["multi-user.target"];
-          after =
-            if cfg.socketActivation
-            then ["ncro.socket"]
-            else ["network.target"];
-          requires = optionals cfg.socketActivation ["ncro.socket"];
-          environment = optionalAttrs (cfg.netrcFile != null) {
-            NETRC = "%d/netrc";
+      services =
+        {
+          ncro = mkIf (cfg.instances == {}) {
+            description = "Nix Cache Route Optimizer";
+            wantedBy = ["multi-user.target"];
+            after =
+              if cfg.socketActivation
+              then ["ncro.socket"]
+              else ["network.target"];
+            requires = optionals cfg.socketActivation ["ncro.socket"];
+            environment = optionalAttrs (cfg.netrcFile != null) {
+              NETRC = "%d/netrc";
+            };
+            serviceConfig =
+              {
+                ExecStart = "${lib.getExe' cfg.package "ncro"} --config ${configFile}";
+                DynamicUser = true;
+                StateDirectory = "ncro";
+                Restart = "on-failure";
+                RestartSec = "5s";
+
+                # NAR proxying is not concurrency-gated: every in-flight NAR holds an
+                # inbound and an upstream socket for the duration of the transfer, so a
+                # single busy nix client can exceed systemd's 1024 soft limit.
+                LimitNOFILE = 65536;
+
+                # Hardening
+                NoNewPrivileges = true;
+                PrivateTmp = true;
+                PrivateDevices = true;
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                ProtectProc = "invisible";
+                ProtectHostname = true;
+                ProtectClock = true;
+                ProtectControlGroups = true;
+                ProtectKernelLogs = true;
+                ProtectKernelTunables = true;
+                RestrictRealtime = true;
+                CapabilityBoundingSet = "";
+                RestrictAddressFamilies =
+                  [
+                    "AF_INET"
+                    "AF_INET6"
+                    "AF_NETLINK" # required by mdns-sd and system resolver
+                  ]
+                  # sd_notify uses a Unix datagram socket to signal readiness.
+                  ++ optionals cfg.socketActivation ["AF_UNIX"];
+                RestrictNamespaces = true;
+                LockPersonality = true;
+                MemoryDenyWriteExecute = true;
+                SystemCallFilter = ["@system-service"];
+                SystemCallArchitectures = "native";
+              }
+              // optionalAttrs cfg.socketActivation {Type = "notify";}
+              // optionalAttrs (cfg.netrcFile != null) {LoadCredential = ["netrc:${cfg.netrcFile}"];};
           };
-          serviceConfig =
-            {
-              ExecStart = "${lib.getExe' cfg.package "ncro"} --config ${configFile}";
-              DynamicUser = true;
-              StateDirectory = "ncro";
-              Restart = "on-failure";
-              RestartSec = "5s";
-
-              # NAR proxying is not concurrency-gated: every in-flight NAR holds an
-              # inbound and an upstream socket for the duration of the transfer, so a
-              # single busy nix client can exceed systemd's 1024 soft limit.
-              LimitNOFILE = 65536;
-
-              # Hardening
-              NoNewPrivileges = true;
-              PrivateTmp = true;
-              PrivateDevices = true;
-              ProtectSystem = "strict";
-              ProtectHome = true;
-              ProtectProc = "invisible";
-              ProtectHostname = true;
-              ProtectClock = true;
-              ProtectControlGroups = true;
-              ProtectKernelLogs = true;
-              ProtectKernelTunables = true;
-              RestrictRealtime = true;
-              CapabilityBoundingSet = "";
-              RestrictAddressFamilies =
-                [
-                  "AF_INET"
-                  "AF_INET6"
-                  "AF_NETLINK" # required by mdns-sd and system resolver
-                ]
-                # sd_notify uses a Unix datagram socket to signal readiness.
-                ++ optionals cfg.socketActivation ["AF_UNIX"];
-              RestrictNamespaces = true;
-              LockPersonality = true;
-              MemoryDenyWriteExecute = true;
-              SystemCallFilter = ["@system-service"];
-              SystemCallArchitectures = "native";
-            }
-            // optionalAttrs cfg.socketActivation {Type = "notify";}
-            // optionalAttrs (cfg.netrcFile != null) {LoadCredential = ["netrc:${cfg.netrcFile}"];};
-        };
-        "ncro@" = mkIf (cfg.instances != {}) instanceService;
-      };
+          "ncro@" = mkIf (cfg.instances != {}) instanceService;
+        }
+        // instanceRestartTriggers;
 
       targets.multi-user.wants =
         map

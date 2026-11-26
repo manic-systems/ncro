@@ -21,6 +21,10 @@ pkgs.testers.runNixOSTest {
         };
       };
     };
+
+    specialisation.changed-config.configuration = {
+      services.ncro.instances.public.settings.logging.timestamps = false;
+    };
   };
 
   testScript = ''
@@ -40,5 +44,19 @@ pkgs.testers.runNixOSTest {
     with subtest("each instance has an isolated route database"):
         machine.succeed("test -f /var/lib/ncro-public/routes.db")
         machine.succeed("test -f /var/lib/ncro-private/routes.db")
+
+    with subtest("a switch restarts an instance whose config changed"):
+        def main_pid(unit):
+            return machine.succeed(f"systemctl show -p MainPID --value {unit}").strip()
+
+        public_pid = main_pid("ncro@public.service")
+        private_pid = main_pid("ncro@private.service")
+        machine.succeed(
+            "/run/current-system/specialisation/changed-config/bin/switch-to-configuration test"
+        )
+        machine.wait_for_unit("ncro@public.service")
+        machine.succeed("grep -qx 'timestamps = false' /etc/ncro/public.toml")
+        assert main_pid("ncro@public.service") != public_pid, "ncro@public was not restarted"
+        assert main_pid("ncro@private.service") == private_pid, "ncro@private was restarted"
   '';
 }
