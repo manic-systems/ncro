@@ -51,6 +51,9 @@ pub struct RouteEntry {
   pub nar_url:          String,
   /// The upstream's own path, since `nar_url` is canonical.
   pub upstream_nar_url: String,
+  /// Not gossiped because it would not fit a mesh datagram, and the router
+  /// fetches it on first use.
+  #[serde(skip)]
   pub narinfo_bytes:    Option<Vec<u8>>,
 }
 

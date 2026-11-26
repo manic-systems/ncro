@@ -1,6 +1,7 @@
 use std::{
   collections::HashMap,
   io::{self, ErrorKind},
+  mem,
   net::{Ipv4Addr, Ipv6Addr, SocketAddr},
   path::{Path, PathBuf},
   sync::Arc,
@@ -342,16 +343,50 @@ async fn merge_routes(db: &Db, incoming: Vec<RouteEntry>) {
   }
 }
 
-/// # Errors
+/// Sign `routes` into packets that each fit [`MAX_PACKET_SIZE`]. A route too
+/// large to fit a packet on its own is skipped.
 ///
-/// Returns [`MeshError`] if the message cannot be signed, the socket cannot
-/// be bound, or the packet fails to send.
-pub async fn announce(
-  peer_addr: &str,
+/// Msgpack encodes a list as a length header followed by its elements, so a
+/// chunk's size is the empty announce plus the routes' own encodings, plus up
+/// to 2 more header bytes once the list holds more than 15 routes.
+fn announce_packets(
   node: &Node,
   routes: Vec<RouteEntry>,
-) -> Result<(), MeshError> {
-  send(peer_addr, node, Payload::Announce(routes)).await
+) -> Result<Vec<Vec<u8>>, MeshError> {
+  let timestamp =
+    i64::try_from(Timestamp::now().as_nanosecond()).unwrap_or_default();
+  let packet = |chunk| {
+    encode_packet(node, &Message {
+      node_id: node.id(),
+      timestamp,
+      payload: Payload::Announce(chunk),
+    })
+  };
+  let budget = MAX_PACKET_SIZE.saturating_sub(packet(Vec::new())?.len() + 2);
+  let mut packets = Vec::new();
+  let mut chunk = Vec::new();
+  let mut used = 0;
+  for route in routes {
+    let size = rmp_serde::to_vec(&route)?.len();
+    if size > budget {
+      tracing::debug!(
+        store = route.store_path,
+        size,
+        "mesh: route too large for one packet, not gossiping it"
+      );
+      continue;
+    }
+    if used + size > budget {
+      packets.push(packet(mem::take(&mut chunk))?);
+      used = 0;
+    }
+    used += size;
+    chunk.push(route);
+  }
+  if !chunk.is_empty() {
+    packets.push(packet(chunk)?);
+  }
+  Ok(packets)
 }
 
 /// Tell a peer that `store_hashes` were built locally, so it stops serving
@@ -383,15 +418,30 @@ async fn send(
       .unwrap_or_default(),
     payload,
   };
-  let packet = encode_packet(node, &msg)?;
+  send_packets(peer_addr, &[encode_packet(node, &msg)?]).await
+}
+
+async fn send_packets(
+  peer_addr: &str,
+  packets: &[Vec<u8>],
+) -> Result<(), MeshError> {
+  if packets.is_empty() {
+    return Ok(());
+  }
   let send_error = |source| {
     MeshError::Send {
       addr: peer_addr.to_owned(),
       source,
     }
   };
-  let peers = lookup_host(peer_addr).await.map_err(send_error)?;
-  send_packet(&packet, peers).await.map_err(send_error)
+  let peers: Vec<SocketAddr> =
+    lookup_host(peer_addr).await.map_err(send_error)?.collect();
+  for packet in packets {
+    send_packet(packet, peers.iter().copied())
+      .await
+      .map_err(send_error)?;
+  }
+  Ok(())
 }
 
 async fn send_packet(
@@ -435,13 +485,29 @@ pub async fn run_gossip_loop(
     tokio::select! {
         _ = stop.changed() => return,
         _ = ticker.tick() => {
-            let Ok(routes) = db.list_recent_routes(MAX_GOSSIP_ROUTES).await else { continue; };
+            let routes = match db.list_recent_routes(MAX_GOSSIP_ROUTES).await {
+                Ok(routes) => routes,
+                Err(err) => {
+                    tracing::warn!(error = %Report::new(err), "mesh: listing routes to gossip failed");
+                    continue;
+                }
+            };
             if routes.is_empty() { continue; }
+            let packets = match announce_packets(&node, routes) {
+                Ok(packets) => Arc::new(packets),
+                Err(err) => {
+                    tracing::warn!(error = %Report::new(err), "mesh: encoding route gossip failed");
+                    continue;
+                }
+            };
             for peer in &peers {
                 let peer = peer.clone();
-                let node = node.clone();
-                let routes = routes.clone();
-                tokio::spawn(async move { let _ = announce(&peer, &node, routes).await; });
+                let packets = Arc::clone(&packets);
+                tokio::spawn(async move {
+                    if let Err(err) = send_packets(&peer, &packets).await {
+                        tracing::debug!(peer, error = %Report::new(err), "mesh: route gossip failed");
+                    }
+                });
             }
         }
     }
@@ -488,6 +554,7 @@ mod tests {
     Node,
     Payload,
     announce_built,
+    announce_packets,
     bind_listener,
     decode_packet,
     merge_routes,
@@ -601,6 +668,56 @@ mod tests {
       upstream_nar_url: "nar/test.nar".into(),
       narinfo_bytes: None,
     }
+  }
+
+  #[tokio::test]
+  async fn announce_packets_fit_and_decode() -> misstep::Result<()> {
+    let node = Node::new(Path::new("")).await?;
+    let routes: Vec<RouteEntry> = (0..25)
+      .map(|i| {
+        let hash = format!("{i:0>32}");
+        RouteEntry {
+          upstream_url: "https://cache.nixos.org".into(),
+          nar_hash: format!("sha256:{}", "a".repeat(52)),
+          nar_url: format!("nar/{}.nar.xz", "b".repeat(52)),
+          upstream_nar_url: format!("nar/{}.nar.xz", "c".repeat(52)),
+          narinfo_bytes: Some(vec![b'x'; 1_500]),
+          ..route(&hash, 10.0, 3600)
+        }
+      })
+      .collect();
+    let packets = announce_packets(&node, routes.clone())?;
+    assert!(packets.len() > 1, "25 routes should need several packets");
+    let mut gossiped = Vec::new();
+    let mut sigs = Vec::new();
+    for packet in &packets {
+      assert!(
+        packet.len() <= MAX_PACKET_SIZE,
+        "packet is {} bytes",
+        packet.len()
+      );
+      let (_, sig, _, msg) = decode_packet(packet)?;
+      sigs.push(sig.to_vec());
+      let chunk = match msg.payload {
+        Payload::Announce(chunk) => Some(chunk),
+        Payload::Built(_) => None,
+      }
+      .context("expected an announce payload")?;
+      gossiped.extend(chunk);
+    }
+    sigs.sort();
+    sigs.dedup();
+    assert_eq!(
+      sigs.len(),
+      packets.len(),
+      "each chunk needs its own replay key"
+    );
+    assert_eq!(gossiped.len(), routes.len());
+    for (sent, got) in routes.iter().zip(&gossiped) {
+      assert_eq!(got.store_path, sent.store_path);
+      assert_eq!(got.narinfo_bytes, None);
+    }
+    Ok(())
   }
 
   #[tokio::test]
